@@ -1,0 +1,49 @@
+// This proto file containes proto messages for waveforms.
+//
+// Author: Chanwoo Kim (chanwcom@gmail.com)
+syntax = "proto3";
+
+import "google/protobuf/any.proto";
+
+package learning;
+
+// A protocol buffer message for storing the format of the waveform.
+message WaveHeader {
+
+  optional int32 number_of_channels = 1;
+
+  // The sampling rate of the wave data.
+  optional double sampling_rate_hz = 2;
+
+  enum AtomicType {
+      INT4 = 0;
+      INT8 = 1;
+      INT16 = 2;
+      INT32 = 3;
+      FLOAT16 = 4;
+      FLOAT32 = 5;
+      FLOAT64 = 6;
+
+  }
+
+  // The atomic type of the wave data.
+  optional AtomicType atomic_type = 3;
+}
+
+// A protocol buffer message for storing utterance information.
+message SpeechData {
+  // A unique ID for this utterance data.
+  optional string utterance_id = 1;
+
+  // The format of the waveform data.
+  optional WaveHeader wave_header = 2;
+
+  // Buffer for storing the raw wave data.
+  //
+  // For multi-channel wave data, samples are stored in an interleaved way.
+  // Each element MUST be stored according to the little endian convention.
+  optional bytes samples = 3;
+
+  // The transcript for the speech.
+  optional string ground_truth_transcript = 4;
+}
