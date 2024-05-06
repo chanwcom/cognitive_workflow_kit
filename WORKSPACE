@@ -124,6 +124,19 @@ new_git_repository(
     remote = "https://github.com/librosa/librosa.git",
 )
 
+# soundfile.
+bind(
+    name = "soundfile",
+    actual = "@com_github_soundfile//:soundfile",
+)
+new_git_repository(
+    name = "com_github_soundfile",
+    build_file = "//bazel:soundfile.BUILD",
+    commit = "8ebb523725e315f24c5592677353c43c4562be54",
+    remote = "https://github.com/bastibe/python-soundfile.git"
+)
+
+
 # SWIG.
 bind(
     name = "swig",
