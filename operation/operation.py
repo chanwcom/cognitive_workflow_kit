@@ -124,7 +124,6 @@ class AbstractOperation(abc.ABC):
 
         self._params_proto = params_proto
 
-
     @abc.abstractmethod
     def process(self, *args, **kwargs):
         """Processes the input array.
