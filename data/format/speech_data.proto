@@ -44,5 +44,5 @@ message SpeechData {
     optional bytes samples = 3;
 
     // A text transcript of the speech.
-    optional string ground_truth_transcript = 4;
+    optional string transcript = 4;
 }
