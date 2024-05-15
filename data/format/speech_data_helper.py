@@ -10,23 +10,19 @@ __author__ = "Chanwoo Kim(chanwcom@gmail.com)"
 import uuid
 
 # Third party imports
-import tensorflow as tf
-from packaging import version
 
 # Custom imports
-import operation
-
-assert version.parse(tf.__version__) >= version.parse("2.0.0"), (
-    "At least tensorflow 2.0 is required.")
+from data.format import speech_data_pb2
+from operation import operation
 
 
-class WaveToSpeechData(operation.Operation):
-    """"""
+class WaveToSpeechData(operation.AbstractOperation):
+    """A class for converting wave data into SpeechData proto-message."""
 
     def __init__(self):
         pass
 
-    def process(self, wave_data_list):
+    def process(self, wave_data_list: list):
         """Converts a list of wave data into a list of SpeechData.
 
         Args:

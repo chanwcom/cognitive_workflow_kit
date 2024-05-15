@@ -12,16 +12,16 @@ py_proto_library(
     ],
 )
 
-py(
-     name = "speech_data_helper",
-     srcs = [
-         "speech_data_helper.py",
-     ],
-     deps = [
-         ":speech_data_pb2",
-     ],
+py_library(
+    name = "speech_data_helper",
+    srcs = [
+        "speech_data_helper.py",
+    ],
+    deps = [
+        ":speech_data_pb2",
+        "//operation:operation",
+    ],
 )
-
 
 py_test(
      name = "speech_data_helper_test",
@@ -29,7 +29,7 @@ py_test(
          "speech_data_helper_test.py",
      ],
      deps = [
-         ":speech_data",
+         ":speech_data_helper",
          ":speech_data_pb2",
      ],
 )
