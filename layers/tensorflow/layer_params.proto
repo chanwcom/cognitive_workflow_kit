@@ -1,0 +1,57 @@
+// This proto file file contains proto messages for Keras layers.
+//
+// Author: Chanwoo Kim (chanw.com@samsung.com)
+
+syntax = "proto3";
+
+import "google/protobuf/any.proto";
+
+package learning;
+
+import "machine_learning/layers/dropout_params.proto";
+
+message SubsamplingParams {
+  // A proto-message for initializing classes derived from "Subsampling".
+  //
+  // The following shows an example:
+  // subsampling_params {
+  //   subsampling_factor: 8
+  //   class_params:  {
+  //     [type.googleapi.com/learning.Conv1DSubsamplingParams] {
+  //        num_filterbank_channels: 40
+  //        num_conv_channels: 256
+  //        kernel_size: 5
+  //     }
+  //   }
+  // }
+
+  // The sub-sampling factor. The default value is 4.
+  optional int32 subsampling_factor = 1;
+
+  // A required field specifying the class name.
+  //
+  // The default class name is "Conv1DSubsampling".
+  optional string class_name = 2;
+
+  // An optional field specifying the class-specific parameters.
+  google.protobuf.Any class_params = 3;
+}
+
+message Conv1DSubsamplingParams {
+  // A proto-message containing parameters specific to Conv1DSubsampling.
+
+  // The number of filterbank channels. The default value is 40.
+  //
+  // If this value does not match the actual input, then an exception will
+  // occur.
+  optional int32 num_filterbank_channels = 1;
+
+  // The number of filters in 1D Convolution. The default value is 256.
+  optional int32 num_conv_channels = 2;
+
+  // The size of the kernel of the Conv1D layer. The default value is 5.
+  optional int32 kernel_size = 3;
+
+  // A proto-message for initializing dropout layers in front of Conv layers.
+  DropoutParams dropout_params = 4;
+}

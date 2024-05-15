@@ -1,0 +1,35 @@
+// This proto file file contains proto messages for a neural frontend.
+//
+// Author: Chanwoo Kim (chanw.com@samsung.com)
+
+syntax = "proto3";
+
+package learning;
+
+message NeuralFrontendParams {
+  // A proto-message used for initializing the NeuralFrontend layer.
+  //
+  // This class is defined in //machine_learning/layers/neural_frontend_layer.py
+
+  // The default value is 100, which corresponds to 1 sec when the frame step
+  // size is 10 ms..
+  optional int32 noise_suppression_kernel_size = 1;
+
+  // This value determines the margin of the forgetting factor.
+  //
+  // More specifically, the actual forgetting factor
+  // The default value is 100, which corresponds to 1 sec when the frame step
+  // size is 10 ms..
+  optional double forgetting_factor_range = 2;
+
+  // A boolean flag indicating whether the asymmetric processing will be done.
+  //
+  // The default value is True.
+  optional bool asymmetric_processing = 3;
+
+  // The size of the kernel in the temporal suppression block.
+  //
+  // The default value is 100, which corresponds to 1 sec when the frame step
+  // size is 10 ms..
+  optional int32 temporal_suppression_kernel_size = 4;
+};

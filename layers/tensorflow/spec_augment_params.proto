@@ -1,0 +1,48 @@
+// This file contains proto-messages for SpecAugment.
+//
+// Author: Chanwoo Kim (chanw.com@sasmung.com)
+
+syntax = "proto3";
+
+package learning;
+
+message SpecAugmentParams {
+  // A proto-message for initializing the SpecAugment class.
+  //
+  // This is an implementation of the following paper except the time warping.
+  //
+  // D. S. Park, W. Chan, Y. Zhang, C-C Chiu, B. Zoph, E. D. Cobuk, Q. V. Le,
+  // "SpecAugment: A Simple Data Augmentation Method for Automatic Speech
+  // Recognition", in INTERSPEECH 2019, pp. 2613-2617.
+
+  // The number of frequency masks.
+  //
+  // This field corresponds to "m_F" of Table 1. in in the above paper.
+  optional int32 num_freq_masks = 1;
+
+  // The size of a frequency mask.
+  //
+  // This field corresponds to "F" of Table 1. in the above paper.
+  optional float max_freq_mask_size = 2;
+
+  // The number of time masks.
+  //
+  // This field corresponds to "m_T" of Table 1. in the above paper.
+  optional int32 num_time_masks = 3;
+
+  // The size of a time mask.
+  //
+  // This field corresponds to "T" of Table 1. in the above paper.
+  optional float max_time_mask_size = 4;
+
+  // The upper limit of the time mask width with respect to feature length.
+  //
+  // This field corresponds to "p" of Table 1 in the above paper.
+  optional double time_mask_upper_limit = 5;
+
+  // Optionally, disables dropout during the initial phase of training.
+  //
+  // The default value is zero. When this is enabled, the model or layer SHOULD
+  // have "model_callback". Otherwise, an exception will occur.
+  optional double dropout_bypass_num_examples = 6;
+};

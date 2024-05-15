@@ -1,0 +1,95 @@
+// A proto file contains various proto messages for "dropout".
+//
+// The following are defined:
+//  * BaselineDropout
+//  * UniformDistDropout
+//  * TwoPointDistDropout
+//  * MacroBlockDropout
+//
+// Author: Chanwoo Kim (chanw.com@samsung.com)
+
+syntax = "proto3";
+
+package learning;
+
+import "google/protobuf/any.proto";
+
+
+message DropoutParams {
+  enum SeqNoiseShapeType {
+  // Defines the noise shape of the DropOut when the input is a sequence.
+  //
+  // Refers to the following page about the noise shape.
+  // https://www.tensorflow.org/api_docs/python/tf/keras/layers/Dropout
+    BATCH_TIME = 0;     // noise_shape=(1, 1, None)
+    BATCH = 1;          // noise_shape=(1, None, None)
+    TIME = 2;           // noise_shape=(None, 1, None)
+    HIDDEN_FEATURE = 3; // noise_shape=(None, None, 1)
+    NONE = 4;           // noise_shape=(None, None, None)
+  };
+
+  // A proto-message for initializing classes derived from "AbstractDropout"
+  //
+  // Typical usage example:
+  //
+  // TODO(chanw.com) Adds an example.
+  optional SeqNoiseShapeType seq_noise_shape = 1;
+
+  // Optionally, disables dropout during the initial phase of training.
+  //
+  // The default value is zero. When this is enabled, the model or layer SHOULD
+  // have "model_callback". Otherwise, an exception will occur.
+  optional double dropout_bypass_num_examples = 2;
+
+  // A required field specifying the class name.
+  //
+  // The default class name is "Conv1DSubsampling".
+  optional string class_name = 3;
+
+  // An optional field specifying the class-specific parameters.
+  google.protobuf.Any class_params = 4;
+}
+
+
+message BaselineDropoutParams {
+  // Initialization parameters for the BaselineDropout class.
+  optional double dropout_rate = 1;
+};
+
+message BatchProbDropoutParams {
+  // Initialization parameters for the BatchProbDropout class.
+};
+
+message UniformDistDropoutParams {
+  message Bounds {
+    // If not specified, the default is 0.0.
+    optional double min_bound = 1;
+
+    // A required value if "uniform_dist" is selected.
+    optional double max_bound = 2;
+  }
+
+  oneof distribution_spec {
+    double dropout_rate = 1;
+
+    Bounds bounds = 2;
+  }
+}
+
+message TwoPointDistDropout  {
+  optional double dropout_rate = 1;
+
+  // An optional field. The default value is 0.0.
+  optional double dropout_rate_0 = 2;
+
+  // An optional field. The default value is 0.5.
+  optional double dropout_rate_1 = 3;
+
+}
+
+message MacroBlockDropout {
+  // Refer to the Macro-Block Dropout paper for more details.
+  optional double dropout_rate = 1;
+
+  repeated int32 block_size = 2;
+}

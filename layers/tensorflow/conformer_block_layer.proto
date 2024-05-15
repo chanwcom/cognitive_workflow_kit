@@ -1,0 +1,163 @@
+// This proto file file contains proto messages for model factories.
+//
+// Author: Chanwoo Kim (chanw.com@samsung.com)
+
+syntax = "proto3";
+
+package learning;
+
+import "machine_learning/layers/dropout_params.proto";
+
+enum NormalizationType {
+  LAYER_NORM = 0;
+  BATCH_NORM_WITH_MASK = 1;
+};
+
+enum ActivationType {
+  SWISH = 0;
+  RELU = 1;
+};
+
+message ConformerBlockParams {
+  // A proto-message for initializing the ConformerBlock.
+  optional FeedForwardModuleParams feed_forward_module_params = 1;
+  optional MHSAModuleParams mhsa_module_params = 2;
+  optional ConvolutionModuleParams convolution_module_params = 3;
+}
+
+message FeedForwardModuleParams {
+  // A proto-message for initializing the FeedForwardModule for Transformer.
+  //
+  // TODO(chanw.com) Adds references (e.g. Transformer paper, Conformer-T, and
+  // Transformer Transducer, NemoASR, etc).
+
+  // A field defining the activation type.
+  //
+  // The default type is "SWISH".
+  optional ActivationType activation_type = 1;
+
+  // A field representing the dimension of the input.
+  //
+  // The default value is 512.
+  optional int32 model_dim = 2;
+
+  // A field representing the dimension of the first feed-forward output.
+  //
+  // This corresponds to the dimension of the expanded portion between two
+  // feed-forward networks. The default value is 2048.
+  optional int32 feedforward_dim = 3;
+
+  // A oneof field specifying the dropout approach.
+  oneof dropout_method {
+    // Selects the dropout approach to be used for this module.
+
+    // TODO(chanw.com) UniformDistDropout should be merged into DropoutParams.
+    // The default dropout rate is 0.1.
+    double dropout_rate = 4;
+
+    DropoutParams dropout_params = 5;
+  }
+
+  // A boolean field to apply dropout to inputs.
+  //
+  // The default value is False.If this option is enabled, we apply dropout
+  // in front of point-wise convolutions and depth-wise convolutions rather
+  // than applying at the end of the module.
+  optional bool input_dropout = 7;
+}
+
+message MHSAModuleParams {
+  // The model dimension. The default value is 512.
+  optional int32 model_dim = 1;
+
+  // The number of heads. The default value is 8.
+  optional int32 num_heads = 2;
+
+  // A field to apply "relative position embedding" in the Conformer-T paper.
+  //
+  // The default value is "True".
+  // Refer to Section 2.1 of the following paper for more detail.
+  //
+  //  A. Gulati, J.Qin, C-C Chiu, N. Parmar, Y. Zhang, J. Yu, W. Han, S. Wang, Z.
+  //  Zhang, Y Wu, and R. Pang, "Conformer: Convolution-augmented Transformer
+  //  for Speech Recognition", INTERSPEECH-2020. 2020, pp.5036-5040.
+  optional bool relative_positional_embedding = 3;
+
+  // A oneof field specifying the dropout approach.
+  oneof dropout_method {
+    // Selects the dropout approach to be used for this module.
+
+    // TODO(chanw.com) UniformDistDropout should be merged into DropoutParams.
+    // The default dropout rate is 0.1.
+    double dropout_rate = 4;
+
+    DropoutParams dropout_params = 5;
+  }
+
+  // A boolean field to apply dropout to inputs.
+  //
+  // The default value is False. When this option is enabled, we apply dropout
+  // in front of the Multi-Head Self Attention (MHSA) layer rather than
+  // applying at the end of the module suggested in the original paper by A.
+  // Gulati et al.
+  optional bool input_dropout = 7;
+
+  // A field representing the number of masking.
+  // The default values is "-1" (no masking)
+  optional int32 left_mask = 8;
+  optional int32 right_mask = 9;
+
+  // A field representing the causality of attention.
+  optional bool causal = 10;
+}
+
+message ConvolutionModuleParams {
+  // A field defining the normalization type after 1-D Depthwise Cov.
+  //
+  // The default type is "Batch Normalization with a mask."
+  optional NormalizationType conv_normalization_type = 1;
+
+  // A field defining the activation type.
+  //
+  // This field determines the type of the activation after the BatchNorm block
+  // in Fig. 2 of the following paper:
+  // https://arxiv.org/pdf/2005.08100.pdf
+  // The default type is "SWISH".
+  optional ActivationType activation_type = 2;
+
+  // A field representing the dimension of the input.
+  //
+  // The default value is 512. If the input does not match, then an exception
+  // will occur.
+  optional int32 model_dim = 3;
+
+  // The kernel size of the Depthwise 1D convolution in the Convolution block.
+  //
+  // Regarding the Convolution block, refer to the following paper:
+  // https://arxiv.org/pdf/2005.08100.pdf
+  // The default value is 31.
+  optional int32 conv_kernel_size = 4;
+
+  // A oneof field specifying the dropout approach.
+  oneof dropout_method {
+    // Selects the dropout approach to be used for this module.
+
+    // TODO(chanw.com) UniformDistDropout should be merged into DropoutParams.
+    // The default dropout rate is 0.1.
+    double dropout_rate = 5;
+
+    DropoutParams dropout_params = 6;
+  }
+
+  // A boolean field to apply dropout to inputs.
+  //
+  // The default value is False. When this option is enabled, we apply dropout
+  // in front of the point-wise convolutions and depth-wise convolutions rather
+  // than applying at the end of the module suggested in the original paper by
+  // A. Gulati et al.
+  optional bool input_dropout = 8;
+
+  // A field represention the causaility of convolution.
+  // The default value is "False"
+  optional bool causal = 9;
+}
