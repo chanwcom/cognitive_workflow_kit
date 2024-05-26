@@ -95,10 +95,10 @@ with open(trans_file, "rt") as file:
             example_index += 1
             shard_index = min(int(example_index // examples_per_shard), num_shards - 1)
 
-                         # Opens a new shard if shard_index has been changed.
-             #
-             # Closes the current TFRecord shard file, and opens a new TFRecord
-             # shard file.
+            # Opens a new shard if shard_index has been changed.
+            #
+            # Closes the current TFRecord shard file, and opens a new TFRecord
+            # shard file.
             if shard_index != prev_shard_index:
                 writer.close()
 
@@ -106,7 +106,9 @@ with open(trans_file, "rt") as file:
                 shard_name = "{0}-{1:05d}-{2:05d}".format(
                     tfrecord_file_name, shard_index, num_shards)
 
-                writer = tf.io.TFRecordWriter(shard_name)
+                writer = tf.io.TFRecordWriter(
+                    shard_name, options=tf.io.TFRecordOptions(compression_type="GZIP"))
+
                 prev_shard_index = shard_index
 
             speech_data.utterance_id = uuid.uuid4().hex
