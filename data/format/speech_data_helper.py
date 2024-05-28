@@ -1,4 +1,4 @@
-"""A model implementing helpder methods for the SpeechData proto-message."""
+"""A module implementing helpder methods for the SpeechData proto-message."""
 
 # pylint: disable=import-error, no-member
 from __future__ import (absolute_import, division, print_function,
@@ -9,20 +9,50 @@ __author__ = "Chanwoo Kim(chanwcom@gmail.com)"
 # Standard imports
 import uuid
 
-# Third party imports
+# Third-party imports
+import tensorflow as tf
+from google.protobuf import descriptor_pb2
+from packaging import version
 
 # Custom imports
 from data.format import speech_data_pb2
 from operation import operation
 
+assert version.parse(tf.__version__) >= version.parse("2.0.0"), (
+    "At least tensorflow 2.0 is required.")
+
+
+def decode_string_int16(inputs, num_channels, max_length):
+    """Converts a serialized string into a tensor array of type "int16".
+
+    Zero-padding may be applied if the length is less than max_length. This is
+    done in order to pack a batch of tensors as a dense tensor.
+
+    Args:
+        inputs: A tensor containing serialized waveform samples.
+        max_channels: An integer tensor containing the number of channels.
+        max_length: An integer tensor containing the max. length.
+
+    Returns:
+        A rank-2 tensor containing the waveform data with the tf.float32 type.
+            The shape is (max_length, num_channels).
+    """
+    return tf.reshape(
+        tf.cast(
+            tf.io.decode_raw(inputs,
+                             tf.dtypes.int16,
+                             fixed_length=tf.cast(max_length * tf.int16.size,
+                                                  dtype=tf.dtypes.int32)),
+            tf.dtypes.float32) / 32768.0, (-1, num_channels))
+
 
 class WaveToSpeechData(operation.AbstractOperation):
-    """A class for converting wave data into SpeechData proto-message."""
+    """"""
 
     def __init__(self):
         pass
 
-    def process(self, wave_data_list: list):
+    def process(self, wave_data_list):
         """Converts a list of wave data into a list of SpeechData.
 
         Args:
@@ -56,3 +86,86 @@ class WaveToSpeechData(operation.AbstractOperation):
             speech_data_list.append(speech_data)
 
         return speech_data_list
+
+
+class SpeechDataToWave(operation.AbstractOperation):
+
+    def __init__(self, output_type):
+        pass
+
+
+def parse_speech_data(speech_data_string,
+                      string_descriptor,
+                      max_seq_len,
+                      out_type=tf.dtypes.float32):
+    """Parses a single example serialized in SpeechData proto-message.
+
+    Args:
+        speech_data_string:
+        string_descriptor:
+        max_seq_len: Zero padding is done to make acoust_dict["SEQ_DATA"]
+        out_type:
+
+    Returns:
+
+    """
+    # Parses speech_data_string containing learning.SpeechData proto-message.
+    speech_data_parsed = tf.io.decode_proto(
+        speech_data_string,
+        "learning.SpeechData", ["wave_header", "samples", "transcript"],
+        [tf.string, tf.string, tf.string],
+        descriptor_source=string_descriptor)
+    serialized_samples = speech_data_parsed.values[1][0]
+
+    # Parses the wave_header using "tf.io.decode_proto".
+    wave_header_parsed = tf.io.decode_proto(
+        speech_data_parsed.values[0][0],
+        "learning.WaveHeader",
+        ["number_of_channels", "sampling_rate_hz", "atomic_type"],
+        [tf.int32, tf.float64, tf.int32],
+        descriptor_source=string_descriptor)
+
+    # The following assumes that the number of channels in a given batch is
+    # the same. Anyway, if there are some examples whose number of channels
+    # differ, then an error will occur.
+    num_channels = wave_header_parsed.values[0][0]
+    atomic_type = wave_header_parsed.values[2][0]
+
+    scaling = 1.0
+    if atomic_type == speech_data_pb2.WaveHeader.INT4:
+        tf.debugging.Assert(False, [tf.constant("Unsupported Type.")])
+    elif atomic_type == speech_data_pb2.WaveHeader.INT8:
+        dtypes = tf.dtypes.int8
+        scaling = 1.0 / 2**7
+    elif atomic_type == speech_data_pb2.WaveHeader.INT16:
+        dtypes = tf.dtypes.int16
+        scaling = 1.0 / 2**15
+    elif atomic_type == speech_data_pb2.WaveHeader.INT32:
+        dtypes = tf.dtypes.int32
+        scaling = 1.0 / 2**31
+    elif atomic_type == speech_data_pb2.WaveHeader.FLOAT16:
+        dtypes = tf.dtypes.float16
+    elif atomic_type == speech_data_pb2.WaveHeader.FLOAT32:
+        dtypes = tf.dtypes.float32
+    elif atomic_type == speech_data_pb2.WaveHeader.FLOAT64:
+        dtypes = tf.dtypes.float64
+
+    samples = tf.reshape(
+        tf.cast(tf.io.decode_raw(serialized_samples, dtypes), out_type),
+        (-1, num_channels))
+    samples = samples * scaling
+
+    seq_len = tf.shape(samples)[0]
+    samples = tf.pad(samples, [[0, max_seq_len - seq_len], [0, 0]])
+
+    acoust_dict = {}
+    acoust_dict["SEQ_LEN"] = seq_len
+    acoust_dict["SEQ_DATA"] = samples
+    acoust_dict["SAMPLING_RATE_HZ"] = tf.cast(wave_header_parsed.values[1][0],
+                                              out_type)
+
+    label_dict = {}
+    label_dict["SEQ_DATA"] = speech_data_parsed.values[2][0]
+    label_dict["SEQ_LEN"] = tf.constant(1)
+
+    return (acoust_dict, label_dict)

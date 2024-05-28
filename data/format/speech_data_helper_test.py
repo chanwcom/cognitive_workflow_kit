@@ -7,17 +7,19 @@ from __future__ import (absolute_import, division, print_function,
 __author__ = "Chanwoo Kim(chanwcom@gmail.com)"
 
 # Standard imports
-import unittest
+import uuid
 
 # Third-party imports
 import numpy as np
+import tensorflow as tf
+from google.protobuf import descriptor_pb2
 
 # Custom imports
 from data.format import speech_data_helper
 from data.format import speech_data_pb2
 
 
-class WaveToSpeechDataTest(unittest.TestCase):
+class WaveToSpeechDataTest(tf.test.TestCase):
     """A class for testing methods in the example module."""
 
     @classmethod
@@ -76,5 +78,84 @@ class WaveToSpeechDataTest(unittest.TestCase):
             self.fail()
 
 
+class SpeechDataToTensorTest(tf.test.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        # Prepare a batch of SpeechData.
+        # TODO TODO
+        # Make the sctring descriptor
+        # Creates a serialized FileDescriptorSet.
+        #
+        # This serialized string is needed for "tf.io.decode_proto".
+        # We use tf.io.decode_proto instead of ParseFromString for efficiency
+        # reason. Obtains the serialized descriptor information.
+        file_descriptor_set = descriptor_pb2.FileDescriptorSet()
+        file_descriptor = file_descriptor_set.file.add()
+        speech_data_pb2.DESCRIPTOR.CopyToProto(file_descriptor)
+        cls._string_descriptor = (b"bytes://" +
+                                  file_descriptor_set.SerializeToString())
+
+        cls.SAMPLING_RATE_HZ = 16000.0
+
+        # Sets up the wave header.
+        wave_header = speech_data_pb2.WaveHeader()
+        wave_header.number_of_channels = 1
+        wave_header.sampling_rate_hz = cls.SAMPLING_RATE_HZ
+        wave_header.atomic_type = speech_data_pb2.WaveHeader.INT16
+
+        # yapf: disable
+        cls.acoust_dict = {}
+        cls.acoust_dict["SEQ_DATA"] = tf.constant(
+            [[ 0,  1,  2,  3,  0],
+             [ 5,  6,  7,  8,  0],
+             [10, 11, 12, 13, 14],
+             [15, 16, 17,  0,  0]], dtype=tf.dtypes.int16)
+        # yapf: disable
+        cls.acoust_dict["SEQ_LEN"] = tf.constant([4, 4, 5, 3])
+
+        cls.label_dict = {}
+        cls.label_dict["SEQ_DATA"] = tf.constant(["HELLO", "LOVE", "KIND", "HAPPY"])
+        cls.label_dict["SEQ_LEN"] = tf.constant([1, 1, 1, 1])
+
+        serialized_speech_data_list = []
+        speech_data = speech_data_pb2.SpeechData()
+        for i in range(tf.shape(cls.acoust_dict["SEQ_DATA"])[0]):
+            speech_data.utterance_id = uuid.uuid4().hex
+            speech_data.wave_header.CopyFrom(wave_header)
+            length = cls.acoust_dict["SEQ_LEN"][i]
+
+            speech_data.samples = cls.acoust_dict["SEQ_DATA"][i][:length].numpy().tobytes()
+            speech_data.transcript = cls.label_dict["SEQ_DATA"][i].numpy()
+            serialized_speech_data_list.append(speech_data.SerializeToString())
+
+        cls._speech_data_tensor = tf.constant(serialized_speech_data_list)
+
+
+    def test_parse_speech_data(self):
+
+        for i in range(4):
+            actual_output = speech_data_helper.parse_speech_data(
+                self._speech_data_tensor[i], self._string_descriptor, 5,
+                tf.dtypes.float32)
+            acoust_data = tf.cast(self.acoust_dict["SEQ_DATA"], dtype=tf.dtypes.float32) / 2 ** 15
+
+            acoust_dict = {}
+            acoust_dict["SEQ_LEN"] = self.acoust_dict["SEQ_LEN"][i]
+            acoust_dict["SEQ_DATA"] = tf.reshape(acoust_data[i], (-1, 1))
+            acoust_dict["SAMPLING_RATE_HZ"] = tf.constant(self.SAMPLING_RATE_HZ)
+
+            label_dict = {}
+            label_dict["SEQ_DATA"] = self.label_dict["SEQ_DATA"][i]
+            label_dict["SEQ_LEN"] = tf.constant(1)
+
+            import pdb; pdb.set_trace()
+
+            expected_output = (acoust_dict, label_dict)
+
+            self.assertAllClose(expected_output[0], actual_output[0])
+            self.assertAllEqual(expected_output[1], actual_output[1])
+
+
 if __name__ == "__main__":
-    unittest.main()
+    tf.test.main()
