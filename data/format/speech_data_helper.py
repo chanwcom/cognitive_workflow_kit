@@ -91,19 +91,65 @@ class WaveToSpeechData(operation.AbstractOperation):
 class SpeechDataToWave(operation.AbstractOperation):
 
     def __init__(self, output_type):
-        pass
+        self._output_type = output_type
+
+        # This serialized string is needed for "tf.io.decode_proto".
+        # We use tf.io.decode_proto instead of ParseFromString for efficiency
+        # reason. Obtains the serialized descriptor information.
+        file_descriptor_set = descriptor_pb2.FileDescriptorSet()
+        file_descriptor = file_descriptor_set.file.add()
+        speech_data_pb2.DESCRIPTOR.CopyToProto(file_descriptor)
+        self._string_descriptor = (b"bytes://" +
+                                   file_descriptor_set.SerializeToString())
+
+    def process(self, inputs):
+        acoust_seq_data = []
+        acoust_seq_len = []
+        acoust_max_seq_len = 0
+        acoust_sampling_rate_hz = []
+
+        label_seq_data = []
+        label_seq_len = []
+
+        # TODO(chanwcom)
+        for i in range(tf.shape(inputs)[0]):
+            outputs = parse_speech_data(inputs[i], self._string_descriptor,
+                                        self._output_type)
+            acoust_seq_data.append(outputs[0]["SEQ_DATA"])
+            acoust_seq_len.append(outputs[0]["SEQ_LEN"])
+            acoust_max_seq_len = tf.math.reduce_max(
+                (acoust_max_seq_len, outputs[0]["SEQ_LEN"]))
+            acoust_sampling_rate_hz.append(outputs[0]["SAMPLING_RATE_HZ"])
+
+            label_seq_data.append(outputs[1]["SEQ_DATA"])
+            label_seq_len.append(outputs[1]["SEQ_LEN"])
+
+        for i in range(tf.shape(inputs)[0]):
+            acoust_seq_data[i] = tf.pad(
+                acoust_seq_data[i],
+                [[0, acoust_max_seq_len - acoust_seq_len[i]], [0, 0]])
+
+        acoust_dict = {}
+        acoust_dict["SEQ_LEN"] = tf.convert_to_tensor(acoust_seq_len)
+        acoust_dict["SEQ_DATA"] = tf.convert_to_tensor(acoust_seq_data)
+        acoust_dict["SAMPLING_RATE_HZ"] = tf.convert_to_tensor(
+            acoust_sampling_rate_hz)
+
+        label_dict = {}
+        label_dict["SEQ_DATA"] = tf.convert_to_tensor(label_seq_data)
+        label_dict["SEQ_LEN"] = tf.convert_to_tensor(label_seq_len)
+
+        return (acoust_dict, label_dict)
 
 
 def parse_speech_data(speech_data_string,
                       string_descriptor,
-                      max_seq_len,
                       out_type=tf.dtypes.float32):
     """Parses a single example serialized in SpeechData proto-message.
 
     Args:
         speech_data_string:
         string_descriptor:
-        max_seq_len: Zero padding is done to make acoust_dict["SEQ_DATA"]
         out_type:
 
     Returns:
@@ -156,7 +202,6 @@ def parse_speech_data(speech_data_string,
     samples = samples * scaling
 
     seq_len = tf.shape(samples)[0]
-    samples = tf.pad(samples, [[0, max_seq_len - seq_len], [0, 0]])
 
     acoust_dict = {}
     acoust_dict["SEQ_LEN"] = seq_len

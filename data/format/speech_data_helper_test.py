@@ -83,7 +83,7 @@ class SpeechDataToTensorTest(tf.test.TestCase):
     @classmethod
     def setUpClass(cls):
         # Prepare a batch of SpeechData.
-        # TODO TODO
+
         # Make the sctring descriptor
         # Creates a serialized FileDescriptorSet.
         #
@@ -129,27 +129,47 @@ class SpeechDataToTensorTest(tf.test.TestCase):
             speech_data.transcript = cls.label_dict["SEQ_DATA"][i].numpy()
             serialized_speech_data_list.append(speech_data.SerializeToString())
 
-        cls._speech_data_tensor = tf.constant(serialized_speech_data_list)
+        cls._speech_data_str = tf.constant(serialized_speech_data_list)
+
+    def test_speech_data_to_wave(self):
+        op =speech_data_helper.SpeechDataToWave(tf.dtypes.float32)
+        actual_output = op.process(self._speech_data_str)
+
+        acoust_data = tf.cast(self.acoust_dict["SEQ_DATA"], dtype=tf.dtypes.float32) / 2 ** 15
+
+        acoust_dict = {}
+        acoust_dict["SEQ_LEN"] = self.acoust_dict["SEQ_LEN"]
+        acoust_dict["SEQ_DATA"] = tf.expand_dims(acoust_data, axis=2)
+        acoust_dict["SAMPLING_RATE_HZ"] = tf.fill((4), self.SAMPLING_RATE_HZ)
+
+        label_dict = {}
+        label_dict["SEQ_DATA"] = self.label_dict["SEQ_DATA"]
+        label_dict["SEQ_LEN"] = tf.fill((4), 1)
+
+        expected_output = (acoust_dict, label_dict)
+
+        self.assertAllClose(expected_output[0], actual_output[0])
+        self.assertAllEqual(expected_output[1]["SEQ_DATA"], actual_output[1]["SEQ_DATA"])
+        self.assertAllEqual(expected_output[1]["SEQ_LEN"], actual_output[1]["SEQ_LEN"])
 
 
     def test_parse_speech_data(self):
-
         for i in range(4):
             actual_output = speech_data_helper.parse_speech_data(
-                self._speech_data_tensor[i], self._string_descriptor, 5,
+                self._speech_data_str[i], self._string_descriptor,
                 tf.dtypes.float32)
-            acoust_data = tf.cast(self.acoust_dict["SEQ_DATA"], dtype=tf.dtypes.float32) / 2 ** 15
+            acoust_data = tf.cast(
+                self.acoust_dict["SEQ_DATA"], dtype=tf.dtypes.float32) / 2 ** 15
 
             acoust_dict = {}
             acoust_dict["SEQ_LEN"] = self.acoust_dict["SEQ_LEN"][i]
-            acoust_dict["SEQ_DATA"] = tf.reshape(acoust_data[i], (-1, 1))
+            acoust_dict["SEQ_DATA"] = tf.reshape(
+                acoust_data[i][:acoust_dict["SEQ_LEN"]], (-1, 1))
             acoust_dict["SAMPLING_RATE_HZ"] = tf.constant(self.SAMPLING_RATE_HZ)
 
             label_dict = {}
             label_dict["SEQ_DATA"] = self.label_dict["SEQ_DATA"][i]
             label_dict["SEQ_LEN"] = tf.constant(1)
-
-            import pdb; pdb.set_trace()
 
             expected_output = (acoust_dict, label_dict)
 
