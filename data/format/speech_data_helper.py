@@ -22,30 +22,6 @@ assert version.parse(tf.__version__) >= version.parse("2.0.0"), (
     "At least tensorflow 2.0 is required.")
 
 
-def decode_string_int16(inputs, num_channels, max_length):
-    """Converts a serialized string into a tensor array of type "int16".
-
-    Zero-padding may be applied if the length is less than max_length. This is
-    done in order to pack a batch of tensors as a dense tensor.
-
-    Args:
-        inputs: A tensor containing serialized waveform samples.
-        max_channels: An integer tensor containing the number of channels.
-        max_length: An integer tensor containing the max. length.
-
-    Returns:
-        A rank-2 tensor containing the waveform data with the tf.float32 type.
-            The shape is (max_length, num_channels).
-    """
-    return tf.reshape(
-        tf.cast(
-            tf.io.decode_raw(inputs,
-                             tf.dtypes.int16,
-                             fixed_length=tf.cast(max_length * tf.int16.size,
-                                                  dtype=tf.dtypes.int32)),
-            tf.dtypes.float32) / 32768.0, (-1, num_channels))
-
-
 class WaveToSpeechData(operation.AbstractOperation):
     """"""
 
@@ -111,7 +87,7 @@ class SpeechDataToWave(operation.AbstractOperation):
         label_seq_data = []
         label_seq_len = []
 
-        # TODO(chanwcom)
+        # TODO(chanwcom) Check whether we can use vectorized map instead.
         for i in range(tf.shape(inputs)[0]):
             outputs = parse_speech_data(inputs[i], self._string_descriptor,
                                         self._output_type)
