@@ -11,3 +11,13 @@ py_binary(
         "//data/format:speech_data_pb2",
     ],
 )
+
+py_binary(
+    name = "wav2vec_huggingface",
+    srcs = [
+        "wav2vec_huggingface.py",
+    ],
+    deps = [
+        "//data/format:speech_data_helper",
+    ],
+)
