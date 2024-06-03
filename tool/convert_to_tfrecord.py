@@ -66,7 +66,8 @@ with open(trans_file, "rt") as file:
 
     # Opens a TFRecord file.
     topdir = "/home/chanwcom/local_repositories/cognitive_workflow_kit/tool/tfrecord"
-    tfrecord_file_name = os.path.join(topdir, "music_train.tfrecord")
+    #tfrecord_file_name = os.path.join(topdir, "music_train.tfrecord")
+    tfrecord_file_name = os.path.join(topdir, "music_test.tfrecord")
     num_shards = 10
     shard_name = "{0}-00000-{1:05d}".format(tfrecord_file_name, num_shards)
     writer = tf.io.TFRecordWriter(
