@@ -12,8 +12,10 @@ import tensorflow as tf
 # Custom imports
 from data.format import speech_data_pb2
 
-db_top = "/home/chanwcom/speech_database/stop/stop/train/music_train"
-trans_file = "/home/chanwcom/speech_database/stop/stop/train/music_train/transcript.txt"
+#db_top = "/home/chanwcom/speech_database/stop/stop/train/music_train"
+#trans_file = "/home/chanwcom/local_repositories/cognitive_workflow_kit/tool/stop_music_train_11563.txt"
+db_top = "/home/chanwcom/speech_database/stop/test_0/music_test"
+trans_file = "/home/chanwcom/local_repositories/cognitive_workflow_kit/tool/stop_test_0_music_random_300.txt"
 num_shards = 10
 
 def _num_examples(transcript_file):
