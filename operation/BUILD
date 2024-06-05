@@ -8,7 +8,4 @@ py_library(
      imports = [
         "..",
      ],
-     deps = [
-         ":speech_data_pb2",
-     ],
 )
