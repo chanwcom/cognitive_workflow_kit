@@ -12,8 +12,8 @@ from data.format import speech_data_helper
 
 db_top_dir="/home/chanwcom/databases/"
 #top_dir = "/home/chanwcom/speech_database/stop/music_train_tfrecord"
-train_top_dir = "/home/chanwcom/databases/stop/music_train_tfrecord"
-test_top_dir =  "/home/chanwcom/databases/stop/test_0_music_random_300_tfrecord"
+train_top_dir = os.path.join(db_top_dir, "stop/music_train_tfrecord")
+test_top_dir =  os.path.join(db_top_dir, "stop/test_0_music_random_300_tfrecord")
 
 train_dataset = tf.data.TFRecordDataset(
     glob.glob(os.path.join(train_top_dir, "*tfrecord-*"))
