@@ -18,8 +18,9 @@ db_top = "/home/chanwcom/speech_database/stop/test_0/music_test"
 trans_file = "/home/chanwcom/local_repositories/cognitive_workflow_kit/tool/stop_test_0_music_random_300.txt"
 num_shards = 10
 
+
 def _num_examples(transcript_file):
-     """Counts the number of utterances from the transcript file.
+    """Counts the number of utterances from the transcript file.
 
      This routine assumes that the number of lines (possibly except empty
      lines) is the number of utterances stored in TFRecords files.
@@ -30,12 +31,13 @@ def _num_examples(transcript_file):
      Returns:
          None.
      """
-     number_of_utterances = 0
-     for line in _read_line_generator(transcript_file):
-         # Processes non-empty lines.
-         if line.strip():
-             number_of_utterances += 1
-     return number_of_utterances
+    number_of_utterances = 0
+    for line in _read_line_generator(transcript_file):
+        # Processes non-empty lines.
+        if line.strip():
+            number_of_utterances += 1
+    return number_of_utterances
+
 
 def _read_line_generator(file_name):
     """Generator reading each line of the file.
@@ -47,17 +49,17 @@ def _read_line_generator(file_name):
      Generator for each line of the file.
     """
     with open(file_name) as f:
-     line = True
-     while line:
-         line = f.readline()
-         yield line.rstrip()
+        line = True
+        while line:
+            line = f.readline()
+            yield line.rstrip()
 
 
 num_examples = _num_examples(trans_file)
 examples_per_shard = num_examples / num_shards
 prev_shard_index = 0
 
-print (num_examples)
+print(num_examples)
 
 with open(trans_file, "rt") as file:
     # Crates a WaveHeader object.
@@ -96,7 +98,8 @@ with open(trans_file, "rt") as file:
                 data = sf_file.read(dtype="int16")
 
             example_index += 1
-            shard_index = min(int(example_index // examples_per_shard), num_shards - 1)
+            shard_index = min(int(example_index // examples_per_shard),
+                              num_shards - 1)
 
             # Opens a new shard if shard_index has been changed.
             #
@@ -110,7 +113,8 @@ with open(trans_file, "rt") as file:
                     tfrecord_file_name, shard_index, num_shards)
 
                 writer = tf.io.TFRecordWriter(
-                    shard_name, options=tf.io.TFRecordOptions(compression_type="GZIP"))
+                    shard_name,
+                    options=tf.io.TFRecordOptions(compression_type="GZIP"))
 
                 prev_shard_index = shard_index
 
