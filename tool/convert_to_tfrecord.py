@@ -12,15 +12,16 @@ import tensorflow as tf
 # Custom imports
 from data.format import speech_data_pb2
 
-# Train
-db_top = "/home/chanwcom/speech_database/stop/train/music_train"
-trans_file = "/home/chanwcom/local_repositories/cognitive_workflow_kit/tool/stop_music_train_11562.txt"
-OUT_TFRECORD_FN = "music_train.tfrecord"
+TRAIN = False
 
-# Test
-#db_top = "/home/chanwcom/speech_database/stop/test_0/music_test"
-#trans_file = "/home/chanwcom/local_repositories/cognitive_workflow_kit/tool/stop_test_0_music_random_300.txt"
-#OUT_TFRECORD_FN = "music_test.tfrecord"
+if TRAIN: # Train
+    db_top = "/home/chanwcom/speech_database/stop/train/music_train"
+    trans_file = "/home/chanwcom/local_repositories/cognitive_workflow_kit/tool/stop_music_train_11562.txt"
+    OUT_TFRECORD_FN = "music_train.tfrecord"
+else: # Test
+    db_top = "/home/chanwcom/speech_database/stop/test_0/music_test"
+    trans_file = "/home/chanwcom/local_repositories/cognitive_workflow_kit/tool/stop_test_0_music_random_300.txt"
+    OUT_TFRECORD_FN = "music_test.tfrecord"
 
 OUT_TOP_DIR = "/home/chanwcom/local_repositories/cognitive_workflow_kit/tool/tfrecord"
 num_shards = 10
