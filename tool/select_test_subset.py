@@ -24,10 +24,7 @@ with open(file_name, "rt") as file:
     for i, line in enumerate(file):
         if i >= 0:  #== index[j]:
             line = line.rstrip()
-
-            match = re.match(r"^(\S+)\s+(?:\S+\s+){3}([^\[]*)\[.*$", line)
-            transcript = match.group(2).rstrip().upper()
-            print(f"[{match.group(1)}] {transcript}")
+            print(line)
 
             j += 1
             if j >= NUM_LINES_SELECTED:
