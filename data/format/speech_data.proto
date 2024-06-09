@@ -43,4 +43,12 @@ message SpeechData {
 
     // A text transcript of the speech.
     optional string transcript = 4;
+
+    // An optional field storing additional information.
+    //
+    // For example, we may store "INTENT" and "SLOT_VALUES" use for Natural
+    // Language Understanding (NLU).
+    // 
+    // TODO(chanwcom) Add an example of specifying INTENT and SLOT_VALUE.
+    repeated map<string, string> attributes = 5;
 }
