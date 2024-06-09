@@ -14,11 +14,11 @@ from data.format import speech_data_pb2
 
 TRAIN = False
 
-if TRAIN: # Train
+if TRAIN:  # Train
     db_top = "/home/chanwcom/speech_database/stop/train/music_train"
     trans_file = "/home/chanwcom/local_repositories/cognitive_workflow_kit/tool/stop_music_train_11562.txt"
     OUT_TFRECORD_FN = "music_train.tfrecord"
-else: # Test
+else:  # Test
     db_top = "/home/chanwcom/speech_database/stop/test_0/music_test"
     trans_file = "/home/chanwcom/local_repositories/cognitive_workflow_kit/tool/stop_test_0_music_random_300.txt"
     OUT_TFRECORD_FN = "music_test.tfrecord"
