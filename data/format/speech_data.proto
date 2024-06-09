@@ -43,4 +43,22 @@ message SpeechData {
 
     // A text transcript of the speech.
     optional string transcript = 4;
+
+     // An optional field storing additional information.
+     //
+     // For example, we may store "INTENT" and "SLOT_VALUES" use for Natural
+     // Language Understanding (NLU).
+     //
+     // TODO(chanwcom) Add an example of specifying INTENT and SLOT_VALUE.
+     // Map is not supported with tf.io.decode_proto. So, we use repeated field
+     // instead.
+     //
+     // https://www.tensorflow.org/api_docs/python/tf/io/decode_proto
+     // https://protobuf.dev/programming-guides/proto3/#backwards
+    message MapField {
+        string key = 1;
+        string value = 2;
+    }
+
+    repeated MapField attributes = 5;
 }
