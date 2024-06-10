@@ -28,6 +28,7 @@ assert version.parse(tf.__version__) >= version.parse("2.0.0"), (
 
 class WaveToSpeechData(operation.AbstractOperation):
     """"""
+
     def __init__(self):
         pass
 
@@ -73,6 +74,7 @@ class SpeechDataToWave(operation.AbstractOperation):
         op = SpeechDataToWave()
         op.process(inputs)
     """
+
     def __init__(self, output_type=tf.dtypes.float32):
         self._output_type = output_type
 
@@ -87,19 +89,23 @@ class SpeechDataToWave(operation.AbstractOperation):
 
     def process(self, inputs):
         outputs = tf.map_fn(
-            lambda inputs: parse_speech_data(inputs, self._string_descriptor, self._output_type),
+            lambda inputs: parse_speech_data(inputs, self._string_descriptor,
+                                             self._output_type),
             inputs,
             fn_output_signature=(
                 {
-                    "SEQ_DATA": tf.RaggedTensorSpec([None, None], dtype=tf.float32),
+                    "SEQ_DATA": tf.RaggedTensorSpec([None, None],
+                                                    dtype=tf.float32),
                     "SEQ_LEN": tf.int32,
                     "SAMPLING_RATE_HZ": tf.float32,
                 },
                 {
                     "SEQ_DATA": tf.string,
                     "SEQ_LEN": tf.int32
-                }),
-        )
+                },
+                tf.TensorSpec([None], dtype=tf.string),  # For key
+                tf.TensorSpec([None], dtype=tf.string),  # For value
+            ))
 
         outputs[0]["SEQ_DATA"] = outputs[0]["SEQ_DATA"].to_tensor()
 
@@ -132,8 +138,9 @@ def parse_speech_data(speech_data_string,
     # Parses speech_data_string containing learning.SpeechData proto-message.
     speech_data_parsed = tf.io.decode_proto(
         speech_data_string,
-        "learning.SpeechData", ["wave_header", "samples", "transcript"],
-        [tf.string, tf.string, tf.string],
+        "learning.SpeechData",
+        ["wave_header", "samples", "transcript", "attributes"],
+        [tf.string, tf.string, tf.string, tf.string],
         descriptor_source=string_descriptor)
     serialized_samples = speech_data_parsed.values[1][0]
 
@@ -151,24 +158,26 @@ def parse_speech_data(speech_data_string,
     num_channels = wave_header_parsed.values[0][0]
     atomic_type = wave_header_parsed.values[2][0]
 
+    serialized_samples = speech_data_parsed.values[1][0]
+
     dtypes = tf.dtypes.int16
-#    if atomic_type == speech_data_pb2.WaveHeader.INT4:
-#        tf.debugging.Assert(False, [tf.constant("Unsupported Type.")])
-#    elif atomic_type == speech_data_pb2.WaveHeader.INT8:
-#        dtypes = tf.dtypes.int8
-#        scaling = 1.0 / 2**7
-#    elif atomic_type == speech_data_pb2.WaveHeader.INT16:
-#        dtypes = tf.dtypes.int16
-#        scaling = 1.0 / 2**15
-#    elif atomic_type == speech_data_pb2.WaveHeader.INT32:
-#        dtypes = tf.dtypes.int32
-#        scaling = 1.0 / 2**31
-#    elif atomic_type == speech_data_pb2.WaveHeader.FLOAT16:
-#        dtypes = tf.dtypes.float16
-#    elif atomic_type == speech_data_pb2.WaveHeader.FLOAT32:
-#        dtypes = tf.dtypes.float32
-#    elif atomic_type == speech_data_pb2.WaveHeader.FLOAT64:
-#        dtypes = tf.dtypes.float64
+    #    if atomic_type == speech_data_pb2.WaveHeader.INT4:
+    #        tf.debugging.Assert(False, [tf.constant("Unsupported Type.")])
+    #    elif atomic_type == speech_data_pb2.WaveHeader.INT8:
+    #        dtypes = tf.dtypes.int8
+    #        scaling = 1.0 / 2**7
+    #    elif atomic_type == speech_data_pb2.WaveHeader.INT16:
+    #        dtypes = tf.dtypes.int16
+    #        scaling = 1.0 / 2**15
+    #    elif atomic_type == speech_data_pb2.WaveHeader.INT32:
+    #        dtypes = tf.dtypes.int32
+    #        scaling = 1.0 / 2**31
+    #    elif atomic_type == speech_data_pb2.WaveHeader.FLOAT16:
+    #        dtypes = tf.dtypes.float16
+    #    elif atomic_type == speech_data_pb2.WaveHeader.FLOAT32:
+    #        dtypes = tf.dtypes.float32
+    #    elif atomic_type == speech_data_pb2.WaveHeader.FLOAT64:
+    #        dtypes = tf.dtypes.float64
 
     samples = tf.reshape(
         tf.cast(tf.io.decode_raw(serialized_samples, dtypes), out_type),
@@ -183,9 +192,24 @@ def parse_speech_data(speech_data_string,
     acoust_dict["SEQ_DATA"] = tf.RaggedTensor.from_tensor(samples)
     acoust_dict["SAMPLING_RATE_HZ"] = tf.cast(wave_header_parsed.values[1][0],
                                               out_type)
-#
+
+    def parse_attribute(inputs):
+        outputs = tf.io.decode_proto(inputs,
+                                     "learning.SpeechData.MapField",
+                                     ["key", "value"], [tf.string, tf.string],
+                                     descriptor_source=string_descriptor)
+
+        return (outputs.values[0][0], outputs.values[1][0])
+
+    outputs = tf.map_fn(parse_attribute,
+                        speech_data_parsed.values[3],
+                        fn_output_signature=((tf.TensorSpec(None,
+                                                            dtype=tf.string),
+                                              tf.TensorSpec(None,
+                                                            dtype=tf.string))))
+
     label_dict = {}
     label_dict["SEQ_DATA"] = speech_data_parsed.values[2][0]
     label_dict["SEQ_LEN"] = tf.constant(1)
 
-    return (acoust_dict, label_dict)
+    return (acoust_dict, label_dict, outputs[0], outputs[1])
