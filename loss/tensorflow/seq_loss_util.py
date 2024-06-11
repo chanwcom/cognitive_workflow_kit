@@ -5,8 +5,9 @@
 from __future__ import (absolute_import, division, print_function,
                         unicode_literals)
 
-__author__ = "Chanwoo Kim(chanw.com@samsung.com)"
+__author__ = "Chanwoo Kim(chanwcom@gmail.com)"
 
+# Third-party imports
 import tensorflow as tf
 import tensorflow_probability as tfp
 
@@ -112,6 +113,9 @@ def calculate_initial_log_seq_prob(label_len):
 # the code in C++.
 #
 # The following are some useful resources:
+
+
+# Third-party imports
 # * https://github.com/amaas/stanford-ctc/blob/master/ctc/ctc.py
 # * https://github.com/HawkAaron/warp-transducer/blob/master/tensorflow_binding/src/warprnnt_op.cc
 def calculate_log_label_prob(labels, softmax_output):
@@ -223,10 +227,7 @@ def label_trans_table(labels, labels_len):
 
 
 @tf.custom_gradient
-def ctc_loss(labels,
-             labels_len,
-             logits,
-             logits_len):
+def ctc_loss(labels, labels_len, logits, logits_len):
     """Calculates the Connectionist Temporal Classification (CTC) loss.
 
     Args:
@@ -341,7 +342,6 @@ def ctc_loss(labels,
         return [None, None, gradient, None]
 
     return loss, grad
-
 
 
 def _get_dim(tensor, i):
