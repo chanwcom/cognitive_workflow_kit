@@ -109,12 +109,6 @@ def calculate_initial_log_seq_prob(label_len):
     return initial_forward_log_seq_prob, initial_backward_log_seq_prob
 
 
-# TODO(chanw.com) Check the speed and if this routine is slow, re-implement
-# the code in C++.
-#
-# The following are some useful resources:
-
-
 # Third-party imports
 # * https://github.com/amaas/stanford-ctc/blob/master/ctc/ctc.py
 # * https://github.com/HawkAaron/warp-transducer/blob/master/tensorflow_binding/src/warprnnt_op.cc
@@ -356,7 +350,7 @@ def calculate_alpha_beta(label_trans_table, log_label_prob, label_len,
     This calculates the alpha and beta variables required for CTC computation.
     Note that the definition of beta variable is somewhat different from the
     original CTC paper. This equation will be explained in my future paper.
-    TODO(chanw.com) Adds the paper link.
+    TODO(chanwcom) Adds the paper link.
 
     Args:
         label_trans_table: A tensor containing the transition tables.
