@@ -204,15 +204,12 @@ class CtcLossTest(tf.test.TestCase):
             self._labels_len
         })
 
-        smoothing_coeff = 0.0
-        apply_smoothing_th = 0.0
-
         with tf.GradientTape() as tape:
             tape.watch(self._logits)
             actual_loss = seq_loss_util.ctc_loss(
                 blank_augmented_label["SEQ_DATA"],
                 blank_augmented_label["SEQ_LEN"], self._logits,
-                self._logits_len, smoothing_coeff, apply_smoothing_th)
+                self._logits_len)
 
             dy_dx = tape.gradient(actual_loss, self._logits)
 
@@ -235,45 +232,6 @@ class CtcLossTest(tf.test.TestCase):
         # yapf:enable
 
         self.assertAllClose(expected_output, dy_dx, atol=1e-05)
-
-
-class InternalMethodTest(tf.test.TestCase):
-    def test_apply_smoothing(self):
-        inputs = tf.constant(
-            [[[0.00, 0.02, 0.98],
-              [0.00, 0.00, 1.00],
-              [0.80, 0.10, 0.10],
-              [0.03, 0.96, 0.01]]]) # yapf: disable
-
-        expected_output = tf.constant(
-            [[[0.000, 0.100, 0.900],
-              [0.050, 0.050, 0.900],
-              [0.800, 0.100, 0.100],
-              [0.075, 0.900, 0.025]]]) # yapf: disable
-
-        smoothing_coeff = 0.1
-        actual_output = seq_loss_util._apply_smoothing(inputs, smoothing_coeff)
-
-        self.assertAllClose(expected_output, actual_output)
-
-    def test_apply_smoothing_zero_trailing(self):
-        inputs = tf.constant(
-            [[[0.00, 0.02, 0.98],
-              [0.00, 1.00, 0.00],
-              [0.00, 0.00, 0.00],
-              [0.00, 0.00, 0.00]]]) # yapf: disable
-
-        expected_output = tf.constant(
-            [[[0.000, 0.100, 0.900],
-              [0.050, 0.900, 0.050],
-              [0.000, 0.000, 0.000],
-              [0.000, 0.000, 0.000]]]) # yapf: disable
-
-        smoothing_coeff = 0.1
-
-        actual_output = seq_loss_util._apply_smoothing(inputs, smoothing_coeff)
-
-        self.assertAllClose(expected_output, actual_output)
 
 
 if __name__ == "__main__":

@@ -226,9 +226,7 @@ def label_trans_table(labels, labels_len):
 def ctc_loss(labels,
              labels_len,
              logits,
-             logits_len,
-             smoothing_coeff=0.0,
-             apply_smoothing_th=0.0):
+             logits_len):
     """Calculates the Connectionist Temporal Classification (CTC) loss.
 
     Args:
@@ -299,12 +297,6 @@ def ctc_loss(labels,
             axis=1),
         tf.cast(logits_len, dtype=tf.dtypes.float32)) # yapf: disable
 
-    # 1 if smoothing will be done.
-    smoothing_flag = tf.cast(
-        tf.math.less(tau, 1.0 - apply_smoothing_th),
-        dtype=tf.dtypes.float32) # yapf: disable
-    smoothing_flag = tf.reshape(smoothing_flag, [-1, 1, 1])
-
     def grad(upstream):
         vocab_size = _get_dim(logits, 2)
 
@@ -337,10 +329,7 @@ def ctc_loss(labels,
         #  if smoothing_flag is one, then smoothing result will be used.
         #  Otherwise,the original exp_nominator will be used in calculating the
         #  gradient.
-        gradient = (tf.nn.softmax(logits, axis=2) -
-                    ((smoothing_flag *
-                      _apply_smoothing(exp_nominator, smoothing_coeff)) +
-                     (1.0 - smoothing_flag) * exp_nominator))
+        gradient = (tf.nn.softmax(logits, axis=2) - exp_nominator)
 
         mask = tf.reshape(invalid_length_mask, (-1, 1, 1))
         gradient = tf.math.multiply(gradient, mask)
@@ -349,7 +338,7 @@ def ctc_loss(labels,
         gradient = tf.math.multiply(gradient, tf.expand_dims(seq_mask, axis=2))
         gradient = tf.math.multiply(gradient, tf.reshape(upstream, (-1, 1, 1)))
 
-        return [None, None, gradient, None, None, None]
+        return [None, None, gradient, None]
 
     return loss, grad
 
@@ -358,70 +347,6 @@ def ctc_loss(labels,
 def _get_dim(tensor, i):
     """Get value of tensor shape[i] preferring static value if available."""
     return tf.compat.dimension_value(tensor.shape[i]) or tf.shape(tensor)[i]
-
-
-def _apply_smoothing(inputs, smoothing_coeff):
-    """Applies smoothing.
-
-    Args:
-        inputs: A tensor containing exp(alaph+beta)
-            The shape is (batch_size, logit_length, label_length)
-            Note that it should not be the "log" probability but the
-            probability between 0 and 1.
-        smoothing_coeff:
-
-    Returns:
-    """
-    def true_fn(inputs):
-        return inputs
-
-    def false_fn(inputs):
-        # Finds cases of an one-hot vector.
-        #
-        # In this case, division by zero error will occur if we do not pre-process
-        # it. So temporarily add these vectors  with 1e-10.
-        ids = tf.where(inputs == 1)
-
-        # Replaces this value with a vector filled with 1e-10. This is done because
-        # the zero value will cause issues. The one value will be replaced by
-        # 1 - sommthing_coeff later.
-        updates = tf.fill(dims=[_get_dim(ids, 0),
-                                _get_dim(inputs, 2)],
-                          value=1e-10)
-
-        # It has the effect of adding a small value to the entire [b, m, :] so
-        # that division by zero will not happen.
-        inputs = tf.tensor_scatter_nd_add(inputs, ids[:, :-1], updates=updates)
-
-        # Values higher than 1 - (smoothing_coeff) are replaced with zeros.
-        ids_too_large = tf.where(inputs > 1 - smoothing_coeff)
-        values = tf.zeros(shape=(_get_dim(ids_too_large, 0)))
-        wo_largest = tf.tensor_scatter_nd_update(inputs, ids_too_large, values)
-
-        # Obtains the sum without the largest values.
-        sum_wo_largest = tf.math.reduce_sum(wo_largest, axis=2)
-
-        # Finds the maximum value along the label axis. Subtracts this value by
-        # (1 - smoothing coeff) and floors by zero.
-        #
-        # This will be the amount that will be subtracted from the maximum value
-        # and subsequently added to other values belonging to the same time step.
-        smoothing_values = (tf.math.maximum(
-            tf.math.reduce_max(inputs, axis=2) - (1 - smoothing_coeff), 0.0))
-
-        scaling_coeff = tf.math.divide_no_nan(
-            smoothing_values + sum_wo_largest, sum_wo_largest)
-        outputs = tf.expand_dims(scaling_coeff, -1) * inputs
-
-        # Replaces too large values with 1.0-smoothing_coeff.
-        updates = tf.fill(dims=[_get_dim(ids_too_large, 0)],
-                          value=1.0 - smoothing_coeff)
-        outputs = tf.tensor_scatter_nd_update(outputs, ids_too_large, updates)
-
-        return outputs
-
-    return tf.cond(tf.math.equal(smoothing_coeff, 0.0),
-                   lambda: true_fn(inputs), lambda: false_fn(inputs))
 
 
 def calculate_alpha_beta(label_trans_table, log_label_prob, label_len,
