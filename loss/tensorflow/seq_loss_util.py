@@ -109,30 +109,26 @@ def calculate_initial_log_seq_prob(label_len):
     return initial_forward_log_seq_prob, initial_backward_log_seq_prob
 
 
-# TODO(chanw.com) Check the speed and if this routine is slow, re-implement
-# the code in C++.
-#
-# The following are some useful resources:
-
-
 # Third-party imports
 # * https://github.com/amaas/stanford-ctc/blob/master/ctc/ctc.py
 # * https://github.com/HawkAaron/warp-transducer/blob/master/tensorflow_binding/src/warprnnt_op.cc
 def calculate_log_label_prob(labels, softmax_output):
-    """Calculates p(z_{[m]} = l' | x).
+    """Calculates log((\hat{y}_t)_{c_l}).
 
-    Note that z represents the time-synchronous label, m is the time index,
-    and l' is the blank-augmented label index. x is the label sequence.
+    The returned value is a three-dimensional tensor, where value is stored
+    in (b, t, l) where b is the batch index, t is the time index, and l ls the
+    label sequence index.
 
     Args:
         labels: A tensor containing a batch of ground-truth label sequences.
             Note that this label sequence should already include blank labels.
             The shape is given by (batch_size, max_labels_len).
-        softmax_output: The predicted "logit value". The shape is given by
-            (batch_size, max_logit_seq_len, num_classes).
+        softmax_output: The output of the model.
+            The shape is given by:
+            (batch_size, max_seq_len, num_classes).
 
     Returns:
-        The shape is (batch, max_logit_seq_len, max_labels_len).
+        The shape is (batch, max_seq_len, max_labels_len).
     """
     return tf.math.log(tf.gather(softmax_output, labels, batch_dims=1, axis=2))
 
@@ -356,7 +352,7 @@ def calculate_alpha_beta(label_trans_table, log_label_prob, label_len,
     This calculates the alpha and beta variables required for CTC computation.
     Note that the definition of beta variable is somewhat different from the
     original CTC paper. This equation will be explained in my future paper.
-    TODO(chanw.com) Adds the paper link.
+    TODO(chanwcom) Adds the paper link.
 
     Args:
         label_trans_table: A tensor containing the transition tables.
