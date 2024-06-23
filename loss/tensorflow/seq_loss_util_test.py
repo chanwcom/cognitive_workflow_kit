@@ -31,7 +31,6 @@ def adjust_minf(inputs):
 
 class SeqFormatConversionTest(tf.test.TestCase):
     """A class for testing methods in the seq_loss_util module."""
-
     @classmethod
     def setUpClass(cls) -> None:
         cls._y_sparse = {}
@@ -111,8 +110,6 @@ class SeqFormatConversionTest(tf.test.TestCase):
 
 
 class SeqLossUtilTest(tf.test.TestCase):
-    """A class for testing the forced_alignment_loss module."""
-
     def test_label_trans_table(self):
         """Tests the label_trans_table method."""
 
@@ -151,7 +148,6 @@ class SeqLossUtilTest(tf.test.TestCase):
 
 
 class CtcLossTest(tf.test.TestCase):
-    """A class for testing the forced_alignment_loss module."""
 
     @classmethod
     def setUpClass(cls):
@@ -177,8 +173,8 @@ class CtcLossTest(tf.test.TestCase):
                                     [0.1, 0.1, 0.6, 0.1, 0.1],
                                     [0.6, 0.1, 0.1, 0.1, 0.1],
                                     [0.0, 0.0, 0.0, 0.0, 0.0],
-                                    [0.0, 0.0, 0.0, 0.0,
-                                     0.0]]])  # yapf: enable
+                                    [0.0, 0.0, 0.0, 0.0, 0.0]]])
+        # yapf: enable
         cls._logits_len = tf.constant([7, 5])
 
     def test_ctc_loss(self):
