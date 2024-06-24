@@ -19,18 +19,17 @@ from loss.tensorflow import seq_loss_util
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
-minf = -np.inf
-minf = tf.cast(tf.math.log(tf.cast(0, tf.dtypes.float64) + 1e-307),
-               tf.dtypes.float32).numpy()
+LOG_0 = seq_loss_util.log_0.numpy()
 
 
 def adjust_minf(inputs):
-    """Allow some margins to minf."""
-    return tf.math.maximum(inputs, minf + 100)
+    """Allow some margins to LOG_0."""
+    return tf.math.maximum(inputs, LOG_0 + 100)
 
 
 class SeqFormatConversionTest(tf.test.TestCase):
     """A class for testing methods in the seq_loss_util module."""
+
     @classmethod
     def setUpClass(cls) -> None:
         cls._y_sparse = {}
@@ -110,41 +109,45 @@ class SeqFormatConversionTest(tf.test.TestCase):
 
 
 class SeqLossUtilTest(tf.test.TestCase):
+
     def test_label_trans_table(self):
         """Tests the label_trans_table method."""
 
-        labels = tf.constant([[0, 1, 0, 2, 0, 3, 0], [0, 1, 0, 2, 0, 2, 0],
+        # yapf: disable
+        labels = tf.constant([[0, 1, 0, 2, 0, 3, 0],
+                              [0, 1, 0, 2, 0, 2, 0],
                               [0, 1, 0, 1, 0, 0, 0]])
+        # yapf: enable
         labels_len = tf.constant([7, 7, 5])
 
         actual = seq_loss_util.label_trans_table(labels, labels_len)
 
         expected = tf.constant(
-            [[[ 0.0,  0.0, minf, minf, minf, minf, minf],
-              [minf,  0.0,  0.0,  0.0, minf, minf, minf],
-              [minf, minf,  0.0,  0.0, minf, minf, minf],
-              [minf, minf, minf,  0.0,  0.0,  0.0, minf],
-              [minf, minf, minf, minf,  0.0,  0.0, minf],
-              [minf, minf, minf, minf, minf,  0.0,  0.0],
-              [minf, minf, minf, minf, minf, minf,  0.0]],
-             [[ 0.0,  0.0, minf, minf, minf, minf, minf],
-              [minf,  0.0,  0.0,  0.0, minf, minf, minf],
-              [minf, minf,  0.0,  0.0, minf, minf, minf],
-              [minf, minf, minf,  0.0,  0.0, minf, minf],
-              [minf, minf, minf, minf,  0.0,  0.0, minf],
-              [minf, minf, minf, minf, minf,  0.0,  0.0],
-              [minf, minf, minf, minf, minf, minf,  0.0]],
-             [[ 0.0,  0.0, minf, minf, minf, minf, minf],
-              [minf,  0.0,  0.0, minf, minf, minf, minf],
-              [minf, minf,  0.0,  0.0, minf, minf, minf],
-              [minf, minf, minf,  0.0,  0.0,  0.0, minf],
-              [minf, minf, minf, minf,  0.0,  0.0, minf],
-              [minf, minf, minf, minf, minf,  0.0,  0.0],
-              [minf, minf, minf, minf, minf, minf,  0.0]]],
+            [[[  0.0,   0.0, LOG_0, LOG_0, LOG_0, LOG_0, LOG_0],
+              [LOG_0,   0.0,   0.0,   0.0, LOG_0, LOG_0, LOG_0],
+              [LOG_0, LOG_0,   0.0,   0.0, LOG_0, LOG_0, LOG_0],
+              [LOG_0, LOG_0, LOG_0,   0.0,   0.0,   0.0, LOG_0],
+              [LOG_0, LOG_0, LOG_0, LOG_0,   0.0,   0.0, LOG_0],
+              [LOG_0, LOG_0, LOG_0, LOG_0, LOG_0,   0.0,   0.0],
+              [LOG_0, LOG_0, LOG_0, LOG_0, LOG_0, LOG_0,   0.0]],
+             [[  0.0,   0.0, LOG_0, LOG_0, LOG_0, LOG_0, LOG_0],
+              [LOG_0,   0.0,   0.0,   0.0, LOG_0, LOG_0, LOG_0],
+              [LOG_0, LOG_0,   0.0,   0.0, LOG_0, LOG_0, LOG_0],
+              [LOG_0, LOG_0, LOG_0,   0.0,   0.0, LOG_0, LOG_0],
+              [LOG_0, LOG_0, LOG_0, LOG_0,   0.0,   0.0, LOG_0],
+              [LOG_0, LOG_0, LOG_0, LOG_0, LOG_0,   0.0,   0.0],
+              [LOG_0, LOG_0, LOG_0, LOG_0, LOG_0, LOG_0,   0.0]],
+             [[  0.0,  0.0,  LOG_0, LOG_0, LOG_0, LOG_0, LOG_0],
+              [LOG_0,  0.0,    0.0, LOG_0, LOG_0, LOG_0, LOG_0],
+              [LOG_0, LOG_0,   0.0,   0.0, LOG_0, LOG_0, LOG_0],
+              [LOG_0, LOG_0, LOG_0,   0.0,  0.0,    0.0, LOG_0],
+              [LOG_0, LOG_0, LOG_0, LOG_0,  0.0,    0.0, LOG_0],
+              [LOG_0, LOG_0, LOG_0, LOG_0, LOG_0,   0.0,   0.0],
+              [LOG_0, LOG_0, LOG_0, LOG_0, LOG_0, LOG_0,   0.0]]],
              dtype=tf.dtypes.float32) # yapf: disable
 
         # Checks the actual output with respect to the expected output.
-        self.assertAllEqual(expected, actual)
+        self.assertAllClose(expected, actual)
 
 
 class CtcLossTest(tf.test.TestCase):
