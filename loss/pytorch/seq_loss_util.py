@@ -13,6 +13,23 @@ import torch
 
 LOG_0 = torch.tensor(np.log(np.finfo(np.float64).tiny).astype(np.float32))
 
+
+def sequence_mask(lengths, maxlen=None, dtype=torch.bool):
+    """Applies sequence masking.
+
+    This implementation is based on the following website.
+    https://discuss.pytorch.org/t/pytorch-equivalent-for-tf-sequence-mask/39036/3
+
+    """
+    if maxlen is None:
+        maxlen = lengths.max()
+    row_vector = torch.arange(0, maxlen, 1)
+    matrix = torch.unsqueeze(lengths, dim=-1)
+    mask = row_vector < matrix
+
+    mask.type(dtype)
+    return mask
+
 def to_blank_augmented_labels(
         inputs: dict, blank_index: int=0,
         boundary_blanks: bool=True) -> dict:  # yapf: disable
@@ -92,7 +109,7 @@ def calculate_initial_log_seq_prob(label_len):
     """
 
     batch_size = _get_dim(label_len, 0)
-    max_label_len = tf.math.reduce_max(label_len)
+    max_label_len = torch.max(label_len)
     initial_forward_log_seq_prob = tf.one_hot(indices=tf.zeros(
         [batch_size], dtype=tf.dtypes.int32),
                                               depth=max_label_len,
@@ -222,7 +239,6 @@ def label_trans_table(labels, labels_len):
     return trans_table
 
 
-#@tf.custom_gradient
 #def ctc_loss(labels, labels_len, logits, logits_len):
 #    """Calculates the Connectionist Temporal Classification (CTC) loss.
 #
@@ -340,64 +356,65 @@ def label_trans_table(labels, labels_len):
 #    return loss, grad
 #
 #
-#def _get_dim(tensor, i):
-#    """Get value of tensor shape[i] preferring static value if available."""
-#    return tf.compat.dimension_value(tensor.shape[i]) or tf.shape(tensor)[i]
-#
-#
-#def calculate_alpha_beta(label_trans_table, log_label_prob, label_len,
-#                         logit_len):
-#    """Calculates the alpha best and beta best variables.
-#
-#    This calculates the alpha and beta variables required for CTC computation.
-#    Note that the definition of beta variable is somewhat different from the
-#    original CTC paper. This equation will be explained in my future paper.
-#    TODO(chanwcom) Adds the paper link.
-#
-#    Args:
-#        label_trans_table: A tensor containing the transition tables.
-#            The shape is (batch_size, max_label_seq_len, max_label_seq_len).
-#        log_label_prob: A tensor of posterior probabilities of each label.
-#            The shape is (batch_size, max_logit_len, max_label_len).
-#            Mathematically, it is given by the following equation:
-#                log (p_{[m]}(y_l | x)).
-#        label_len: A tensor containing the label lengths.
-#            The shape is (batch_size).
-#        logit_len: A tensor containing the logit lengths.
-#            The shape is (batch_size).
-#    """
-#    batch_size = _get_dim(log_label_prob, 0)
-#    max_label_len = tf.math.reduce_max(label_len)
-#    max_logit_len = tf.math.reduce_max(logit_len)
-#
-#    initial_log_seq_probs = calculate_initial_log_seq_prob(label_len)
-#
-#    def forward(accum, elem):
-#        log_seq_prob, accum_log_seq_prob_sum = accum
-#        log_label_prob, mask = elem
-#
-#        log_seq_prob = tf.expand_dims(log_seq_prob, axis=-1)
-#
-#        # Finds the maximum log_seq_prob. from the previous time step.
-#        log_seq_prob = tf.math.reduce_logsumexp(
-#            tf.math.add(log_seq_prob, label_trans_table),
-#            axis=1) # yapf: disable
-#
-#        # The log label probabilities are added.
-#        log_seq_prob += log_label_prob
-#
-#        # Normalizes the log sequence prob.
-#        #log_seq_prob_sum = tf.math.reduce_logsumexp(log_seq_prob, axis=1, keepdims=True)
-#        log_seq_prob_sum = tf.math.reduce_max(log_seq_prob,
-#                                              axis=1,
-#                                              keepdims=True)
-#        log_seq_prob -= log_seq_prob_sum
-#
-#        # Accumulates the sum.
-#        accum_log_seq_prob_sum += tf.squeeze(log_seq_prob_sum, axis=-1)
-#
-#        return (log_seq_prob, accum_log_seq_prob_sum)
-#
+
+
+def calculate_alpha_beta(label_trans_table, log_label_prob, label_len,
+                         logit_len):
+    """Calculates the alpha best and beta best variables.
+
+    This calculates the alpha and beta variables required for CTC computation.
+    Note that the definition of beta variable is somewhat different from the
+    original CTC paper. This equation will be explained in my future paper.
+    TODO(chanwcom) Adds the paper link.
+
+    Args:
+        label_trans_table: A tensor containing the transition tables.
+            The shape is (batch_size, max_label_seq_len, max_label_seq_len).
+        log_label_prob: A tensor of posterior probabilities of each label.
+            The shape is (batch_size, max_logit_len, max_label_len).
+            Mathematically, it is given by the following equation:
+                log (p_{[m]}(y_l | x)).
+        label_len: A tensor containing the label lengths.
+            The shape is (batch_size).
+        logit_len: A tensor containing the logit lengths.
+            The shape is (batch_size).
+    """
+    batch_size = log_label_prob.shape[0]
+    max_label_len = torch.max(label_len)
+    max_logit_len = torch.max(logit_len)
+
+    # Initalization of log_alpha and log_beta
+    log_alpha = torch.full((batch_size, max_logit_len, max_label_len),
+                           fill_value=LOG_0)
+    log_beta = torch.full((batch_size, max_logit_len, max_label_len),
+                          fill_value=LOG_0)
+
+    # Mask is used for calculating log_beta for proper backward initialization.
+    mask = sequence_mask(logit_len, maxlen=max_logit_len)
+
+    prev_log_alpha = ((1.0 - (torch.nn.functional.one_hot(
+        torch.zeros(size=(batch_size, ), dtype=torch.int64), max_label_len))) *
+                      LOG_0)
+    prev_log_beta = (
+        (1.0 - torch.nn.functional.one_hot(label_len - 1, max_label_len)) *
+        LOG_0)
+
+    accum_log_alpha_max = torch.zeros((batch_size), dtype=torch.float32)
+    for t in range(max_logit_len):
+        # Finds the maximum log_alpha. from the previous time step.
+        log_alpha[:, t, :] = (torch.logsumexp(torch.add(
+            torch.unsqueeze(prev_log_alpha, 2), label_trans_table),
+                                              dim=1) + log_label_prob[:, t, :])
+        # Normalizes the log sequence prob.
+        log_alpha_max = torch.max(log_alpha[:, t, :], axis=1,
+                                  keepdims=True).values
+        log_alpha[:, t, :] -= log_alpha_max
+
+        # Accumulates the maximum.
+        accum_log_alpha_max += torch.squeeze(log_alpha_max, axis=-1)
+        prev_log_alpha = log_alpha[:, t, :]
+
+
 #    def backward(log_seq_prob, elem):
 #        log_label_prob, mask = elem
 #
@@ -408,7 +425,6 @@ def label_trans_table(labels, labels_len):
 #            tf.math.add(log_seq_prob, label_trans_table), axis=2) # yapf: disable
 #
 #        # Normalizes the log sequence prob.
-#        #log_seq_prob_sum = tf.math.reduce_logsumexp(log_seq_prob, axis=1, keepdims=True)
 #        log_seq_prob_sum = tf.math.reduce_max(log_seq_prob,
 #                                              axis=1,
 #                                              keepdims=True)
@@ -421,8 +437,8 @@ def label_trans_table(labels, labels_len):
 #        # first multiplying with the mask. After that, re-initializes the
 #        # log_seq_prob to be "initial_log_seq_probs[1]".
 #        log_seq_prob = tf.math.multiply_no_nan(log_seq_prob, mask)
-#        log_seq_prob += tf.math.multiply_no_nan(initial_log_seq_probs[1],
-#                                                (1.0 - mask))
+#        log_seq_prob += tf.math.multiply_no_nan(
+#            initial_log_seq_probs[1], (1.0 - mask))
 #
 #        return log_seq_prob
 #
@@ -430,10 +446,16 @@ def label_trans_table(labels, labels_len):
 #        tf.sequence_mask(
 #            logit_len, maxlen=max_logit_len, dtype=tf.dtypes.float32),
 #        axis=-1) # yapf: disable
-#
-#    # We utilize the "tf.stop_gradient" API with the "tf.nest.map_structure"
-#    # API based on the recommendation in the following page:
-#    # https://www.tensorflow.org/api_docs/python/tf/scan
+
+
+
+# We utilize the "tf.stop_gradient" API with the "tf.nest.map_structure"
+# API based on the recommendation in the following page:
+# https://www.tensorflow.org/api_docs/python/tf/scan
+
+
+
+
 #    gamma, accum_log_seq_prob_sum = tf.nest.map_structure(
 #        tf.stop_gradient,
 #        tf.scan(forward,
@@ -471,5 +493,8 @@ def label_trans_table(labels, labels_len):
 #
 #    gamma += tf.math.multiply_no_nan(LOG_0, (1.0 - mask))
 #    delta += tf.math.multiply_no_nan(LOG_0, (1.0 - mask))
-#
-#    return gamma, delta, log_seq_prob_final
+
+# TODO(chanwcom) a Temporary value.
+    log_seq_prob_final = None
+
+    return log_alpha, log_beta, log_seq_prob_final

@@ -128,7 +128,7 @@ def calculate_log_label_prob(labels, softmax_output):
             (batch_size, max_seq_len, num_classes).
 
     Returns:
-        The shape is (batch, max_seq_len, max_labels_len).
+        The shape is (batch, max_seq_len, max_label_len).
     """
     return tf.math.log(tf.gather(softmax_output, labels, batch_dims=1, axis=2))
 
@@ -356,7 +356,7 @@ def calculate_alpha_beta(label_trans_table, log_label_prob, label_len,
 
     Args:
         label_trans_table: A tensor containing the transition tables.
-            The shape is (batch_size, max_label_seq_len, max_label_seq_len).
+            The shape is (batch_size, max_label_len, max_label_len).
         log_label_prob: A tensor of posterior probabilities of each label.
             The shape is (batch_size, max_logit_len, max_label_len).
             Mathematically, it is given by the following equation:
@@ -365,6 +365,15 @@ def calculate_alpha_beta(label_trans_table, log_label_prob, label_len,
             The shape is (batch_size).
         logit_len: A tensor containing the logit lengths.
             The shape is (batch_size).
+
+    Returns:
+        A tuple of (alpha, beta, log_seq_prob_final)
+        alpha: A tensor containing the "normalized" forward variable.
+            The shape is (batch_size, max_logit_len, max_label_len).
+        beta: A tensor containing the "normazlied" backward variable.
+            The shape is (batch_size, max_logit_len, max_label_len).
+        log_seq_prob_final:
+
     """
     batch_size = _get_dim(log_label_prob, 0)
     max_label_len = tf.math.reduce_max(label_len)

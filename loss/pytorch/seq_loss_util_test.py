@@ -146,35 +146,126 @@ class SeqLossUtilTest(unittest.TestCase):
         # Checks the actual output with respect to the expected output.
         torch.testing.assert_allclose(actual, expected)
 
+    def test_calculate_alpha_beta(self):
+        batch_size = 3
+        max_logit_len = 6
+        max_label_len = 5
 
-#class CtcLossTest(unittest.TestCase):
-#
-#    @classmethod
-#    def setUpClass(cls):
-#        # The shape of labels is (batch_size, labels_len).
-#        cls._labels = torch.tensor([[1, 2, 3], [3, 2, 0]], dtype=torch.int32)
-#        cls._labels_len = torch.tensor([3, 2], dtype=torch.int32)
-#
-#        # A tensor containing prediction values from the softmax layer.
-#
-#        # The shape of y_pred is (batch_size, pred_seq_len, num_classes).
-#        # The number of classes is 5.
-#        cls._logits = torch.tensor([[[0.6, 0.1, 0.1, 0.1, 0.1],
-#                                     [0.1, 0.6, 0.1, 0.1, 0.1],
-#                                     [0.3, 0.1, 0.1, 0.3, 0.1],
-#                                     [0.3, 0.1, 0.1, 0.3, 0.1],
-#                                     [0.6, 0.1, 0.1, 0.1, 0.1],
-#                                     [0.1, 0.1, 0.1, 0.1, 0.6],
-#                                     [0.2, 0.2, 0.2, 0.2, 0.2]],
-#                                    [[0.6, 0.1, 0.1, 0.1, 0.1],
-#                                     [0.1, 0.1, 0.1, 0.1, 0.6],
-#                                     [0.6, 0.1, 0.1, 0.1, 0.1],
-#                                     [0.1, 0.1, 0.6, 0.1, 0.1],
-#                                     [0.6, 0.1, 0.1, 0.1, 0.1],
-#                                     [0.0, 0.0, 0.0, 0.0, 0.0],
-#                                     [0.0, 0.0, 0.0, 0.0,
-#                                      0.0]]])  # yapf: enable
-#        cls._logits_len = torch.tensor([7, 5])
+        # yapf: disable
+        labels = torch.tensor([[0, 1, 0, 2, 0],
+                               [0, 1, 0, 1, 0],
+                               [0, 1, 0, 0, 0]])
+        labels_len = torch.tensor([5, 5, 3])
+        # yapf: enable
+        actual = seq_loss_util.label_trans_table(labels, labels_len)
+
+        label_trans_table = torch.tensor(
+            [[[  0.0,   0.0, LOG_0, LOG_0, LOG_0],
+              [LOG_0,   0.0,   0.0,   0.0, LOG_0],
+              [LOG_0, LOG_0,   0.0,   0.0, LOG_0],
+              [LOG_0, LOG_0, LOG_0,   0.0,   0.0],
+              [LOG_0, LOG_0, LOG_0, LOG_0,   0.0]],
+             [[  0.0,   0.0, LOG_0, LOG_0, LOG_0],
+              [LOG_0,   0.0,   0.0, LOG_0, LOG_0],
+              [LOG_0, LOG_0,   0.0,   0.0, LOG_0],
+              [LOG_0, LOG_0, LOG_0,   0.0,   0.0],
+              [LOG_0, LOG_0, LOG_0, LOG_0,   0.0]],
+             [[  0.0,   0.0, LOG_0, LOG_0, LOG_0],
+              [LOG_0,   0.0,   0.0,   0.0, LOG_0],
+              [LOG_0, LOG_0,   0.0,   0.0, LOG_0],
+              [LOG_0, LOG_0, LOG_0,   0.0,   0.0],
+              [LOG_0, LOG_0, LOG_0, LOG_0,   0.0]]]) # yapf: disable
+
+        # log_pred_label_prob is the predicted prob. of each token of the label.
+        #
+        # In equation form it is given by log(\tilde{y}_t)_(c_l).
+        # \tilde{y}_t is time-aligned model output which predictes the probabilty
+        # of the token. The index is [b, t, l].
+        log_pred_label_prob = torch.randn(size=(batch_size, max_logit_len,
+                                                max_label_len))
+        log_pred_label_prob = torch.log_softmax(log_pred_label_prob, axis=2)
+        logits_len = torch.tensor([6, 5, 4])
+
+        (alpha, beta, log_seq_prob_final) = seq_loss_util.calculate_alpha_beta(
+            label_trans_table, log_pred_label_prob, labels_len, logits_len)
+
+        # yapf: disable
+        expected_alpha = torch.tensor(
+            [[[    0.0000,    -1.0881,  -707.7258,  -708.0544,  -708.5428],
+              [    0.0000,    -0.1939,    -0.3696,    -0.9559,  -706.1531],
+              [   -1.9146,    -1.0410,     0.0000,    -1.2649,    -3.1246],
+              [   -3.6110,    -1.8486,    -0.7171,     0.0000,    -1.3944],
+              [   -4.0316,    -0.6778,    -1.8094,     0.0000,    -0.5339],
+              [   -5.3798,    -0.9123,    -0.1723,    -2.4190,     0.0000]],
+             [[    0.0000,    -2.4450,  -706.6018,  -706.2614,  -709.4107],
+              [    0.0000,    -0.2672,    -1.6509,  -705.3391,  -705.7469],
+              [   -1.0821,    -0.8717,     0.0000,    -3.2433,  -704.1838],
+              [   -0.0266,    -0.7374,    -0.7130,     0.0000,    -1.9096],
+              [   -0.6087,    -0.0082,    -0.9106,    -0.8778,     0.0000],
+              [ -710.2783,  -707.5999,  -710.8660,  -709.0690,  -706.8936]],
+             [[   -0.5627,     0.0000,  -705.8452, -1413.8931, -1413.9279],
+              [   -1.4187,     0.0000,    -0.9661,  -708.7030, -1414.7341],
+              [   -3.4511,    -2.2539,    -1.4808,  -707.5606,  -706.8936],
+              [   -3.9060,    -2.1698,     0.0000,  -707.5084,  -707.0101],
+              [ -712.7349,  -710.0615,  -708.4570, -1414.4249, -1413.7872],
+              [ -713.8657,  -710.7015,  -709.4113, -1415.2185, -1413.7872]]])
+        expected_beta = torch.tensor(
+            [[[   -0.9860,     0.0000,    -0.2954,    -2.1958,    -3.9582],
+              [   -1.2640,     0.0000,    -0.2671,    -1.6373,    -3.2085],
+              [   -1.3105,     0.0000,    -0.2677,    -0.1549,    -1.2309],
+              [   -1.5800,    -0.2123,    -0.5062,     0.0000,    -0.8766],
+              [ -705.0048,    -2.5524,    -2.5524,     0.0000,    -0.0811],
+              [ -705.7950,  -705.5073,  -705.7950,     0.0000,     0.0000]],
+             [[   -2.5423,    -0.7287,    -0.0387,     0.0000,    -0.8125],
+              [   -5.5621,    -1.5363,    -1.0153,     0.0000,    -0.1636],
+              [ -705.6790,    -3.8235,    -1.2994,     0.0000,    -0.2888],
+              [ -705.9285,  -706.0543,    -1.4164,     0.0000,    -0.2778],
+              [ -706.4599,  -706.5057,  -706.6983,     0.0000,     0.0000],
+              [-1413.7872, -1413.7872, -1413.7872, -1413.7872,  -706.8936]],
+             [[   -0.0057,     0.0000,    -1.3275, -1410.8773, -1411.7058],
+              [   -0.6360,     0.0000,    -0.5041, -1409.7847, -1409.8673],
+              [   -1.5262,     0.0000,    -0.2451, -1412.7612, -1413.2437],
+              [ -705.6595,     0.0000,     0.0000, -1411.9282, -1412.2358],
+              [-1413.7872, -1413.7872,  -706.8936, -2120.6809, -2120.6809],
+              [-1413.7872, -1413.7872,  -706.8936, -2120.6809, -2120.6809]]])
+        # yapf: enable
+        expected_log_seq_prob_final = torch.tensor([-5.9462, -6.9765, -5.3152])
+
+        torch.testing.assert_allclose(alpha, expected_alpha, atol=1e-4)
+        #torch.testing.assert_allclose(beta, expected_beta, atol=1e-4)
+        #torch.testing.assert_allclose(
+        #    log_seq_prob_final, expected_log_seq_prob_final, atol=1e-4)
+
+
+class CtcLossTest(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        # The shape of labels is (batch_size, labels_len).
+        cls._labels = torch.tensor([[1, 2, 3], [3, 2, 0]], dtype=torch.int32)
+        cls._labels_len = torch.tensor([3, 2], dtype=torch.int32)
+
+        # A tensor containing prediction values from the softmax layer.
+
+        # The shape of y_pred is (batch_size, pred_seq_len, num_classes).
+        # The number of classes is 5.
+        cls._logits = torch.tensor([[[0.6, 0.1, 0.1, 0.1, 0.1],
+                                     [0.1, 0.6, 0.1, 0.1, 0.1],
+                                     [0.3, 0.1, 0.1, 0.3, 0.1],
+                                     [0.3, 0.1, 0.1, 0.3, 0.1],
+                                     [0.6, 0.1, 0.1, 0.1, 0.1],
+                                     [0.1, 0.1, 0.1, 0.1, 0.6],
+                                     [0.2, 0.2, 0.2, 0.2, 0.2]],
+                                    [[0.6, 0.1, 0.1, 0.1, 0.1],
+                                     [0.1, 0.1, 0.1, 0.1, 0.6],
+                                     [0.6, 0.1, 0.1, 0.1, 0.1],
+                                     [0.1, 0.1, 0.6, 0.1, 0.1],
+                                     [0.6, 0.1, 0.1, 0.1, 0.1],
+                                     [0.0, 0.0, 0.0, 0.0, 0.0],
+                                     [0.0, 0.0, 0.0, 0.0,
+                                      0.0]]])  # yapf: enable
+        cls._logits_len = torch.tensor([7, 5])
+
 
 #    def test_ctc_loss(self):
 #        """Tests the ctc_loss method."""

@@ -16,5 +16,6 @@ py_test(
     ],
     deps = [
         ":seq_loss_util",
+        "//math_lib:math_util",
     ],
 )
