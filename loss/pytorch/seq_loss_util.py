@@ -11,7 +11,9 @@ __author__ = "Chanwoo Kim(chanwcom@gmail.com)"
 import numpy as np
 import torch
 
-LOG_0 = torch.tensor(np.log(np.finfo(np.float64).tiny).astype(np.float32))
+#LOG_0 = torch.tensor(np.log(np.finfo(np.float64).tiny).astype(np.float32))
+
+LOG_0 = torch.tensor(np.log(1e-307)).type(torch.float32)
 
 
 def sequence_mask(lengths, maxlen=None, dtype=torch.bool):
@@ -27,8 +29,7 @@ def sequence_mask(lengths, maxlen=None, dtype=torch.bool):
     matrix = torch.unsqueeze(lengths, dim=-1)
     mask = row_vector < matrix
 
-    mask.type(dtype)
-    return mask
+    return mask.type(dtype)
 
 def to_blank_augmented_labels(
         inputs: dict, blank_index: int=0,
@@ -157,16 +158,16 @@ def calculate_log_label_prob(labels, softmax_output):
 
 def _calculate_unnormalized_log_seq_prob(gamma, accum_log_seq_prob_sum,
                                          logit_len, label_len):
-    batch_size = _get_dim(gamma, 0)
+    batch_size = gamma.shape[0]
     batch_range = tf.range(batch_size)
 
     # Obtains the list of indices for the sequence ends.
     #
     # Note that the sequence may end at L -1 (blank label) or L - 2 (the last
     # non-blank label).
-    indices0 = tf.stack([batch_range, logit_len - 1, label_len - 1], axis=1)
-    indices1 = tf.stack([batch_range, logit_len - 1, label_len - 2], axis=1)
-    indices = tf.concat([indices0, indices1], axis=0)
+    indices0 = torch.stack([batch_range, logit_len - 1, label_len - 1], axis=1)
+    indices1 = torch.stack([batch_range, logit_len - 1, label_len - 2], axis=1)
+    indices = torch.concat([indices0, indices1], axis=0)
 
     seq_final_value = tf.transpose(
         tf.reshape(tf.gather_nd(gamma, indices), shape=[-1, batch_size]))
@@ -354,8 +355,6 @@ def label_trans_table(labels, labels_len):
 #        return [None, None, gradient, None]
 #
 #    return loss, grad
-#
-#
 
 
 def calculate_alpha_beta(label_trans_table, log_label_prob, label_len,
@@ -395,16 +394,16 @@ def calculate_alpha_beta(label_trans_table, log_label_prob, label_len,
     prev_log_alpha = ((1.0 - (torch.nn.functional.one_hot(
         torch.zeros(size=(batch_size, ), dtype=torch.int64), max_label_len))) *
                       LOG_0)
-    prev_log_beta = (
-        (1.0 - torch.nn.functional.one_hot(label_len - 1, max_label_len)) *
-        LOG_0)
-
     accum_log_alpha_max = torch.zeros((batch_size), dtype=torch.float32)
+
     for t in range(max_logit_len):
-        # Finds the maximum log_alpha. from the previous time step.
-        log_alpha[:, t, :] = (torch.logsumexp(torch.add(
-            torch.unsqueeze(prev_log_alpha, 2), label_trans_table),
-                                              dim=1) + log_label_prob[:, t, :])
+        # Calculates log_alpha recursively from the previous time step.
+        log_alpha[:, t, :] = (
+            torch.logsumexp(
+                torch.add(torch.unsqueeze(prev_log_alpha, 2),
+                          label_trans_table), dim=1)
+            + log_label_prob[:, t, :]) # yapf: disable
+
         # Normalizes the log sequence prob.
         log_alpha_max = torch.max(log_alpha[:, t, :], axis=1,
                                   keepdims=True).values
@@ -414,87 +413,74 @@ def calculate_alpha_beta(label_trans_table, log_label_prob, label_len,
         accum_log_alpha_max += torch.squeeze(log_alpha_max, axis=-1)
         prev_log_alpha = log_alpha[:, t, :]
 
+    initial_log_beta = (
+        (1.0 - torch.nn.functional.one_hot(label_len - 1, max_label_len)) *
+        LOG_0)
+    prev_log_beta = initial_log_beta
 
-#    def backward(log_seq_prob, elem):
-#        log_label_prob, mask = elem
-#
-#        log_seq_prob += log_label_prob
-#
-#        log_seq_prob = tf.expand_dims(log_seq_prob, axis=1)
-#        log_seq_prob = tf.math.reduce_logsumexp(
-#            tf.math.add(log_seq_prob, label_trans_table), axis=2) # yapf: disable
-#
-#        # Normalizes the log sequence prob.
-#        log_seq_prob_sum = tf.math.reduce_max(log_seq_prob,
-#                                              axis=1,
-#                                              keepdims=True)
-#
-#        log_seq_prob -= log_seq_prob_sum
-#
-#        # Correctly initializes log_seq_prob from the length info.
-#        #
-#        # If mask is zero, then makes the current log_seq_prob zero
-#        # first multiplying with the mask. After that, re-initializes the
-#        # log_seq_prob to be "initial_log_seq_probs[1]".
-#        log_seq_prob = tf.math.multiply_no_nan(log_seq_prob, mask)
-#        log_seq_prob += tf.math.multiply_no_nan(
-#            initial_log_seq_probs[1], (1.0 - mask))
-#
-#        return log_seq_prob
-#
-#    mask = tf.expand_dims(
-#        tf.sequence_mask(
-#            logit_len, maxlen=max_logit_len, dtype=tf.dtypes.float32),
-#        axis=-1) # yapf: disable
+    time_mask = torch.unsqueeze(sequence_mask(logit_len,
+                                              maxlen=max_logit_len,
+                                              dtype=torch.float32),
+                                axis=2)
 
+    next_log_label_prob = torch.zeros(size=(batch_size, max_label_len))
+    for t in range(max_logit_len - 1, -1, -1):
+        # Calculates log_beta recursively from the next time step.
+        log_beta[:, t, :] = (torch.logsumexp(torch.add(
+            torch.unsqueeze(prev_log_beta + next_log_label_prob, 1),
+            label_trans_table),
+                                             dim=2))
 
+        next_log_label_prob = log_label_prob[:, t, :]
 
-# We utilize the "tf.stop_gradient" API with the "tf.nest.map_structure"
-# API based on the recommendation in the following page:
-# https://www.tensorflow.org/api_docs/python/tf/scan
+        # Normalizes the log beta prob. using the maximum value at time t.
+        log_beta_max = torch.max(log_beta[:, t, :], axis=1,
+                                 keepdims=True).values
+        log_beta[:, t, :] -= log_beta_max
 
+        # Correctly initializes log_beta from the length info.
+        #
+        # If mask is zero, then makes the current log_beta zero
+        # first multiplying with the mask. After that, re-initializes the
+        # log_beta to be "initial_log_beta".
 
+        log_beta[:, t, :] = torch.multiply(log_beta[:, t, :], time_mask[:,
+                                                                        t, :])
+        log_beta[:, t, :] += torch.multiply(initial_log_beta,
+                                            (1.0 - time_mask[:, t, :]))
 
+        prev_log_beta = log_beta[:, t, :]
 
-#    gamma, accum_log_seq_prob_sum = tf.nest.map_structure(
-#        tf.stop_gradient,
-#        tf.scan(forward,
-#                elems=(
-#                    tf.transpose(log_label_prob, perm=[1, 0, 2]),
-#                    tf.transpose(mask, perm=[1, 0, 2])),
-#                initializer=(
-#                    initial_log_seq_probs[0],
-#                    tf.fill(dims=[batch_size], value=0.0)))) # yapf: disable
-#    gamma = tf.transpose(gamma, perm=[1, 0, 2])
-#    accum_log_seq_prob_sum = tf.transpose(accum_log_seq_prob_sum, [1, 0])
-#
-#    zero_padded_log_label_prob = tf.pad(log_label_prob[:, 1:, :],
-#                                        [[0, 0], [0, 1], [0, 0]])
-#
-#    delta = tf.nest.map_structure(
-#        tf.stop_gradient,
-#        tf.scan(backward,
-#                elems=(tf.transpose(zero_padded_log_label_prob, perm=[1, 0, 2]),
-#                       tf.transpose(mask, perm=[1, 0, 2])),
-#                reverse=True,
-#                initializer=initial_log_seq_probs[1])) # yapf: disable
-#    delta = tf.transpose(delta, perm=[1, 0, 2])
-#
-#    log_seq_prob_final = _calculate_unnormalized_log_seq_prob(
-#        gamma, accum_log_seq_prob_sum, logit_len, label_len)
-#
-#    gamma += tf.math.multiply_no_nan(LOG_0, (1.0 - mask))
-#    delta += tf.math.multiply_no_nan(LOG_0, (1.0 - mask))
-#
-#    mask = tf.expand_dims(
-#        tf.sequence_mask(
-#            label_len, maxlen=max_label_len, dtype=tf.dtypes.float32),
-#        axis=1) # yapf: disable
-#
-#    gamma += tf.math.multiply_no_nan(LOG_0, (1.0 - mask))
-#    delta += tf.math.multiply_no_nan(LOG_0, (1.0 - mask))
+    log_alpha += torch.multiply(LOG_0, (1.0 - time_mask))
+    log_beta += torch.multiply(LOG_0, (1.0 - time_mask))
 
-# TODO(chanwcom) a Temporary value.
+    label_mask = torch.unsqueeze(sequence_mask(label_len,
+                                               maxlen=max_label_len,
+                                               dtype=torch.float32),
+                                 axis=1)
+    log_alpha += torch.multiply(LOG_0, (1.0 - label_mask))
+    log_beta += torch.multiply(LOG_0, (1.0 - label_mask))
+
+    # We utilize the "tf.stop_gradient" API with the "tf.nest.map_structure"
+    # API based on the recommendation in the following page:
+    # https://www.tensorflow.org/api_docs/python/tf/scan
+
+    #
+    #    log_seq_prob_final = _calculate_unnormalized_log_seq_prob(
+    #        gamma, accum_log_seq_prob_sum, logit_len, label_len)
+    #
+    #    gamma += tf.math.multiply_no_nan(LOG_0, (1.0 - mask))
+    #    delta += tf.math.multiply_no_nan(LOG_0, (1.0 - mask))
+    #
+    #    mask = tf.expand_dims(
+    #        tf.sequence_mask(
+    #            label_len, maxlen=max_label_len, dtype=tf.dtypes.float32),
+    #        axis=1) # yapf: disable
+    #
+    #    gamma += tf.math.multiply_no_nan(LOG_0, (1.0 - mask))
+    #    delta += tf.math.multiply_no_nan(LOG_0, (1.0 - mask))
+
+    # TODO(chanwcom) a Temporary value.
     log_seq_prob_final = None
 
     return log_alpha, log_beta, log_seq_prob_final
