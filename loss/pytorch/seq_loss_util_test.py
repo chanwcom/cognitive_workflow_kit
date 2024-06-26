@@ -151,6 +151,9 @@ class SeqLossUtilTest(unittest.TestCase):
         max_logit_len = 6
         max_label_len = 5
 
+        # Sets the random seed.
+        np.random.seed(0)
+
         # yapf: disable
         labels = torch.tensor([[0, 1, 0, 2, 0],
                                [0, 1, 0, 1, 0],
@@ -181,9 +184,13 @@ class SeqLossUtilTest(unittest.TestCase):
         # In equation form it is given by log(\tilde{y}_t)_(c_l).
         # \tilde{y}_t is time-aligned model output which predictes the probabilty
         # of the token. The index is [b, t, l].
-        log_pred_label_prob = torch.randn(size=(batch_size, max_logit_len,
-                                                max_label_len))
-        log_pred_label_prob = torch.log_softmax(log_pred_label_prob, axis=2)
+        # yapf: disable
+        log_pred_label_prob = np.random.normal(
+            size=(batch_size, max_logit_len, max_label_len)).astype(np.float32)
+        log_pred_label_prob = torch.log_softmax(
+            torch.tensor(log_pred_label_prob), axis=2)
+        # yapf: enable
+
         logits_len = torch.tensor([6, 5, 4])
 
         (alpha, beta, log_seq_prob_final) = seq_loss_util.calculate_alpha_beta(
@@ -232,7 +239,15 @@ class SeqLossUtilTest(unittest.TestCase):
         # yapf: enable
         expected_log_seq_prob_final = torch.tensor([-5.3125, -4.9338, -4.7480])
 
-        torch.testing.assert_allclose(alpha, expected_alpha, atol=1e-4)
+        torch.testing.assert_allclose(alpha,
+                                      expected_alpha,
+                                      atol=1e-4,
+                                      rtol=1e-4)
+        torch.testing.assert_allclose(beta,
+                                      expected_beta,
+                                      atol=1e-4,
+                                      rtol=1e-4)
+
         #torch.testing.assert_allclose(beta, expected_beta, atol=1e-4)
         #torch.testing.assert_allclose(
         #    log_seq_prob_final, expected_log_seq_prob_final, atol=1e-4)

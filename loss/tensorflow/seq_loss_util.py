@@ -396,7 +396,6 @@ def calculate_alpha_beta(label_trans_table, log_label_prob, label_len,
         log_seq_prob += log_label_prob
 
         # Normalizes the log sequence prob.
-        #log_seq_prob_sum = tf.math.reduce_logsumexp(log_seq_prob, axis=1, keepdims=True)
         log_seq_prob_sum = tf.math.reduce_max(log_seq_prob,
                                               axis=1,
                                               keepdims=True)
@@ -417,7 +416,6 @@ def calculate_alpha_beta(label_trans_table, log_label_prob, label_len,
             tf.math.add(log_seq_prob, label_trans_table), axis=2) # yapf: disable
 
         # Normalizes the log sequence prob.
-        #log_seq_prob_sum = tf.math.reduce_logsumexp(log_seq_prob, axis=1, keepdims=True)
         log_seq_prob_sum = tf.math.reduce_max(log_seq_prob,
                                               axis=1,
                                               keepdims=True)
