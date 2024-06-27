@@ -95,38 +95,6 @@ def to_blank_augmented_labels(
     return output
 
 
-def calculate_initial_log_seq_prob(label_len):
-    """Calculates CTC alignment initial and final state log probabilities.
-
-    Create the initial/final state values directly as log values to avoid
-    having to take a float64 log on tpu (which does not exist).
-
-    Args:
-        label_len: int tensor of shape [batch_size], seq lengths in the batch.
-        max_label_len: int, max sequence length possible.
-
-    Returns:
-        initial_state_log_probs, final_state_log_probs
-    """
-
-    batch_size = _get_dim(label_len, 0)
-    max_label_len = torch.max(label_len)
-    initial_forward_log_seq_prob = tf.one_hot(indices=tf.zeros(
-        [batch_size], dtype=tf.dtypes.int32),
-                                              depth=max_label_len,
-                                              on_value=0.0,
-                                              off_value=LOG_0,
-                                              axis=1)
-
-    initial_backward_log_seq_prob = tf.one_hot(indices=label_len - 1,
-                                               depth=max_label_len,
-                                               on_value=0.0,
-                                               off_value=LOG_0,
-                                               axis=1)
-
-    return initial_forward_log_seq_prob, initial_backward_log_seq_prob
-
-
 # Third-party imports
 # * https://github.com/amaas/stanford-ctc/blob/master/ctc/ctc.py
 # * https://github.com/HawkAaron/warp-transducer/blob/master/tensorflow_binding/src/warprnnt_op.cc
@@ -424,10 +392,9 @@ def calculate_alpha_beta(label_trans_table, log_label_prob, label_len,
         LOG_0)
     prev_log_beta = initial_log_beta
 
-    time_mask = torch.unsqueeze(sequence_mask(logit_len,
-                                              maxlen=max_logit_len,
-                                              dtype=torch.float32),
-                                axis=2)
+    time_mask = torch.unsqueeze(
+        sequence_mask(logit_len, maxlen=max_logit_len, dtype=torch.float32),
+        axis=2) # yapf: disable
 
     next_log_label_prob = torch.zeros(size=(batch_size, max_label_len))
     for t in range(max_logit_len - 1, -1, -1):
