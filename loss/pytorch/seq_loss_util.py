@@ -156,28 +156,30 @@ def calculate_log_label_prob(labels, softmax_output):
     return tf.math.log(tf.gather(softmax_output, 1, labels))
 
 
-def _calculate_unnormalized_log_seq_prob(gamma, accum_log_seq_prob_sum,
+def _calculate_unnormalized_log_seq_prob(log_alpha, accum_log_seq_prob_sum,
                                          logit_len, label_len):
-    batch_size = gamma.shape[0]
-    batch_range = tf.range(batch_size)
+    # In alpha calculation, the log probabilty is normalized to prevent
+    # over-flowing and under-flowing. This effect is compensated here.
+    # log_p_ctc = log
+    batch_size = log_alpha.shape[0]
+    batch_index = torch.range(0, batch_size - 1, dtype=torch.int32)
 
-    # Obtains the list of indices for the sequence ends.
+    final_log_alpha0 = log_alpha[batch_index, logit_len - 1, label_len - 1]
+    final_log_alpha1 = log_alpha[batch_index, logit_len - 1, label_len - 2]
+
+    # max(alpha_{T-1,L-1}, alpha_{T-1,L})
     #
-    # Note that the sequence may end at L -1 (blank label) or L - 2 (the last
-    # non-blank label).
-    indices0 = torch.stack([batch_range, logit_len - 1, label_len - 1], axis=1)
-    indices1 = torch.stack([batch_range, logit_len - 1, label_len - 2], axis=1)
-    indices = torch.concat([indices0, indices1], axis=0)
-
-    seq_final_value = tf.transpose(
-        tf.reshape(tf.gather_nd(gamma, indices), shape=[-1, batch_size]))
-    seq_final_value = tf.reduce_max(seq_final_value, axis=1)
+    # TODO(chanwcom)
+    # There is an issue with the following statement.
+    # It should be  addition rather than max.
+    # alpha_{T-1,L-2}, alpha_{T-1,L-1}
+    # log(Exp(log_alpha_{T-1, L-2}) + Exp(log_alpha_{T-1, L-1}))
+    final_log_alpha = torch.max(final_log_alpha0, final_log_alpha1)
 
     # Finds the accumulated log seq probability at the last time index.
-    indices = tf.stack([batch_range, logit_len - 1], axis=1)
-    final_accum = tf.gather_nd(accum_log_seq_prob_sum, indices)
+    final_accum = accum_log_seq_prob_sum[batch_index, logit_len - 1]
 
-    return seq_final_value + final_accum
+    return final_log_alpha + final_accum
 
 
 def label_trans_table(labels, labels_len):
@@ -394,7 +396,9 @@ def calculate_alpha_beta(label_trans_table, log_label_prob, label_len,
     prev_log_alpha = ((1.0 - (torch.nn.functional.one_hot(
         torch.zeros(size=(batch_size, ), dtype=torch.int64), max_label_len))) *
                       LOG_0)
-    accum_log_alpha_max = torch.zeros((batch_size), dtype=torch.float32)
+    accum_log_alpha_max = torch.zeros((batch_size, max_logit_len),
+                                      dtype=torch.float32)
+    prev_log_alpha_max = torch.zeros((batch_size), dtype=torch.float32)
 
     for t in range(max_logit_len):
         # Calculates log_alpha recursively from the previous time step.
@@ -410,7 +414,9 @@ def calculate_alpha_beta(label_trans_table, log_label_prob, label_len,
         log_alpha[:, t, :] -= log_alpha_max
 
         # Accumulates the maximum.
-        accum_log_alpha_max += torch.squeeze(log_alpha_max, axis=-1)
+        accum_log_alpha_max[:, t] = (prev_log_alpha_max +
+                                     torch.squeeze(log_alpha_max, axis=-1))
+        prev_log_alpha_max = accum_log_alpha_max[:, t]
         prev_log_alpha = log_alpha[:, t, :]
 
     initial_log_beta = (
@@ -465,22 +471,7 @@ def calculate_alpha_beta(label_trans_table, log_label_prob, label_len,
     # API based on the recommendation in the following page:
     # https://www.tensorflow.org/api_docs/python/tf/scan
 
-    #
-    #    log_seq_prob_final = _calculate_unnormalized_log_seq_prob(
-    #        gamma, accum_log_seq_prob_sum, logit_len, label_len)
-    #
-    #    gamma += tf.math.multiply_no_nan(LOG_0, (1.0 - mask))
-    #    delta += tf.math.multiply_no_nan(LOG_0, (1.0 - mask))
-    #
-    #    mask = tf.expand_dims(
-    #        tf.sequence_mask(
-    #            label_len, maxlen=max_label_len, dtype=tf.dtypes.float32),
-    #        axis=1) # yapf: disable
-    #
-    #    gamma += tf.math.multiply_no_nan(LOG_0, (1.0 - mask))
-    #    delta += tf.math.multiply_no_nan(LOG_0, (1.0 - mask))
-
-    # TODO(chanwcom) a Temporary value.
-    log_seq_prob_final = None
+    log_seq_prob_final = _calculate_unnormalized_log_seq_prob(
+        log_alpha, accum_log_alpha_max, logit_len, label_len)
 
     return log_alpha, log_beta, log_seq_prob_final
