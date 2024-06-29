@@ -21,84 +21,92 @@ from loss.pytorch import seq_loss_util
 # Sets the log of minius inifinty of the float 32 type.
 LOG_0 = seq_loss_util.LOG_0
 
-#class SeqFormatConversionTest(unittest.TestCase):
-#    """A class for testing methods in the seq_loss_util module."""
-#    @classmethod
-#    def setUpClass(cls) -> None:
-#        cls._y_sparse = {}
-#        cls._y_sparse["SEQ_DATA"] = torch.tensor(
-#            [[1, 3, 4, 2, 5], [1, 4, 2, 5, 0]], dtype=torch.int32)
-#        cls._y_sparse["SEQ_LEN"] = torch.tensor([5, 4], dtype=torch.int32)
-#
-#    def test_to_blank_augmented_labels_default_blank_index(self):
-#        blank_index = 0
-#
-#        actual_output = seq_loss_util.to_blank_augmented_labels(
-#            self._y_sparse, blank_index)
-#
-#        expected_output = {}
-#        expected_output["SEQ_DATA"] = torch.tensor(
-#            [[0, 2, 0, 4, 0, 5, 0, 3, 0, 6, 0],
-#             [0, 2, 0, 5, 0, 3, 0, 6, 0, 0, 0]],
-#            dtype=torch.int32)
-#        expected_output["SEQ_LEN"] = torch.tensor([11, 9],
-#                                                 dtype=torch.int32)
-#        self.assertAllEqual(expected_output["SEQ_DATA"],
-#                            actual_output["SEQ_DATA"])
-#        self.assertAllEqual(expected_output["SEQ_LEN"],
-#                            actual_output["SEQ_LEN"])
-#
-#    def test_to_blank_augmented_labels_default_blank_index_no_boundary_blanks(
-#            self):
-#        blank_index = 0
-#
-#        actual_output = seq_loss_util.to_blank_augmented_labels(
-#            self._y_sparse, blank_index, False)
-#
-#        expected_output = {}
-#        expected_output["SEQ_DATA"] = torch.tensor(
-#            [[2, 0, 4, 0, 5, 0, 3, 0, 6], [2, 0, 5, 0, 3, 0, 6, 0, 0]],
-#            dtype=torch.int32)
-#        expected_output["SEQ_LEN"] = torch.tensor([9, 7], dtype=torch.int32)
-#        self.assertAllEqual(expected_output["SEQ_DATA"],
-#                            actual_output["SEQ_DATA"])
-#        self.assertAllEqual(expected_output["SEQ_LEN"],
-#                            actual_output["SEQ_LEN"])
-#
-#    def test_to_blank_augmented_labels_specific_blank_index(self):
-#        blank_index = 6
-#
-#        actual_output = seq_loss_util.to_blank_augmented_labels(
-#            self._y_sparse, blank_index)
-#
-#        expected_output = {}
-#        expected_output["SEQ_DATA"] = torch.tensor(
-#            [[6, 1, 6, 3, 6, 4, 6, 2, 6, 5, 6],
-#             [6, 1, 6, 4, 6, 2, 6, 5, 6, 0, 0]],
-#            dtype=torch.int32)
-#        expected_output["SEQ_LEN"] = torch.tensor([11, 9],
-#                                                 dtype=torch.int32)
-#        self.assertAllEqual(expected_output["SEQ_DATA"],
-#                            actual_output["SEQ_DATA"])
-#        self.assertAllEqual(expected_output["SEQ_LEN"],
-#                            actual_output["SEQ_LEN"])
-#
-#    def test_to_blank_augmented_labels_specific_blank_index_no_boundary_blanks(
-#            self):
-#        blank_index = 6
-#
-#        actual_output = seq_loss_util.to_blank_augmented_labels(
-#            self._y_sparse, blank_index, False)
-#
-#        expected_output = {}
-#        expected_output["SEQ_DATA"] = torch.tensor(
-#            [[1, 6, 3, 6, 4, 6, 2, 6, 5], [1, 6, 4, 6, 2, 6, 5, 0, 0]],
-#            dtype=torch.int32)
-#        expected_output["SEQ_LEN"] = torch.tensor([9, 7], dtype=torch.int32)
-#        self.assertAllEqual(expected_output["SEQ_DATA"],
-#                            actual_output["SEQ_DATA"])
-#        self.assertAllEqual(expected_output["SEQ_LEN"],
-#                            actual_output["SEQ_LEN"])
+
+class SeqFormatConversionTest(unittest.TestCase):
+    """A class for testing methods in the seq_loss_util module."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._y_sparse = {}
+        cls._y_sparse["SEQ_DATA"] = torch.tensor(
+            [[1, 3, 4, 2, 5], [1, 4, 2, 5, 0]], dtype=torch.int32)
+        cls._y_sparse["SEQ_LEN"] = torch.tensor([5, 4], dtype=torch.int32)
+
+    def test_to_blank_augmented_labels_default_blank_index(self):
+        blank_index = 0
+
+        actual_output = seq_loss_util.to_blank_augmented_labels(
+            self._y_sparse, blank_index)
+
+        expected_output = {}
+        expected_output["SEQ_DATA"] = torch.tensor(
+            [[0, 2, 0, 4, 0, 5, 0, 3, 0, 6, 0],
+             [0, 2, 0, 5, 0, 3, 0, 6, 0, 0, 0]],
+            dtype=torch.int32)
+        expected_output["SEQ_LEN"] = torch.tensor([11, 9], dtype=torch.int32)
+
+        self.assertTrue(
+            torch.equal(expected_output["SEQ_DATA"],
+                        actual_output["SEQ_DATA"]))
+        self.assertTrue(
+            torch.equal(expected_output["SEQ_LEN"], actual_output["SEQ_LEN"]))
+
+    def test_to_blank_augmented_labels_default_blank_index_no_boundary_blanks(
+            self):
+        blank_index = 0
+
+        actual_output = seq_loss_util.to_blank_augmented_labels(
+            self._y_sparse, blank_index, False)
+
+        expected_output = {}
+        expected_output["SEQ_DATA"] = torch.tensor(
+            [[2, 0, 4, 0, 5, 0, 3, 0, 6],
+             [2, 0, 5, 0, 3, 0, 6, 0, 0]],
+            dtype=torch.int32) # yapf: disable
+        expected_output["SEQ_LEN"] = torch.tensor([9, 7], dtype=torch.int32)
+        self.assertTrue(
+            torch.equal(expected_output["SEQ_DATA"],
+                        actual_output["SEQ_DATA"]))
+        self.assertTrue(
+            torch.equal(expected_output["SEQ_LEN"], actual_output["SEQ_LEN"]))
+
+    def test_to_blank_augmented_labels_specific_blank_index(self):
+        blank_index = 6
+
+        actual_output = seq_loss_util.to_blank_augmented_labels(
+            self._y_sparse, blank_index)
+
+        expected_output = {}
+        expected_output["SEQ_DATA"] = torch.tensor(
+            [[6, 1, 6, 3, 6, 4, 6, 2, 6, 5, 6],
+             [6, 1, 6, 4, 6, 2, 6, 5, 6, 0, 0]],
+            dtype=torch.int32)
+        expected_output["SEQ_LEN"] = torch.tensor([11, 9], dtype=torch.int32)
+
+        self.assertTrue(
+            torch.equal(expected_output["SEQ_DATA"],
+                        actual_output["SEQ_DATA"]))
+        self.assertTrue(
+            torch.equal(expected_output["SEQ_LEN"], actual_output["SEQ_LEN"]))
+
+    def test_to_blank_augmented_labels_specific_blank_index_no_boundary_blanks(
+            self):
+        blank_index = 6
+
+        actual_output = seq_loss_util.to_blank_augmented_labels(
+            self._y_sparse, blank_index, False)
+
+        expected_output = {}
+        expected_output["SEQ_DATA"] = torch.tensor(
+            [[1, 6, 3, 6, 4, 6, 2, 6, 5],
+             [1, 6, 4, 6, 2, 6, 5, 0, 0]],
+            dtype=torch.int32) # yapf: disable
+        expected_output["SEQ_LEN"] = torch.tensor([9, 7], dtype=torch.int32)
+        self.assertTrue(
+            torch.equal(expected_output["SEQ_DATA"],
+                        actual_output["SEQ_DATA"]))
+        self.assertTrue(
+            torch.equal(expected_output["SEQ_LEN"], actual_output["SEQ_LEN"]))
 
 
 class SeqLossUtilTest(unittest.TestCase):
@@ -144,7 +152,7 @@ class SeqLossUtilTest(unittest.TestCase):
              dtype=torch.float32) # yapf: disable
 
         # Checks the actual output with respect to the expected output.
-        torch.testing.assert_allclose(actual, expected)
+        torch.testing.assert_close(actual, expected)
 
     def test_calculate_alpha_beta(self):
         batch_size = 3
@@ -239,19 +247,13 @@ class SeqLossUtilTest(unittest.TestCase):
         # yapf: enable
         expected_log_seq_prob_final = torch.tensor([-5.3125, -4.9338, -4.7480])
 
-        torch.testing.assert_allclose(alpha,
-                                      expected_alpha,
-                                      atol=1e-4,
-                                      rtol=1e-4)
-        torch.testing.assert_allclose(beta,
-                                      expected_beta,
-                                      atol=1e-4,
-                                      rtol=1e-4)
+        torch.testing.assert_close(alpha, expected_alpha, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(beta, expected_beta, atol=1e-4, rtol=1e-4)
 
-        torch.testing.assert_allclose(log_seq_prob_final,
-                                      expected_log_seq_prob_final,
-                                      atol=1e-4,
-                                      rtol=1e-4)
+        torch.testing.assert_close(log_seq_prob_final,
+                                   expected_log_seq_prob_final,
+                                   atol=1e-4,
+                                   rtol=1e-4)
 
 
 class CtcLossTest(unittest.TestCase):
