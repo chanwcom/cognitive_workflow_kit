@@ -248,9 +248,10 @@ class SeqLossUtilTest(unittest.TestCase):
                                       atol=1e-4,
                                       rtol=1e-4)
 
-        #torch.testing.assert_allclose(beta, expected_beta, atol=1e-4)
-        #torch.testing.assert_allclose(
-        #    log_seq_prob_final, expected_log_seq_prob_final, atol=1e-4)
+        torch.testing.assert_allclose(log_seq_prob_final,
+                                      expected_log_seq_prob_final,
+                                      atol=1e-4,
+                                      rtol=1e-4)
 
 
 class CtcLossTest(unittest.TestCase):

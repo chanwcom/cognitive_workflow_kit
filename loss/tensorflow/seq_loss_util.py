@@ -13,6 +13,8 @@ import tensorflow_probability as tfp
 
 log_0 = tf.cast(tf.math.log(tf.cast(0, tf.dtypes.float64) + 1e-307),
                 tf.dtypes.float32)
+#LOG_0 = tf.constant(np.log(np.finfo(np.float64).tiny).astype(np.float32))
+
 def to_blank_augmented_labels(
         inputs: dict, blank_index: int=0,
         boundary_blanks: bool=True) -> dict:  # yapf: disable
