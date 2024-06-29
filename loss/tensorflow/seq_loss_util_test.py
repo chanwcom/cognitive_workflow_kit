@@ -241,8 +241,7 @@ class SeqLossUtilTest(tf.test.TestCase):
               [-1413.7872, -1413.7872,  -706.8936, -2120.6809, -2120.6809]]])
         # yapf: enable
 
-        expected_log_seq_prob_final = tf.constant(
-            [-5.312494, -4.9338045, -4.747966])
+        expected_log_seq_prob_final = tf.constant([-5.3125, -4.9338, -4.7480])
         self.assertAllClose(expected_alpha, alpha, atol=1e-4)
         self.assertAllClose(expected_beta, beta, atol=1e-4)
         self.assertAllClose(expected_log_seq_prob_final,
