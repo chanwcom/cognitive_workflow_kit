@@ -304,13 +304,18 @@ def ctc_loss(labels, labels_len, logits, logits_len):
 
         # Update is done for each label to reduce memory requirement.
         def while_body(l, nominator):
-            xi_l = log_gamma[:, :, l]
             onehot = tf.one_hot(labels[:, l],
                                 depth=vocab_size,
                                 on_value=0.0,
                                 off_value=log_0)
-            updates = tf.expand_dims(xi_l, axis=2) + tf.expand_dims(onehot,
-                                                                    axis=1)
+            # For specific "l", multiply gamma_{t, l} with one_hot(c_l).
+            #
+            # For each example in a batch, it becomes a vector where the
+            # c_l element has the value of gamma{t, l}.
+            # Note that c_l is "j", which is the class index.
+            # Since logarithm is used, multiplictaion is changed with addition.
+            updates = (tf.expand_dims(log_gamma[:, :, l], axis=2)
+                       + tf.expand_dims(onehot, axis=1))
 
             nominator = tfp.math.log_add_exp(nominator, updates)
 
