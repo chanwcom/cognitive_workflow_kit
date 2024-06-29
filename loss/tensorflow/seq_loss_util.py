@@ -271,12 +271,22 @@ def ctc_loss(labels, labels_len, logits, logits_len):
 
     loss = -tf.math.multiply_no_nan(log_seq_prob, invalid_length_mask)
 
-    # "gamma" is the posterior probability of label index.
+    # "gamma" is the posterior probability of the alignment variable $q_t$.
+    #
+    # The alignment variable $q_t$ is a random variable representing
+    # the distribution  of the label sequcne index $l$ at time $t$.
+    #
+    # gamma is defined by:
+    #  p(\mathbf{q_t} = l | \mathbbm{x}, \mathbbm{y}).
+    #
+    # gamma can be expressed in terms of \alpha and \beta as follows:
+    #   gamma_{t, l} = sum_{l \in {l | q_t = l}} \alpha_{t, l} \beta{t, l}
+    #                / sum_{l=0^L-1} \alpha_{t, l} \beta{t, l}.
     #
     # log_gamma is defined as follows:
-    #   log p(q_{[m]} = l'| x, y) where m is the temporal index, and l' is the
-    # blank-augmented label index. q_{[m]} is the "path variable" at time m.
-    # The shape of log_gamma is (batch_size, max_logits__len, max_label_len).
+    #   log p(q_t = l| x, y) where t is the temporal index, and l is the
+    # blank-augmented label sequence index.
+    # The shape of log_gamma is (batch_size, max_logits_len, max_label_len).
     log_gamma = alpha + beta
     gamma_sum = tf.math.reduce_logsumexp(log_gamma, axis=2, keepdims=True)
     log_gamma -= gamma_sum
@@ -299,11 +309,17 @@ def ctc_loss(labels, labels_len, logits, logits_len):
     def grad(upstream):
         vocab_size = _get_dim(logits, 2)
 
-        nominator = tf.fill(dims=tf.shape(logits), value=log_0)
+        log_ground_truth_prob = tf.fill(dims=tf.shape(logits), value=log_0)
         max_labels_len = tf.math.reduce_max(labels_len)
 
+        # Calculates an estimated ground-truth vector \tilde{\mathbbm{y}}.
+        #
         # Update is done for each label to reduce memory requirement.
-        def while_body(l, nominator):
+        # TODO(chanwcom)Is it really true?
+        # Check with real codes.
+
+        # Update is done for each label to reduce memory requirement.
+        def while_body(l, log_ground_truth_prob):
             onehot = tf.one_hot(labels[:, l],
                                 depth=vocab_size,
                                 on_value=0.0,
@@ -314,26 +330,27 @@ def ctc_loss(labels, labels_len, logits, logits_len):
             # c_l element has the value of gamma{t, l}.
             # Note that c_l is "j", which is the class index.
             # Since logarithm is used, multiplictaion is changed with addition.
-            updates = (tf.expand_dims(log_gamma[:, :, l], axis=2)
-                       + tf.expand_dims(onehot, axis=1))
+            updates = (tf.expand_dims(log_gamma[:, :, l], axis=2) +
+                       tf.expand_dims(onehot, axis=1))
 
-            nominator = tfp.math.log_add_exp(nominator, updates)
+            log_ground_truth_prob = tfp.math.log_add_exp(
+                log_ground_truth_prob, updates)
 
-            return (l + 1, nominator)
+            return (l + 1, log_ground_truth_prob)
 
         l = tf.constant(0)
-        nominator = tf.while_loop(
+        log_ground_truth_prob = tf.while_loop(
             lambda l, _1: tf.less(l, max_labels_len),
-            while_body, [l, nominator])[1] # yapf: disable
+            while_body, [l, log_ground_truth_prob])[1] # yapf: disable
 
-        exp_nominator = tf.math.exp(nominator)
+        exp_log_ground_truth_prob = tf.math.exp(log_ground_truth_prob)
         # Since log_gamma is already normalized with respect to all the labels, just
-        # subtracting the nominator is fine.
+        # subtracting the log_ground_truth_prob is fine.
         #
         #  if smoothing_flag is one, then smoothing result will be used.
-        #  Otherwise,the original exp_nominator will be used in calculating the
+        #  Otherwise,the original exp_log_ground_truth_prob will be used in calculating the
         #  gradient.
-        gradient = (tf.nn.softmax(logits, axis=2) - exp_nominator)
+        gradient = (tf.nn.softmax(logits, axis=2) - exp_log_ground_truth_prob)
 
         mask = tf.reshape(invalid_length_mask, (-1, 1, 1))
         gradient = tf.math.multiply(gradient, mask)
