@@ -58,38 +58,37 @@ def to_blank_augmented_labels(
 
     # If some values are larger than blank_index, then those values are added
     # by one to make a room for the blank index.
-    ids = tf.where(inputs["SEQ_DATA"] >= blank_index)
-    values = tf.gather_nd(inputs["SEQ_DATA"], ids) + 1
-    updated_data = tf.tensor_scatter_nd_update(inputs["SEQ_DATA"], ids, values)
+    ids = torch.where(inputs["SEQ_DATA"] >= blank_index)
+    updated_data = inputs["SEQ_DATA"].clone().detach()
+    updated_data[ids] = inputs["SEQ_DATA"][ids] + 1
 
     output = {}
-
     # Creates a tensor filled with blank values.
-    blank_tensor = tf.fill(tf.shape(inputs["SEQ_DATA"]), blank_index)
+    blank_tensor = torch.full(inputs["SEQ_DATA"].shape, fill_value=blank_index)
 
     # updated_data is interleaved with the blank tensor using "stacking" and
     # "reshaping".
     if boundary_blanks:
-        data = tf.stack((blank_tensor, updated_data), axis=2)
-        data = tf.reshape(data, (tf.shape(updated_data)[0], -1))
+        data = torch.stack((blank_tensor, updated_data), axis=2)
+        data = torch.reshape(data, (updated_data.shape[0], -1))
 
         # Concatenates a zero at the end of the sequence.
-        padded = tf.fill((tf.shape(updated_data)[0], 1), blank_index)
-        data = tf.concat((data, padded), axis=1)
+        padded = torch.full((updated_data.shape[0], 1), fill_value=blank_index)
+        data = torch.concat((data, padded), axis=1)
 
         # If boundary_blanks are not used, then the length is 2 * L + 1.
         output["SEQ_LEN"] = 2 * inputs["SEQ_LEN"] + 1
     else:
-        data = tf.stack((updated_data, blank_tensor), axis=2)
-        data = tf.reshape(data, (tf.shape(updated_data)[0], -1))
+        data = torch.stack((updated_data, blank_tensor), axis=2)
+        data = torch.reshape(data, (updated_data.shape[0], -1))
         data = data[:, :-1]
 
         # If boundary_blanks are not used, then the length is 2 * L - 1.
         output["SEQ_LEN"] = 2 * inputs["SEQ_LEN"] - 1
 
-    mask = tf.cast(tf.sequence_mask(output["SEQ_LEN"],
-                                    maxlen=tf.shape(data)[1]),
-                   dtype=data.dtype)
+    mask = sequence_mask(output["SEQ_LEN"],
+                         maxlen=data.shape[1],
+                         dtype=data.dtype)
     output["SEQ_DATA"] = data * mask
 
     return output
@@ -130,7 +129,7 @@ def _calculate_unnormalized_log_seq_prob(log_alpha, accum_log_seq_prob_sum,
     # over-flowing and under-flowing. This effect is compensated here.
     # log_p_ctc = log
     batch_size = log_alpha.shape[0]
-    batch_index = torch.range(0, batch_size - 1, dtype=torch.int32)
+    batch_index = torch.arange(batch_size, dtype=torch.int32)
 
     final_log_alpha0 = log_alpha[batch_index, logit_len - 1, label_len - 1]
     final_log_alpha1 = log_alpha[batch_index, logit_len - 1, label_len - 2]
@@ -178,7 +177,7 @@ def label_trans_table(labels, labels_len):
     """
 
     max_seq_len = torch.max(labels_len)
-    l = torch.range(0, max_seq_len - 1, dtype=torch.int32)
+    l = torch.arange(max_seq_len, dtype=torch.int32)
 
     # Indices corresponding to i -> i.
     indices0 = torch.stack([l, l], axis=1)
@@ -208,6 +207,133 @@ def label_trans_table(labels, labels_len):
     trans_table[indices] = LOG_0
 
     return trans_table
+
+
+class CtcLoss(torch.autograd.Function):
+    """A class for calculating the CTC loss."""
+
+    @staticmethod
+    def ctc_loss(ctc, labels, labels_len, logits, logits_len):
+        """Calculates the Connectionist Temporal Classification (CTC) loss.
+
+
+         Args:
+             labels: A tensor containing batch of ground-truth label sequences.
+                 Note that this label sequence should already include blank labels.
+                 The shape is given by (batch_size, max_labels_len).
+             labels_len: The lengths of labels that has the shape of
+                 (batch_size).
+             logits: The predicted "logit value". The shape is given by
+                 (batch_size, max_logit_seq_len, num_classes).
+             logits_len: The len of logits that has the shape of (batch_size).
+             smoothing_coeff:
+             apply_smoothing_th:
+
+     Note that zero values are assumed to be masked-values.
+
+     Returns:
+         A tuple containing (loss, grad)
+     """
+
+        # Alpha and beta should be calculated.
+
+        # Stored in the context.
+
+        # loss is calculated using alpha...
+
+        ctx.save_for_backward(alpha, beta, logits)
+
+        return ctc_loss(x)
+
+    @staticmethod
+    def backward(ctx, grad):
+        log_alpha, log_beta, labels, labels_len, logits, logits_len = ctx.saved_tensors
+        # "gamma" is the posterior probability of the alignment variable $q_t$.
+        #
+        # The "alignment variable" $q_t$ is a random variable representing
+        # the distribution  of the label sequcne index $l$ at time $t$.
+        #
+        # gamma is defined by:
+        #   p(\mathbf{q_t} = l | \mathbbm{x}, \mathbbm{y}).
+        #
+        # gamma can be expressed in terms of \alpha and \beta as follows:
+        #   gamma_{t, l} = sum_{l \in {l | q_t = l}} \alpha_{t, l} \beta{t, l}
+        #                / sum_{l=0^L-1} \alpha_{t, l} \beta{t, l}.
+        #
+        # log_gamma is defined as follows:
+        #   log p(q_t = l| x, y) where t is the temporal index, and l is the
+        # blank-augmented label sequence index.
+        # The shape of log_gamma is (batch_size, max_logits_len, max_label_len).
+        log_gamma = log_alpha + log_beta
+        log_gamma = log_gamma - torch.logsumexp(
+            log_gamma, axis=2, keepdim=True)
+
+        max_label_length = torch.max(lables_len)
+        num_classes = logits.shape[2]
+        log_ground_truth_prob = torch.zeros_like(logits, dtype=torch.float32)
+
+        # Calculates an estimated time-aligned ground-truth sequence.
+        #
+        # log_ground_truth_prob is \tilde{\mathbbm{y}_t}.
+        #
+        # Update is done for each label to reduce memory requirement.
+        # TODO(chanwcom)Is it really true?
+        # Check with real codes.
+        for l in range(max_label_len):
+            onehot = (1.0 - (torch.nn.functional.one_hot(
+                labels[:, l], num_classes))) * LOG_0
+
+            # For specific "l", multiply gamma_{t, l} with one_hot(c_l).
+            #
+            # For each example in a batch, it becomes a vector where the
+            # c_l element has the value of gamma{t, l}.
+            # Note that c_l is "j", which is the class index.
+            # Since logarithm is used, multiplictaion is changed with addition.
+            updates = (torch.unsqueeze(log_gamma[:, :, l], axis=2) +
+                       torch.unsqueeze(onehot, axis=1))
+            log_ground_truth_prob = torch.logaddexp(log_ground_truth_prob,
+                                                    updates)
+
+        gradient = -(torch.exp(log_ground_truth_prob) -
+                     torch.softmax(logits, axis=2))
+
+        # Invalid length mask
+
+        # TODO(chanwcom)
+        # Make the code here.
+
+        # The dimension of "gradient" is (batch_size, logit_len, num_classes)
+        out_grad = tf.math.multiply(gradient, grad)
+        return [None, None, gradient, None]
+
+        vocab_size = _get_dim(logits, 2)
+
+        nominator = tf.fill(dims=tf.shape(logits), value=LOG_0)
+        max_labels_len = tf.math.reduce_max(labels_len)
+
+        l = tf.constant(0)
+        nominator = tf.while_loop(
+            lambda l, _1: tf.less(l, max_labels_len),
+            while_body, [l, nominator])[1] # yapf: disable
+
+        exp_nominator = tf.math.exp(nominator)
+        # Since log_gamma is already normalized with respect to all the labels, just
+        # subtracting the nominator is fine.
+        #
+        #  if smoothing_flag is one, then smoothing result will be used.
+        #  Otherwise,the original exp_nominator will be used in calculating the
+        #  gradient.
+        gradient = (tf.nn.softmax(logits, axis=2) - exp_nominator)
+
+        mask = tf.reshape(invalid_length_mask, (-1, 1, 1))
+        gradient = tf.math.multiply(gradient, mask)
+
+        # The shape of gradient is (batch_size, max_logits_seq_len, num_classes).
+        gradient = tf.math.multiply(gradient, tf.expand_dims(seq_mask, axis=2))
+        gradient = tf.math.multiply(gradient, tf.reshape(upstream, (-1, 1, 1)))
+
+        return [None, None, gradient, None]
+        return custom_grad_ctc_loss(grad)
 
 
 #def ctc_loss(labels, labels_len, logits, logits_len):
