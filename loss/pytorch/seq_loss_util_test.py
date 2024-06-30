@@ -301,13 +301,14 @@ class CtcLossTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         # The shape of labels is (batch_size, labels_len).
-        cls._labels = torch.tensor([[1, 2, 3], [3, 2, 0]], dtype=torch.int32)
-        cls._labels_len = torch.tensor([3, 2], dtype=torch.int32)
+        cls._labels = torch.tensor([[1, 2, 3], [3, 2, 0]])
+        cls._labels_len = torch.tensor([3, 2])
 
         # A tensor containing prediction values from the softmax layer.
 
         # The shape of y_pred is (batch_size, pred_seq_len, num_classes).
         # The number of classes is 5.
+        # yapf: disable
         cls._logits = torch.tensor([[[0.6, 0.1, 0.1, 0.1, 0.1],
                                      [0.1, 0.6, 0.1, 0.1, 0.1],
                                      [0.3, 0.1, 0.1, 0.3, 0.1],
@@ -321,28 +322,30 @@ class CtcLossTest(unittest.TestCase):
                                      [0.1, 0.1, 0.6, 0.1, 0.1],
                                      [0.6, 0.1, 0.1, 0.1, 0.1],
                                      [0.0, 0.0, 0.0, 0.0, 0.0],
-                                     [0.0, 0.0, 0.0, 0.0,
-                                      0.0]]])  # yapf: enable
+                                     [0.0, 0.0, 0.0, 0.0, 0.0]]])
+        # yapf: enable
         cls._logits_len = torch.tensor([7, 5])
 
+    def test_ctc_loss(self):
+        """Tests the ctc_loss method."""
 
-#    def test_ctc_loss(self):
-#        """Tests the ctc_loss method."""
-#
-#        blank_augmented_label = seq_loss_util.to_blank_augmented_labels({
-#            "SEQ_DATA":
-#            self._labels,
-#            "SEQ_LEN":
-#            self._labels_len
-#        })
-#
-#        actual_loss = seq_loss_util.ctc_loss(blank_augmented_label["SEQ_DATA"],
-#                                             blank_augmented_label["SEQ_LEN"],
-#                                             self._logits, self._logits_len)
-#
-#        expected_loss = torch.tensor([6.115841, 4.7813644])
-#
-#        self.assertAllEqual(expected_loss, actual_loss)
+        blank_augmented_label = seq_loss_util.to_blank_augmented_labels({
+            "SEQ_DATA":
+            self._labels,
+            "SEQ_LEN":
+            self._labels_len
+        })
+
+        actual_loss = seq_loss_util.CtcLoss.apply(
+            blank_augmented_label["SEQ_DATA"],
+            blank_augmented_label["SEQ_LEN"],
+            self._logits, self._logits_len)  # yapf: disable
+
+        expected_loss = torch.tensor([6.115841, 4.7813644])
+
+        torch.testing.assert_close(expected_loss, actual_loss)
+
+
 #
 #    def test_ctc_loss_gradient(self):
 #        blank_augmented_label = seq_loss_util.to_blank_augmented_labels({

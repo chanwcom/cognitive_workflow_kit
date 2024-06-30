@@ -211,21 +211,19 @@ class CtcLoss(torch.autograd.Function):
     """A class for calculating the CTC loss."""
 
     @staticmethod
-    def ctc_loss(ctc, labels, labels_len, logits, logits_len):
+    def forward(ctx, labels, labels_len, logits, logits_len):
         """Calculates the Connectionist Temporal Classification (CTC) loss.
 
-
-         Args:
-             labels: A tensor containing batch of ground-truth label sequences.
-                 Note that this label sequence should already include blank labels.
-                 The shape is given by (batch_size, max_labels_len).
-             labels_len: The lengths of labels that has the shape of
-                 (batch_size).
-             logits: The predicted "logit value". The shape is given by
-                 (batch_size, max_logit_seq_len, num_classes).
-             logits_len: The len of logits that has the shape of (batch_size).
-             smoothing_coeff:
-             apply_smoothing_th:
+        Args:
+            ctx: Contexts for this CtcLoss operation.
+            labels: A tensor containing batch of ground-truth label sequences.
+                Note that this label sequence should already include blank labels.
+                The shape is given by (batch_size, max_labels_len).
+            labels_len: The lengths of labels that has the shape of
+                (batch_size).
+            logits: The predicted "logit value". The shape is given by
+                (batch_size, max_logit_seq_len, num_classes).
+            logits_len: The len of logits that has the shape of (batch_size).
 
         Note that zero values are assumed to be masked-values.
 
@@ -278,7 +276,7 @@ class CtcLoss(torch.autograd.Function):
 
         loss = -torch.multiply(log_seq_prob, invalid_length_mask)
 
-        ctx.save_for_backward(log_gamma, labels, lables_len, logits,
+        ctx.save_for_backward(log_gamma, labels, labels_len, logits,
                               logits_len)
 
         return loss
