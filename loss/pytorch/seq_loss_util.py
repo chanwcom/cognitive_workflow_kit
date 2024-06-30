@@ -283,11 +283,13 @@ class CtcLoss(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad):
+
         log_gamma, labels, labels_len, logits, logits_len = ctx.saved_tensors
 
-        max_label_length = torch.max(lables_len)
+        max_label_len = torch.max(labels_len)
         num_classes = logits.shape[2]
-        log_ground_truth_prob = torch.zeros_like(logits, dtype=torch.float32)
+        log_ground_truth_prob = torch.ones_like(logits,
+                                                dtype=torch.float32) * LOG_0
 
         # Calculates an estimated time-aligned ground-truth sequence.
         #
@@ -314,42 +316,22 @@ class CtcLoss(torch.autograd.Function):
         gradient = -(torch.exp(log_ground_truth_prob) -
                      torch.softmax(logits, dim=2))
 
-        # Invalid length mask
+        # To ignore an invalid loss case.
+        #
+        # If labels_len < logits_len, then the loss is not valid.
+        invalid_length_mask = (torch.greater_equal(
+            logits_len, labels_len)).type(torch.float32)
 
-        # TODO(chanwcom)
-        # Make the code here.
+        # Seqeunce mask
+        seq_mask = sequence_mask(logits_len,
+                                 maxlen=torch.max(logits_len),
+                                 dtype=log_gamma.dtype)
 
         # The dimension of "gradient" is (batch_size, logit_len, num_classes)
-        out_grad = tf.math.multiply(gradient, grad)
-        return [None, None, gradient, None]
+        gradient = torch.multiply(gradient, torch.unsqueeze(seq_mask, axis=2))
+        gradient = torch.multiply(gradient, torch.reshape(grad, (-1, 1, 1)))
 
-        vocab_size = _get_dim(logits, 2)
-
-        nominator = tf.fill(dims=tf.shape(logits), value=LOG_0)
-        max_labels_len = tf.math.reduce_max(labels_len)
-
-        l = tf.constant(0)
-        nominator = tf.while_loop(
-            lambda l, _1: tf.less(l, max_labels_len),
-            while_body, [l, nominator])[1] # yapf: disable
-
-        exp_nominator = tf.math.exp(nominator)
-        # Since log_gamma is already normalized with respect to all the labels, just
-        # subtracting the nominator is fine.
-        #
-        #  if smoothing_flag is one, then smoothing result will be used.
-        #  Otherwise,the original exp_nominator will be used in calculating the
-        #  gradient.
-        gradient = (tf.nn.softmax(logits, axis=2) - exp_nominator)
-
-        mask = tf.reshape(invalid_length_mask, (-1, 1, 1))
-        gradient = tf.math.multiply(gradient, mask)
-
-        # The shape of gradient is (batch_size, max_logits_seq_len, num_classes).
-        gradient = tf.math.multiply(gradient, tf.expand_dims(seq_mask, axis=2))
-        gradient = tf.math.multiply(gradient, tf.reshape(upstream, (-1, 1, 1)))
-
-        return [None, None, gradient, None]
+        return None, None, gradient, None
 
 
 def calculate_alpha_beta(label_trans_table, log_label_prob, label_len,
@@ -397,7 +379,7 @@ def calculate_alpha_beta(label_trans_table, log_label_prob, label_len,
         # Calculates log_alpha recursively from the previous time step.
         log_alpha[:, t, :] = (
             torch.logsumexp(
-                torch.add(torch.unsqueeze(prev_log_alpha, 2),
+                torch.add(torch.unsqueeze(prev_log_alpha, axis=2),
                           label_trans_table), dim=1)
             + log_label_prob[:, t, :]) # yapf: disable
 
