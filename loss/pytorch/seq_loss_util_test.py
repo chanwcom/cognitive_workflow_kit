@@ -154,6 +154,46 @@ class SeqLossUtilTest(unittest.TestCase):
         # Checks the actual output with respect to the expected output.
         torch.testing.assert_close(actual, expected)
 
+    def test_calculate_log_label_prob(self):
+        batch_size = 2
+        max_logit_len = 6
+        num_classes = 3
+
+        labels = torch.tensor([
+            [0, 1, 0, 2, 0],
+            [0, 2, 0, 1, 0],
+        ])
+
+        # Sets the random seed.
+        np.random.seed(0)
+
+        # yapf: disable
+        logits = np.random.normal(
+            size=(batch_size, max_logit_len, num_classes)).astype(np.float32)
+        # yapf: enable
+        softmax_output = torch.softmax(torch.Tensor(logits), dim=2)
+
+        actual_output = seq_loss_util.calculate_log_label_prob(
+            labels, softmax_output)
+        expected_output = torch.tensor(
+            [[[-0.5375, -1.9013, -0.5375, -1.3228, -0.5375],
+              [-0.5472, -0.9206, -0.5472, -3.7654, -0.5472],
+              [-0.5195, -1.6209, -0.5195, -1.5728, -0.5195],
+              [-1.5273, -1.7938, -1.5273, -0.4836, -1.5273],
+              [-0.8135, -1.4529, -0.8135, -1.1307, -0.8135],
+              [-1.5633, -0.4029, -1.5633, -2.1022, -1.5633]],
+             [[-0.3135, -3.1795, -0.3135, -1.4806, -0.3135],
+              [-0.9092, -2.3050, -0.9092, -0.6984, -0.9092],
+              [-0.1243, -2.3483, -0.1243, -3.8484, -0.1243],
+              [-2.4703, -0.8137, -2.4703, -0.7503, -2.4703],
+              [-0.9565, -1.9992, -0.9565, -0.7333, -0.9565],
+              [-2.6806, -0.5435, -2.6806, -1.0477, -2.6806]]])
+
+        torch.testing.assert_close(expected_output,
+                                   actual_output,
+                                   atol=1e-4,
+                                   rtol=1e-4)
+
     def test_calculate_alpha_beta(self):
         batch_size = 3
         max_logit_len = 6

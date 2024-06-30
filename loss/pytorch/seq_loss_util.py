@@ -114,13 +114,11 @@ def calculate_log_label_prob(labels, softmax_output):
             (batch_size, max_seq_len, num_classes).
 
     Returns:
-        The shape is (batch, max_seq_len, max_labels_len).
+        The shape is (batch, max_logit_len, max_labels_len).
     """
-
-    seq_len = softmax_output.shape[1]
-    labels = torch.tile(torch.unsqueeze(labels, 1), (1, seq_len, 1))
-
-    return tf.math.log(tf.gather(softmax_output, 1, labels))
+    max_logit_len = softmax_output.shape[1]
+    labels = torch.tile(torch.unsqueeze(labels, dim=1), (1, max_logit_len, 1))
+    return torch.log(torch.gather(input=softmax_output, dim=2, index=labels))
 
 
 def _calculate_unnormalized_log_seq_prob(log_alpha, accum_log_seq_prob_sum,
@@ -229,11 +227,19 @@ class CtcLoss(torch.autograd.Function):
              smoothing_coeff:
              apply_smoothing_th:
 
-     Note that zero values are assumed to be masked-values.
+        Note that zero values are assumed to be masked-values.
 
-     Returns:
-         A tuple containing (loss, grad)
-     """
+        Returns:
+            A tuple containing (loss, grad)
+        """
+        # Checks whether the shape of labels is (B, L).
+        assert labels.dim() == 2
+
+        # Checks whether the shape of logits is (B, T, C)
+        assert logits.dim() == 3
+
+        # Checks the consistency of the batch size.
+        assert labels.shape[0] == logits.shape[0]
 
         # Alpha and beta should be calculated.
 
@@ -243,7 +249,7 @@ class CtcLoss(torch.autograd.Function):
 
         ctx.save_for_backward(alpha, beta, logits)
 
-        return ctc_loss(x)
+        return True
 
     @staticmethod
     def backward(ctx, grad):
