@@ -380,8 +380,8 @@ def calculate_alpha_beta(label_trans_table, log_label_prob, label_len,
         log_alpha[:, t, :] = (
             torch.logsumexp(
                 torch.add(torch.unsqueeze(prev_log_alpha, axis=2),
-                          label_trans_table), dim=1)
-            + log_label_prob[:, t, :]) # yapf: disable
+                          label_trans_table),
+                dim=1) + log_label_prob[:, t, :]) # yapf: disable
 
         # Normalizes the log sequence prob.
         log_alpha_max = torch.max(log_alpha[:, t, :], axis=1,
@@ -406,10 +406,12 @@ def calculate_alpha_beta(label_trans_table, log_label_prob, label_len,
     next_log_label_prob = torch.zeros(size=(batch_size, max_label_len))
     for t in range(max_logit_len - 1, -1, -1):
         # Calculates log_beta recursively from the next time step.
-        log_beta[:, t, :] = (torch.logsumexp(torch.add(
-            torch.unsqueeze(prev_log_beta + next_log_label_prob, 1),
-            label_trans_table),
-                                             dim=2))
+        log_beta[:, t, :] = (
+            torch.logsumexp(
+                torch.add(torch.unsqueeze(
+                    prev_log_beta + next_log_label_prob, 1),
+                    label_trans_table),
+                dim=2)) # yapf: disable
 
         next_log_label_prob = log_label_prob[:, t, :]
 
@@ -424,8 +426,8 @@ def calculate_alpha_beta(label_trans_table, log_label_prob, label_len,
         # first multiplying with the mask. After that, re-initializes the
         # log_beta to be "initial_log_beta".
 
-        log_beta[:, t, :] = torch.multiply(log_beta[:, t, :], time_mask[:,
-                                                                        t, :])
+        log_beta[:, t, :] = torch.multiply(log_beta[:, t, :],
+                                           time_mask[:, t, :]) # yapf: disable
         log_beta[:, t, :] += torch.multiply(initial_log_beta,
                                             (1.0 - time_mask[:, t, :]))
 
