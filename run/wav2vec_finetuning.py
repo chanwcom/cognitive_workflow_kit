@@ -23,6 +23,7 @@ import numpy as np
 # Custom imports
 from data.format import speech_data_helper
 from typing import Any, Dict, List, Optional, Union
+from loss.pytorch import seq_loss_util
 
 # Prevents Tensorflow from using the entire GPU memory.
 #
@@ -151,7 +152,7 @@ model = AutoModelForCTC.from_pretrained(
 
 training_args = TrainingArguments(
     output_dir=
-    "/home/chanwcom/local_repositories/cognitive_workflow_kit/tool/models/asr_stop_model_final2",
+    "/home/chanwcom/local_repositories/cognitive_workflow_kit/tool/models/asr_stop_model_final3",
     per_device_train_batch_size=40,
     gradient_accumulation_steps=2,
     learning_rate=1e-4,
@@ -189,7 +190,38 @@ class MyTrainer(Trainer):
         else:
             return loss
 
-trainer = MyTrainer(
+class MyCtcTrainer(Trainer):
+    def compute_loss(self, model, inputs, return_outputs=False):
+
+        blank_augmented_inputs = {}
+        blank_augmented_inputs["SEQ_DATA"] = inputs["labels"]
+        blank_augmented_inputs["SEQ_LEN"] = torch.sum(
+            (inputs["labels"] >= 0).type(torch.int32), axis=1)
+
+        with torch.device(inputs["input_values"].device.type):
+            blank_augmented_inputs = seq_loss_util.to_blank_augmented_labels(
+                blank_augmented_inputs, 0, False)
+
+        target = inputs.pop("labels")
+        outputs = model(**inputs)
+
+        logits = outputs["logits"]
+        logits_lengths = torch.full(size=(logits.shape[1],), fill_value=logits.shape[0])
+
+        target = blank_augmented_inputs["SEQ_DATA"]
+        target_lengths = blank_augmented_inputs["SEQ_LEN"]
+
+        with torch.device(inputs["input_values"].device.type):
+            ctc_loss = seq_loss_util.CtcLoss()
+            loss = ctc_loss.apply(
+                target, target_lengths, logits.log_softmax(2), logits_lengths)
+
+        if return_outputs:
+            return loss, outputs
+        else:
+            return loss
+
+trainer = MyCtcTrainer(
     model=model,
     args=training_args,
     train_dataset=pytorch_train_dataset,

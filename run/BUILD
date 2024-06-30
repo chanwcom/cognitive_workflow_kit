@@ -12,6 +12,7 @@ py_binary(
     ],
     deps = [
         "//data/format:speech_data_helper",
+        "//loss/pytorch:seq_loss_util",
     ],
 )
 
