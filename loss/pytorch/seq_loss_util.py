@@ -321,6 +321,8 @@ class CtcLoss(torch.autograd.Function):
         # If labels_len < logits_len, then the loss is not valid.
         invalid_length_mask = (torch.greater_equal(
             logits_len, labels_len)).type(torch.float32)
+        gradient = torch.multiply(
+            gradient, torch.reshape(invalid_length_mask, (-1, 1, 1)))
 
         # Seqeunce mask
         seq_mask = sequence_mask(logits_len,
