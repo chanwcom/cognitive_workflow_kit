@@ -241,19 +241,15 @@ class CtcLoss(torch.autograd.Function):
         # Checks the consistency of the batch size.
         assert labels.shape[0] == logits.shape[0]
 
+        log_label_prob = calculate_log_label_prob(
+            labels, torch.softmax(logits, dim=-1))
+
+        trans_table = label_trans_table(labels, labels_len)
+
         # Alpha and beta should be calculated.
+        log_alpha, log_beta, log_seq_prob = calculate_alpha_beta(
+            trans_table, log_label_prob, labels_len, logits_len)
 
-        # Stored in the context.
-
-        # loss is calculated using alpha...
-
-        ctx.save_for_backward(alpha, beta, logits)
-
-        return True
-
-    @staticmethod
-    def backward(ctx, grad):
-        log_alpha, log_beta, labels, labels_len, logits, logits_len = ctx.saved_tensors
         # "gamma" is the posterior probability of the alignment variable $q_t$.
         #
         # The "alignment variable" $q_t$ is a random variable representing
@@ -273,6 +269,23 @@ class CtcLoss(torch.autograd.Function):
         log_gamma = log_alpha + log_beta
         log_gamma = log_gamma - torch.logsumexp(
             log_gamma, axis=2, keepdim=True)
+
+        # To ignore an invalid loss case.
+        #
+        # If labels_len < logits_len, then the loss is not valid.
+        invalid_length_mask = (torch.greater_equal(
+            logits_len, labels_len)).type(torch.float32)
+
+        loss = -torch.multiply(log_seq_prob, invalid_length_mask)
+
+        ctx.save_for_backward(log_gamma, labels, lables_len, logits,
+                              logits_len)
+
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad):
+        log_gamma, labels, labels_len, logits, logits_len = ctx.saved_tensors
 
         max_label_length = torch.max(lables_len)
         num_classes = logits.shape[2]
@@ -301,7 +314,7 @@ class CtcLoss(torch.autograd.Function):
                                                     updates)
 
         gradient = -(torch.exp(log_ground_truth_prob) -
-                     torch.softmax(logits, axis=2))
+                     torch.softmax(logits, dim=2))
 
         # Invalid length mask
 
