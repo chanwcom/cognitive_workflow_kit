@@ -322,7 +322,7 @@ class CtcLossTest(unittest.TestCase):
                                      [0.1, 0.1, 0.6, 0.1, 0.1],
                                      [0.6, 0.1, 0.1, 0.1, 0.1],
                                      [0.0, 0.0, 0.0, 0.0, 0.0],
-                                     [0.0, 0.0, 0.0, 0.0, 0.0]]])
+                                     [0.0, 0.0, 0.0, 0.0, 0.0]]], requires_grad=True)
         # yapf: enable
         cls._logits_len = torch.tensor([7, 5])
 
@@ -345,16 +345,27 @@ class CtcLossTest(unittest.TestCase):
 
         torch.testing.assert_close(expected_loss, actual_loss)
 
+    def test_ctc_loss_gradient(self):
+        blank_augmented_label = seq_loss_util.to_blank_augmented_labels({
+            "SEQ_DATA":
+            self._labels,
+            "SEQ_LEN":
+            self._labels_len
+        })
 
-#
-#    def test_ctc_loss_gradient(self):
-#        blank_augmented_label = seq_loss_util.to_blank_augmented_labels({
-#            "SEQ_DATA":
-#            self._labels,
-#            "SEQ_LEN":
-#            self._labels_len
-#        })
-#
+        actual_loss = seq_loss_util.CtcLoss.apply(
+            blank_augmented_label["SEQ_DATA"],
+            blank_augmented_label["SEQ_LEN"],
+            self._logits, self._logits_len)  # yapf: disable
+
+        #        actual_loss.backward()
+
+        import pdb
+        pdb.set_trace()
+
+        print(self._logits.grad)
+
+
 #        with tf.GradientTape() as tape:
 #            tape.watch(self._logits)
 #            actual_loss = seq_loss_util.ctc_loss(
