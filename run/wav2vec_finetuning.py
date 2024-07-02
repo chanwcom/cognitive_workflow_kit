@@ -206,7 +206,7 @@ class MyCtcTrainer(Trainer):
         outputs = model(**inputs)
 
         logits = outputs["logits"]
-        logits_lengths = torch.full(size=(logits.shape[1],), fill_value=logits.shape[0])
+        logits_lengths = torch.full(size=(logits.shape[0],), fill_value=logits.shape[1])
 
         target = blank_augmented_inputs["SEQ_DATA"]
         target_lengths = blank_augmented_inputs["SEQ_LEN"]
