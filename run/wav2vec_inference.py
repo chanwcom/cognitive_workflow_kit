@@ -1,6 +1,6 @@
 # pylint: disable=import-error, no-member
 from __future__ import (absolute_import, division, print_function,
-                         unicode_literals)
+                        unicode_literals)
 
 __author__ = "Chanwoo Kim(chanwcom@gmail.com)"
 
@@ -28,16 +28,16 @@ from data.format import speech_data_helper
 # https://www.tensorflow.org/guide/gpu
 gpus = tf.config.list_physical_devices("GPU")
 if gpus:
-  try:
-    # Currently, memory growth needs to be the same across GPUs.
-    for gpu in gpus:
-      tf.config.experimental.set_memory_growth(gpu, True)
-    logical_gpus = tf.config.list_logical_devices("GPU")
-    print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs")
+    try:
+        # Currently, memory growth needs to be the same across GPUs.
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        logical_gpus = tf.config.list_logical_devices("GPU")
+        print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs")
 
-  except RuntimeError as e:
-    # Memory growth must be set before GPUs have been initialized.
-    print(e)
+    except RuntimeError as e:
+        # Memory growth must be set before GPUs have been initialized.
+        print(e)
 
 db_top_dir = "/home/chanwcom/databases/"
 train_top_dir = os.path.join(db_top_dir, "stop/music_train_tfrecord")
@@ -66,7 +66,9 @@ test_dataset = test_dataset.map(op.process)
 
 processor = AutoProcessor.from_pretrained("facebook/wav2vec2-base")
 
+
 class IterDataset(data.IterableDataset):
+
     def __init__(self, tf_dataset):
         self._dataset = tf_dataset
 
