@@ -198,7 +198,7 @@ class MyCtcTrainer(Trainer):
             blank_augmented_inputs["SEQ_LEN"] = torch.sum(
                 (inputs["labels"] >= 0).type(torch.int32), axis=1)
             blank_augmented_inputs = seq_loss_util.to_blank_augmented_labels(
-                blank_augmented_inputs, 0, False, False)
+                blank_augmented_inputs, 0, True, False)
 
             target = inputs.pop("labels")
             outputs = model(**inputs)
