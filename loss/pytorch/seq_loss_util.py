@@ -25,15 +25,15 @@ def sequence_mask(lengths, maxlen=None, dtype=torch.bool):
     """
     if maxlen is None:
         maxlen = lengths.max()
-    row_vector = torch.arange(0, maxlen, 1)
+    row_vector = torch.arange(0, maxlen, 1).to(lengths.device)
     matrix = torch.unsqueeze(lengths, dim=-1)
     mask = row_vector < matrix
 
     return mask.type(dtype)
 
 def to_blank_augmented_labels(
-        inputs: dict, blank_index: int=0,
-        boundary_blanks: bool=True) -> dict:  # yapf: disable
+        inputs: dict, blank_index: int=0, boundary_blanks: bool=True,
+        update_non_blank_token_index: bool=True) -> dict:  # yapf: disable
     """Expands the input sequence with blank labels.
 
     The blank symbol is inserted at the beginning and at the end of the
@@ -50,6 +50,14 @@ def to_blank_augmented_labels(
             An integer for the blank label in the CTC loss.
         boundary_blanks:
             A boolean flag to insert labels at the boundaries of the sequence.
+        unpdate_non_blank_token_index:
+            A boolean flag to update non-blank token indices.
+                When the blank token index is added, we may need to update the
+                indices of non-blank tokens to make a room for the blank token
+                index to avoid having conflicting indices. If this issue has
+                been already taken care of, then set this flag to False. In
+                fine tuning the Wav2Vec2.0 huggingface model, this flag needs
+                to be set False.
     Returns:
         A dictionary containing a blank augmented sequence.
     """
@@ -60,7 +68,8 @@ def to_blank_augmented_labels(
     # by one to make a room for the blank index.
     ids = torch.where(inputs["SEQ_DATA"] >= blank_index)
     updated_data = inputs["SEQ_DATA"].clone().detach()
-    updated_data[ids] = inputs["SEQ_DATA"][ids] + 1
+    if update_non_blank_token_index:
+        updated_data[ids] = inputs["SEQ_DATA"][ids] + 1
 
     output = {}
     # Creates a tensor filled with blank values.
