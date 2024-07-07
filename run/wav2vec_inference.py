@@ -17,7 +17,7 @@ import tensorflow as tf
 import torch
 
 # Custom imports
-from data import speech_data_helper
+from data.format import speech_data_helper
 
 # Prevents Tensorflow from using the entire GPU memory.
 #
@@ -87,7 +87,7 @@ pytorch_test_dataset = IterDataset(test_dataset)
 transcriber = pipeline(
     "automatic-speech-recognition",
     model=
-    "/home/chanwcom/local_repositories/cognitive_workflow_kit/tool/models/asr_stop_model_final/checkpoint-5000"
+    "/home/chanwcom/local_repositories/cognitive_workflow_kit/tool/models/asr_stop_model_final3/checkpoint-10000"
 )
 
 for data in pytorch_test_dataset:
