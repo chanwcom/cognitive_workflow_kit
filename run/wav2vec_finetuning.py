@@ -1,6 +1,6 @@
 # pylint: disable=import-error, no-member
 from __future__ import (absolute_import, division, print_function,
-                         unicode_literals)
+                        unicode_literals)
 
 __author__ = "Chanwoo Kim(chanwcom@gmail.com)"
 
@@ -34,16 +34,16 @@ from loss.pytorch import seq_loss_util
 # https://www.tensorflow.org/guide/gpu
 gpus = tf.config.list_physical_devices("GPU")
 if gpus:
-  try:
-    # Currently, memory growth needs to be the same across GPUs.
-    for gpu in gpus:
-      tf.config.experimental.set_memory_growth(gpu, True)
-    logical_gpus = tf.config.list_logical_devices("GPU")
-    print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs")
+    try:
+        # Currently, memory growth needs to be the same across GPUs.
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        logical_gpus = tf.config.list_logical_devices("GPU")
+        print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs")
 
-  except RuntimeError as e:
-    # Memory growth must be set before GPUs have been initialized.
-    print(e)
+    except RuntimeError as e:
+        # Memory growth must be set before GPUs have been initialized.
+        print(e)
 
 db_top_dir = "/home/chanwcom/databases/"
 train_top_dir = os.path.join(db_top_dir, "stop/music_train_tfrecord")
@@ -72,7 +72,9 @@ test_dataset = test_dataset.map(op.process)
 
 processor = AutoProcessor.from_pretrained("facebook/wav2vec2-base")
 
+
 class IterDataset(data.IterableDataset):
+
     def __init__(self, tf_dataset):
         self._dataset = tf_dataset
 
@@ -171,26 +173,32 @@ training_args = TrainingArguments(
     push_to_hub=False,
 )
 
+
 class MyTrainer(Trainer):
+
     def compute_loss(self, model, inputs, return_outputs=False):
         target = inputs.pop("labels")
         outputs = model(**inputs)
 
         # In torch.nn.CTCLoss(), the logit should have the shape of (T, B, C).
         logits = torch.permute(outputs["logits"], (1, 0, 2))
-        logits_lengths = torch.full(size=(logits.shape[1],), fill_value=logits.shape[0])
+        logits_lengths = torch.full(size=(logits.shape[1], ),
+                                    fill_value=logits.shape[0])
         target_lengths = torch.sum((target >= 0).type(torch.int32), axis=1)
 
         ctc_loss = torch.nn.CTCLoss()
 
-        loss = ctc_loss(logits.log_softmax(2), target, logits_lengths, target_lengths)
+        loss = ctc_loss(logits.log_softmax(2), target, logits_lengths,
+                        target_lengths)
 
         if return_outputs:
             return loss, outputs
         else:
             return loss
 
+
 class MyCtcTrainer(Trainer):
+
     def compute_loss(self, model, inputs, return_outputs=False):
         with torch.device(inputs["input_values"].device.type):
             blank_augmented_inputs = {}
@@ -204,20 +212,23 @@ class MyCtcTrainer(Trainer):
             outputs = model(**inputs)
 
             logits = outputs["logits"]
-            logits_lengths = torch.full(
-                size=(logits.shape[0],), fill_value=logits.shape[1]).to(logits.device)
+            logits_lengths = torch.full(size=(logits.shape[0], ),
+                                        fill_value=logits.shape[1]).to(
+                                            logits.device)
 
             target = blank_augmented_inputs["SEQ_DATA"]
             target_lengths = blank_augmented_inputs["SEQ_LEN"]
 
             ctc_loss = seq_loss_util.CtcLoss()
-            loss = ctc_loss.apply(
-                target, target_lengths, logits.log_softmax(2), logits_lengths).mean()
+            loss = ctc_loss.apply(target, target_lengths,
+                                  logits.log_softmax(2),
+                                  logits_lengths).mean()
 
         if return_outputs:
             return loss, outputs
         else:
             return loss
+
 
 trainer = MyCtcTrainer(
     model=model,
