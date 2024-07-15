@@ -14,13 +14,13 @@ def print_line(inputs, precision, minf_value=None, minf_string="MINF",
         elif inf_value is not None and inputs[i] > inf_value:
             print (f"{inf_string}, ", end="")
         else:
-            print (f"{inputs[i]:10.{precision}f}, ", end="")
+            print (f"{inputs[i]:7.{precision}f}, ", end="")
     if minf_value is not None and inputs[-1] <= minf_value:
         print (f"{minf_string}]", end="")
     elif inf_value is not None and inputs[-1] > inf_value:
         print (f"{inf_string}]", end="")
     else:
-        print (f"{inputs[-1]:10.{precision}f}]", end="")
+        print (f"{inputs[-1]:7.{precision}f}]", end="")
 
 def print_array(inputs, precision, minf_value=None, minf_string="MINF",
                 inf_value=None, inf_string="INF"):
