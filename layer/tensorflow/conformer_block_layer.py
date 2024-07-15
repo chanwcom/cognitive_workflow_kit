@@ -14,12 +14,12 @@ import tensorflow as tf
 from google.protobuf import message
 
 # Custom imports
-from speech.trainer.tf_based_end_to_end_trainer.tf_trainer.layers import attention
-from speech.trainer.tf_based_end_to_end_trainer.tf_trainer.layers import normalization
-from speech.trainer.ck_trainer.util import proto_util
-from machine_learning.layers import conformer_block_layer_pb2
-from machine_learning.layers import dropout
-from machine_learning.layers import layer_type
+from layer.tensorflow import attention
+from layer.tensorflow import normalization
+from layer.tensorflow import conformer_block_layer_pb2
+from layer.tensorflow import dropout
+from layer.tensorflow import layer_type
+from util import proto_util
 
 LayerType = layer_type.Type
 

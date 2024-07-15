@@ -1,16 +1,15 @@
+# Standard imports
 from itertools import cycle
 
+# Third-party imports
 import numpy as np
 import tensorflow as tf
 
-from speech.trainer.tf_based_end_to_end_trainer.tf_trainer.layers \
-    import layer_utils
-from speech.trainer.tf_based_end_to_end_trainer.tf_trainer.layers.tied_layer \
-    import TiedDense
-from speech.trainer.tf_based_end_to_end_trainer.tf_trainer.layers.layer_utils \
-    import shape_list
-
-from speech.trainer.tf_based_end_to_end_trainer.tf_trainer.util import utils
+# Custom imports
+from layer.tensorflow import layer_utils
+from layer.tensorflow.tied_layer import TiedDense
+from layer.tensorflow.layer_utils import shaped_list
+from math_lib import utils
 
 def cast_if_fp16(x):
     if isinstance(x, list):
