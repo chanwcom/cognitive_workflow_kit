@@ -3,7 +3,7 @@
 from __future__ import (absolute_import, division, print_function,
                         unicode_literals)
 
-__author__ = "Chanwoo Kim(chanw.com@samsung.com)"
+__author__ = "Chanwoo Kim(chanwcom@gmail.com)"
 
 # Standard imports
 import copy
@@ -65,6 +65,7 @@ class ConformerBlock(tf.keras.layers.Layer):
     "Transformer transducer: a streamable speech recognition model with
     transformer encoders and rnn-t loss", ICASSP 2020.
     """
+
     def __init__(
             self, params_proto: conformer_block_layer_pb2.ConformerBlockParams
     ) -> None:
@@ -226,6 +227,7 @@ class FeedForwardModule(tf.keras.layers.Layer):
     transformer encoders and rnn-t loss", ICASSP 2020.
 
     """
+
     def __init__(
         self, params_proto: conformer_block_layer_pb2.FeedForwardModuleParams
     ) -> None:
@@ -387,6 +389,7 @@ class MHSAModule(tf.keras.layers.Layer):
     Zhang, Y Wu, and R. Pang, "Conformer: Convolution-augmented Transformer
     for Speech Recognition", INTERSPEECH-2020. 2020, pp.5036-5040.
     """
+
     def __init__(
             self,
             params_proto: conformer_block_layer_pb2.MHSAModuleParams) -> None:
@@ -593,6 +596,7 @@ class ConvolutionModule(tf.keras.layers.Layer):
     Zhang, Y Wu, and R. Pang, "Conformer: Convolution-augmented Transformer
     for Speech Recognition", INTERSPEECH 2020.
     """
+
     def __init__(
         self, params_proto: conformer_block_layer_pb2.ConvolutionModuleParams
     ) -> None:

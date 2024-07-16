@@ -3,7 +3,9 @@ import tensorflow as tf
 from speech.trainer.tf_based_end_to_end_trainer.tf_trainer.layers \
         import layer_utils
 
+
 class UtilTest(tf.test.TestCase):
+
     def test_last_values(self):
         T = tf.constant([[[1, 0], [2, 0], [3, 0], [4, 0], [5, 0], [6, 0]],
                          [[4, 1], [5, 1], [6, 1], [7, 1], [8, 1], [9, 1]],
@@ -11,8 +13,7 @@ class UtilTest(tf.test.TestCase):
         seq_len = tf.constant([3, 4, 5])
         output = layer_utils.get_last_values(T, seq_len, 2)
 
-        expected_output = tf.constant([[[2,  0], [3,  0]],
-                                       [[6,  1], [7,  1]],
+        expected_output = tf.constant([[[2, 0], [3, 0]], [[6, 1], [7, 1]],
                                        [[10, 2], [11, 2]]])
 
         self.assertAllClose(output, expected_output)
@@ -24,18 +25,20 @@ class UtilTest(tf.test.TestCase):
         self.assertAllEqual([], flatten([]))
 
         T = tf.constant
+
         def _get_nested_input():
             return [T(1), [T(2), (T(3), T(4))], (T(5), T(6))]
+
         def _get_expected_output():
             return [T(1), T(2), T(3), T(4), T(5), T(6)]
 
         # flattened input test
         self.assertAllEqual(_get_expected_output(),
-                flatten(_get_expected_output()))
+                            flatten(_get_expected_output()))
 
         # nested input test
         self.assertAllEqual(_get_expected_output(),
-                flatten(_get_nested_input()))
+                            flatten(_get_nested_input()))
 
     def test_grad_scale(self):
         random_input_size = (3, 4)

@@ -8,7 +8,9 @@ from tensorflow.python.keras import backend as K
 from tensorflow.keras.layers import InputSpec
 from tensorflow.python.ops import nn_ops, standard_ops
 
+
 class TiedDense(tf.keras.layers.Dense):
+
     def __init__(self, units, tied_to=None, transpose_kernel=True, **kwargs):
         super(TiedDense, self).__init__(units, **kwargs)
         self.tied_to = tied_to
@@ -18,7 +20,7 @@ class TiedDense(tf.keras.layers.Dense):
         dtype = dtypes.as_dtype(self.dtype or K.floatx())
         if not (dtype.is_floating or dtype.is_complex):
             raise TypeError('Unable to build `Dense` layer with non-floating '
-                            'point dtype %s' % (dtype,))
+                            'point dtype %s' % (dtype, ))
         input_shape = tensor_shape.TensorShape(input_shape)
         last_dim = tensor_shape.dimension_value(input_shape[-1])
         if last_dim is None:
@@ -32,16 +34,20 @@ class TiedDense(tf.keras.layers.Dense):
         else:
             raise NotImplementedError('invalid tying layer')
 
-        if self.transpose_kernel and (self.tied_kernel.shape[0] != self.units or
-                                    self.tied_kernel.shape[1] != input_shape[-1]):
+        if self.transpose_kernel and (self.tied_kernel.shape[0] != self.units
+                                      or self.tied_kernel.shape[1]
+                                      != input_shape[-1]):
             raise ValueError('Shape of tied weights doesn\'t match ')
-        if not self.transpose_kernel and (self.tied_kernel.shape[1] != self.units or
-                                    self.tied_kernel.shape[0] != input_shape[-1]):
+        if not self.transpose_kernel and (
+                self.tied_kernel.shape[1] != self.units
+                or self.tied_kernel.shape[0] != input_shape[-1]):
             raise ValueError('Shape of tied weights doesn\'t match ')
 
         if self.use_bias:
             self.bias = self.add_weight('bias',
-                                        shape=[self.units,],
+                                        shape=[
+                                            self.units,
+                                        ],
                                         initializer=self.bias_initializer,
                                         regularizer=self.bias_regularizer,
                                         constraint=self.bias_constraint,
@@ -58,10 +64,10 @@ class TiedDense(tf.keras.layers.Dense):
             kernel = self.tied_kernel
 
         # for mixed precision training
-        if kernel.dtype !=  self._compute_dtype_object:
+        if kernel.dtype != self._compute_dtype_object:
             kernel = tf.cast(kernel, self._compute_dtype_object)
 
-        if inputs.dtype !=  self._compute_dtype_object:
+        if inputs.dtype != self._compute_dtype_object:
             inputs = tf.cast(inputs, self._compute_dtype_object)
 
         # The code below is from tensorflow-2.5.0.keras.layers.Dense

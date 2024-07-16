@@ -49,6 +49,7 @@ class SpecAugment(tf.keras.layers.Layer):
         layer = SpecAugment(params_proto)
         output = layer(inputs)
     """
+
     def __init__(self, params_proto: any_pb2.Any) -> None:
         """Initializes a SpecAugment class.
 
@@ -179,6 +180,7 @@ class SpecAugmentOperation(operation.AbstractOperation):
         operation = spec_augment.SpecAugment(params_proto)
         outputs = operation.process(self._inputs)
     """
+
     def __init__(self,
                  params_proto: any_pb2.Any,
                  params_dict=None,

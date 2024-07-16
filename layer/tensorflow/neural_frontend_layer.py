@@ -32,6 +32,7 @@ assert version.parse(tf.__version__) >= version.parse("2.0.0"), (
 
 class NeuralFrontend(tf.keras.layers.Layer):
     """An abstract class for Subsampling."""
+
     @abc.abstractmethod
     def __init__(self,
                  params_proto: layer_params_pb2.SubsamplingParams) -> None:
@@ -51,6 +52,7 @@ class NeuralFrontend(tf.keras.layers.Layer):
 
 
 class NeuralNoiseSuppressionModule(tf.keras.layers.Layer):
+
     def __init__(self, params_proto):
         pass
 
@@ -59,6 +61,7 @@ class NeuralNoiseSuppressionModule(tf.keras.layers.Layer):
 
 
 class NeuralTemporalMaskingModule(tf.keras.layers.Layer):
+
     def __init__(self, params_proto):
         pass
 

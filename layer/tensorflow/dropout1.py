@@ -1,4 +1,5 @@
 class BatchProbDropout(tf.keras.layers.Layer, AbstractDropout):
+
     def __init__(self, params_proto: dropout_params_pb2.DropoutParams,
                  **kwargs):
         super(BatchProbDropout, self).__init__(**kwargs)

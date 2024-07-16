@@ -130,6 +130,7 @@ class Masking(tf.keras.layers.Layer):
         * MIDDLE_VALUE_MASKING
         * RANDOM_MASKING
     """
+
     def __init__(self, masking_type, dropout_rate=None, **kwargs):
         super(Masking, self).__init__(**kwargs)
 

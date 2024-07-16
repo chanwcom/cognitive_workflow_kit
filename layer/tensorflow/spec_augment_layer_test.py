@@ -30,6 +30,7 @@ assert version.parse(tf.__version__) > version.parse("2.0.0"), (
 
 
 class TestModel(tf.keras.Model):
+
     def __init__(self, params_proto) -> None:
         super(TestModel, self).__init__()
 
@@ -77,6 +78,7 @@ class TestModel(tf.keras.Model):
 
 class SpecAugmentTest(tf.test.TestCase):
     """A class for unit-testing SpecAugment class."""
+
     @classmethod
     def setUpClass(cls):
         """Creates the inputs to be used in this unit test."""
@@ -238,6 +240,7 @@ class SpecAugmentTest(tf.test.TestCase):
 
 class SpecAugmentOperationTest(tf.test.TestCase):
     """A class for testing the SpecAugment class."""
+
     @classmethod
     def setUpClass(cls):
         """Creates the input signal to be used in this unit test."""

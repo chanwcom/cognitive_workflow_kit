@@ -5,6 +5,7 @@ import tensorflow as tf
 from tensorflow.keras.layers import LayerNormalization
 from tensorflow.python.training.tracking import data_structures
 
+
 def get_last_values(x, seq_len, n_output, axis=1):
     """Get x[:, seq_len-n_output:seq_len, :].
 
@@ -27,12 +28,13 @@ def get_last_values(x, seq_len, n_output, axis=1):
     output_shape[axis] = n_output
     return tf.reshape(last_values, output_shape)
 
+
 def shape_list(x, out_type=tf.int32):
     """Deal with dynamic shape in tensorflow cleanly."""
     static = x.shape.as_list()
     dynamic = tf.shape(x, out_type=out_type)
-    return [dynamic[i] if s is None else s
-                for i, s in enumerate(static)]
+    return [dynamic[i] if s is None else s for i, s in enumerate(static)]
+
 
 def flatten_nested_tensors(maybe_nested_tensors):
     """Make flattened list of Tensors
@@ -48,10 +50,13 @@ def flatten_nested_tensors(maybe_nested_tensors):
     unpacked = []
     for element in maybe_nested_tensors:
         if isinstance(element, tf.Tensor):
-            unpacked += [element, ]
+            unpacked += [
+                element,
+            ]
         else:
             unpacked += flatten_nested_tensors(element)
     return unpacked
+
 
 def get_sublayers(layer):
     assert isinstance(layer, tf.keras.layers.Layer)
@@ -59,6 +64,7 @@ def get_sublayers(layer):
         return layer._self_tracked_trackables
     else:
         return layer._layers
+
 
 # prevent the model from using fusedBatchNorm
 def disable_fused_ln(layer):
@@ -75,8 +81,11 @@ def disable_fused_ln(layer):
         disable_fused_ln(get_sublayers(layer))
         return
 
+
 @tf.custom_gradient
 def grad_scale(x, scale):
+
     def grad(dy):
-        return dy*scale, None
+        return dy * scale, None
+
     return x, grad

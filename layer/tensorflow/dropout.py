@@ -43,6 +43,7 @@ def _get_dim(tensor, i):
 
 class DropoutFactory(object):
     """A factory class to create a concrete Subsampling layer."""
+
     def __init__(self) -> None:
         # Creates a dict containing all the classes derived from Subsampling.
         #
@@ -64,6 +65,7 @@ class DropoutFactory(object):
 
 class AbstractDropout(abc.ABC):
     """An abstract class for applying different types of Dropout."""
+
     @abc.abstractmethod
     def __init__(self,
                  params_proto: dropout_params_pb2.DropoutParams,
@@ -414,6 +416,7 @@ class TwoPointDistDropout(tf.keras.layers.Layer, AbstractDropout):
     drop_prob_min and drop_prob_max. If both drop_prob_min and drop_prob_max
     are the same, this layer is exactly the same as the normal dropout.
     """
+
     def __init__(self,
                  average_drop_prob=0.0,
                  drop_prob_max=0.5,

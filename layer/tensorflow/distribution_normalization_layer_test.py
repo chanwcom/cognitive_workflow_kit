@@ -22,6 +22,7 @@ _dist_norm_layer = distribution_normalization_layer.DistributionNormalization
 class DistributionNormalizationLayerTest(tf.test.TestCase):
     """A class for testing methods in the masking_layer module.
     """
+
     def test_masking_layer_small_value_masking_option(self):
         """In this test, the entire layer is tested."""
         input_data = tf.constant([[[[0.0, 3.0, 1.0], [1.0, 2.0, 4.0]],
