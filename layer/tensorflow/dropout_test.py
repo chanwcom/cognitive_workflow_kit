@@ -27,6 +27,7 @@ assert version.parse(tf.__version__) >= version.parse("2.0.0"), (
 
 
 class BatchProbDropoutFactoryTest(tf.test.TestCase):
+
     def setUp(self):
         # yapf: disable
         self._inputs = tf.constant(
@@ -78,6 +79,7 @@ class BatchProbDropoutFactoryTest(tf.test.TestCase):
 
 class BaselineDropoutTest(tf.test.TestCase):
     """A class for unit-testing classes dervied from the Subsampling class."""
+
     def setUp(self):
         # yapf: disable
         self._inputs = tf.constant(
@@ -215,6 +217,7 @@ class BaselineDropoutTest(tf.test.TestCase):
 
 class BatchProbDropoutTest(tf.test.TestCase):
     """A class for unit-testing classes dervied from the Subsampling class."""
+
     def setUp(self):
         tf.random.set_seed(0)
         # yapf: disable
@@ -277,6 +280,7 @@ class BatchProbDropoutTest(tf.test.TestCase):
 
 class UniformDistDropoutTest(tf.test.TestCase):
     """A class for unit-testing classes dervied from the Subsampling class."""
+
     @classmethod
     def setUpClass(cls):
         SEQ_NOISE_SHAPE_TYPE = dropout_params_pb2.DropoutParams.TIME
@@ -416,6 +420,7 @@ class UniformDistDropoutTest(tf.test.TestCase):
 
 
 class TwoPointDistDropout(tf.test.TestCase):
+
     def setUp(self):
         tf.random.set_seed(0)
 
@@ -445,6 +450,7 @@ class TwoPointDistDropout(tf.test.TestCase):
 
 
 class GlobalMethodTest(tf.test.TestCase):
+
     @classmethod
     def setUpClass(cls):
         cls._inputs = tf.ones(shape=(3, 2, 4), dtype=tf.dtypes.float32)

@@ -30,6 +30,7 @@ assert version.parse(tf.__version__) > version.parse("2.0.0"), (
 
 class SubsamplingTest(tf.test.TestCase):
     """A class for unit-testing classes dervied from the Subsampling class."""
+
     @classmethod
     def setUpClass(cls):
         """Creates the inputs to be used in this unit test."""

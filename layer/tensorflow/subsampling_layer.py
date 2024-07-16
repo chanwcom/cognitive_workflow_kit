@@ -38,6 +38,7 @@ LayerType = layer_type.Type
 
 class SubsamplingFactory(object):
     """A factory class to create a concrete Subsampling layer."""
+
     def __init__(self) -> None:
         # Creates a dict containing all the classes derived from Subsampling.
         #
@@ -69,6 +70,7 @@ def _is_power_of_two(value: int) -> bool:
 
 class Subsampling(tf.keras.layers.Layer, abc.ABC):
     """An abstract class for Subsampling."""
+
     @abc.abstractmethod
     def __init__(self,
                  params_proto: layer_params_pb2.SubsamplingParams) -> None:

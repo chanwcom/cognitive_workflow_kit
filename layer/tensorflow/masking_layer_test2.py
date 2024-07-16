@@ -25,6 +25,7 @@ EPS = 1e-4
 class MaskingLayerUtilTest(tf.test.TestCase):
     """A class for testing methods in the masking_layer module.
     """
+
     def test_small_value_masking(self):
         """This method tests the _small_value_masking private method.
 

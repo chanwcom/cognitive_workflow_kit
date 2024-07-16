@@ -181,6 +181,7 @@ class Masking(tf.keras.layers.Layer):
         * MIDDLE_VALUE_MASKING
         * RANDOM_MASKING
     """
+
     def __init__(self, masking_type, keep_prob=1.0, num_blocks=4, **kwargs):
         # Note that num_blocks can be also an array.
         super(Masking, self).__init__(**kwargs)

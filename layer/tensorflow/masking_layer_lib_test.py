@@ -23,6 +23,7 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 class MaskingLayerLibTest(tf.test.TestCase):
     """A class for testing methods in the masking_layer module.
     """
+
     def test_apply_block_masking():
         """In this test, the entire layer is tested."""
 

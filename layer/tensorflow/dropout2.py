@@ -5,6 +5,7 @@ class UniformDropout(tf.keras.layers.Layer, AbstractDropout):
     drop_prob_min and drop_prob_max. If both drop_prob_min and drop_prob_max
     are the same, this layer is exactly the same as the normal dropout.
     """
+
     def __init__(self,
                  drop_prob_min=0.0,
                  drop_prob_max=0.0,

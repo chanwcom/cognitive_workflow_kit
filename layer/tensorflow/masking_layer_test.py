@@ -34,6 +34,7 @@ assert version.parse(tfp.__version__) >= version.parse("0.11.0"), (
 
 class MaskingLayerUtilTest(tf.test.TestCase):
     """A class for testing methods in the masking_layer module."""
+
     @classmethod
     def setUpClass(cls):
         """Sets the tf determinism for reproducible results."""

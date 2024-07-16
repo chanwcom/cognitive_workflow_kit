@@ -59,6 +59,7 @@ def _inverse_gaussian_cdf(inputs):
 class DistributionNormalization(tf.keras.layers.Layer):
     """A keras layer implementation of distribution normalization.
     """
+
     def __init__(self, rescaling=False, **kwargs):
         super(DistributionNormalization, self).__init__(**kwargs)
         self._rescaling = rescaling

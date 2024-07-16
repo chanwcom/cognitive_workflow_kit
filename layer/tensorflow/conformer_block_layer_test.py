@@ -30,6 +30,7 @@ assert version.parse(tf.__version__) > version.parse("2.0.0"), (
 
 class ConformerBlockTest(tf.test.TestCase):
     """A class for unit-testing the FeedForwardModule class."""
+
     @classmethod
     def setUpClass(cls):
         """Creates the inputs to be used in this unit test."""
@@ -169,6 +170,7 @@ class ConformerBlockTest(tf.test.TestCase):
 
 class FeedForwardModuleTest(tf.test.TestCase):
     """A class for unit-testing the FeedForwardModule class."""
+
     @classmethod
     def setUpClass(cls):
         """Creates the inputs to be used in this unit test."""
@@ -331,6 +333,7 @@ class FeedForwardModuleTest(tf.test.TestCase):
 
 class MHSAModuleTest(tf.test.TestCase):
     """A class for unit-testing the MHSAModule class."""
+
     @classmethod
     def setUpClass(cls):
         """Creates the inputs to be used in this unit test."""
@@ -483,6 +486,7 @@ class MHSAModuleTest(tf.test.TestCase):
 
 class ConvolutionModuleTest(tf.test.TestCase):
     """A class for unit-testing the FeedForwardModule class."""
+
     @classmethod
     def setUpClass(cls):
         """Creates the inputs to be used in this unit test."""
