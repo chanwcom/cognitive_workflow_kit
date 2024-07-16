@@ -1,6 +1,6 @@
 // This proto file file contains proto messages for Keras layers.
 //
-// Author: Chanwoo Kim (chanw.com@samsung.com)
+// Author: Chanwoo Kim (chanwcom@gmail.com)
 
 syntax = "proto3";
 
