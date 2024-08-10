@@ -106,6 +106,25 @@ def to_blank_augmented_labels(
     return output
 
 
+def to_onset_augmented_labels(inputs: dict, num_classes: int) -> dict:
+    assert isinstance(inputs, dict)
+    assert {"SEQ_DATA", "SEQ_LEN"} <= inputs.keys()
+
+    output = {}
+    output["SEQ_LEN"] = 2 * inputs["SEQ_LEN"]
+
+    in_data = 2 * inputs["SEQ_DATA"].clone().detach()
+
+    data = torch.stack((in_data, in_data + 1), axis=2)
+    data = torch.reshape(data, (inputs["SEQ_DATA"].shape[0], -1))
+    mask = sequence_mask(output["SEQ_LEN"],
+                         maxlen=data.shape[1],
+                         dtype=data.dtype)
+    output["SEQ_DATA"] = data * mask
+
+    return output
+
+
 # Third-party imports
 # * https://github.com/amaas/stanford-ctc/blob/master/ctc/ctc.py
 # * https://github.com/HawkAaron/warp-transducer/blob/master/tensorflow_binding/src/warprnnt_op.cc

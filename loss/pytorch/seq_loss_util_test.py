@@ -108,6 +108,47 @@ class SeqFormatConversionTest(unittest.TestCase):
         self.assertTrue(
             torch.equal(expected_output["SEQ_LEN"], actual_output["SEQ_LEN"]))
 
+    def test_to_blank_augmented_labels_default_blank_index(self):
+        blank_index = 0
+
+        actual_output = seq_loss_util.to_blank_augmented_labels(
+            self._y_sparse, blank_index)
+
+        expected_output = {}
+        expected_output["SEQ_DATA"] = torch.tensor(
+            [[0, 2, 0, 4, 0, 5, 0, 3, 0, 6, 0],
+             [0, 2, 0, 5, 0, 3, 0, 6, 0, 0, 0]],
+            dtype=torch.int32)
+        expected_output["SEQ_LEN"] = torch.tensor([11, 9], dtype=torch.int32)
+
+        self.assertTrue(
+            torch.equal(expected_output["SEQ_DATA"],
+                        actual_output["SEQ_DATA"]))
+        self.assertTrue(
+            torch.equal(expected_output["SEQ_LEN"], actual_output["SEQ_LEN"]))
+
+    def test_to_onset_augmented_labels(self):
+        # The shape of y_true_sparse is (batch_size, label_seq_len).
+        num_classes = 6
+
+        actual_output = seq_loss_util.to_onset_augmented_labels(
+            self._y_sparse, num_classes)
+
+        expected_output = {}
+        # yapf: disable
+        expected_output["SEQ_DATA"] = torch.tensor(
+            [[2, 3, 6, 7, 8, 9,  4,  5, 10, 11],
+             [2, 3, 8, 9, 4, 5, 10, 11,  0,  0]],
+            dtype=torch.int32)
+        # yapf: enable
+        expected_output["SEQ_LEN"] = torch.tensor([10, 8], dtype=torch.int32)
+
+        self.assertTrue(
+            torch.equal(expected_output["SEQ_DATA"],
+                        actual_output["SEQ_DATA"]))
+        self.assertTrue(
+            torch.equal(expected_output["SEQ_LEN"], actual_output["SEQ_LEN"]))
+
 
 class SeqLossUtilTest(unittest.TestCase):
 
