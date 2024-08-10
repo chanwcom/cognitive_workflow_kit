@@ -6,12 +6,15 @@ from __future__ import (absolute_import, division, print_function,
                         unicode_literals)
 
 __author__ = "Chanwoo Kim(chanwcom@gmail.com)"
+# Standard imports
+import enum
 
 # Third-party imports
 import numpy as np
 import torch
 
-#LOG_0 = torch.tensor(np.log(np.finfo(np.float64).tiny).astype(np.float32))
+# TODO(chanwcom) Replace with this one. But unit tests need to be updated.
+#LOG_00 = torch.tensor(np.log(np.finfo(np.float64).tiny).astype(np.float32))
 
 LOG_0 = torch.tensor(np.log(1e-307)).type(torch.float32)
 
@@ -156,8 +159,14 @@ def _calculate_unnormalized_log_seq_prob(log_alpha, accum_log_seq_prob_sum,
     return final_log_alpha + final_accum
 
 
-def label_trans_table(labels, labels_len):
-    """Constructs a table containing the label transition flags.
+class TableType(enum.Enum):
+    CTC = 0
+    SHC_TYPE_0 = 1
+    SHC_TYPE_1 = 2
+
+
+def label_trans_allowance_table_ctc(labels, labels_len):
+    """Constructs a table containing the label transition allowance flags.
 
     We assume that label_seq should contain "blank labels" described in the
     original CTC paper.
@@ -216,6 +225,122 @@ def label_trans_table(labels, labels_len):
     return trans_table
 
 
+def label_trans_table_shc_type0(labels, labels_len):
+    """Constructs a table containing the label transition allowance flags.
+
+    We assume that label_seq should contain "blank labels" described in the
+    original CTC paper.
+    The shape of the returned tensor is (batch_size, max_seq_len, max_seq_len).
+    The transition rule is as follows:
+
+    Depending on whether the transition from the i-th label to the j-th label
+    in the label sequence is allowed,
+      a[b, i, j] = 0,         if this transition is allowed.
+      a[b, i, j] = LOG_0:     if this transition is not allowed.
+
+    Args:
+        label_seq: A dictionary containing a batch of label sequences.
+            * "DATA": A tensor containing label sequences.
+                The shape is (batch_size, max_seq_length). Note that the data
+                should follow the blank label rule, which states that "blank"
+                labels should be interleaved with real labels. In addition to
+                this, blank symbols are prepended and appended to the sequence.
+            * "SEQ_LEN": A tensor containing the length of each label sequence.
+                The shape is (batch_size).
+    Returns:
+        A tensor containing flags whether transitions are allowed.
+            The shape is (batch_size, max_label_seq_len, max_seq_len)
+    """
+
+    max_seq_len = torch.max(labels_len)
+    l0 = torch.arange(1, max_seq_len, 2, dtype=torch.int32)
+    l1 = torch.arange(max_seq_len, dtype=torch.int32)
+
+    # Indices corresponding to i -> i.
+    indices0 = torch.stack([l0, l0], axis=1)
+
+    # Indices corresponding to i -> i + 1.
+    indices1 = torch.stack([l1[:-1], l1[:-1] + 1], axis=1)
+
+    # Constructs the transition table.
+    indices = torch.concat([indices0, indices1], axis=0)
+    values = torch.zeros([indices.shape[0]])
+
+    trans_table = torch.full(size=(max_seq_len, max_seq_len), fill_value=LOG_0)
+    trans_table[torch.unbind(indices, axis=1)] = 0
+
+    batch_size = labels.shape[0]
+    trans_table = torch.tile(torch.unsqueeze(trans_table, axis=0),
+                             [batch_size, 1, 1])
+
+    return trans_table
+
+
+def label_trans_table_shc_type1(labels, labels_len):
+    """Constructs a table containing the label transition allowance flags.
+
+    We assume that label_seq should contain "blank labels" described in the
+    original CTC paper.
+    The shape of the returned tensor is (batch_size, max_seq_len, max_seq_len).
+    The transition rule is as follows:
+
+    Depending on whether the transition from the i-th label to the j-th label
+    in the label sequence is allowed,
+      a[b, i, j] = 0,         if this transition is allowed.
+      a[b, i, j] = LOG_0:     if this transition is not allowed.
+
+    Args:
+        label_seq: A dictionary containing a batch of label sequences.
+            * "DATA": A tensor containing label sequences.
+                The shape is (batch_size, max_seq_length). Note that the data
+                should follow the blank label rule, which states that "blank"
+                labels should be interleaved with real labels. In addition to
+                this, blank symbols are prepended and appended to the sequence.
+            * "SEQ_LEN": A tensor containing the length of each label sequence.
+                The shape is (batch_size).
+    Returns:
+        A tensor containing flags whether transitions are allowed.
+            The shape is (batch_size, max_label_seq_len, max_seq_len)
+    """
+
+    max_seq_len = torch.max(labels_len)
+    l = torch.arange(max_seq_len, dtype=torch.int32)
+
+    # Indices corresponding to i -> i.
+    indices0 = torch.stack([l, l], axis=1)
+
+    # Indices corresponding to i -> i + 1.
+    indices1 = torch.stack([l[:-1], l[:-1] + 1], axis=1)
+
+    # Constructs the transition table.
+    indices = torch.concat([indices0, indices1], axis=0)
+    values = torch.zeros([indices.shape[0]])
+
+    trans_table = torch.full(size=(max_seq_len, max_seq_len), fill_value=LOG_0)
+    trans_table[torch.unbind(indices, axis=1)] = 0
+
+    batch_size = labels.shape[0]
+    trans_table = torch.tile(torch.unsqueeze(trans_table, axis=0),
+                             [batch_size, 1, 1])
+
+    return trans_table
+
+
+# TODO TODO(chanwcom)
+# Refactor as a class
+def label_trans_allowance_table(labels, label_len, table_type: TableType):
+    if table_type == TableType.CTC:
+        table = label_trans_allowance_table_ctc(labels, label_len)
+    elif table_type == TableType.SHC_TYPE_0:
+        table = label_trans_table_shc_type0(labels, label_len)
+    elif table_type == TableType.SHC_TYPE_1:
+        table = label_trans_table_shc_type1(labels, label_len)
+    else:
+        raise ValueError("Unsupported type.")
+
+    return table
+
+
 class CtcLoss(torch.autograd.Function):
     """A class for calculating the CTC loss."""
 
@@ -251,7 +376,8 @@ class CtcLoss(torch.autograd.Function):
         log_label_prob = calculate_log_label_prob(
             labels, torch.softmax(logits, dim=-1))
 
-        trans_table = label_trans_table(labels, labels_len)
+        trans_table = label_trans_allowance_table(labels, labels_len,
+                                                  TableType.CTC)
 
         # Alpha and beta should be calculated.
         log_alpha, log_beta, log_seq_prob = calculate_alpha_beta(

@@ -111,8 +111,8 @@ class SeqFormatConversionTest(unittest.TestCase):
 
 class SeqLossUtilTest(unittest.TestCase):
 
-    def test_label_trans_table(self):
-        """Tests the label_trans_table method.
+    def test_label_trans_allowance_table_ctc(self):
+        """Tests the label_trans_allowance_table_ctc method.
 
         In this unit test, it is assumed that "0" corresponds to the blank
         label.
@@ -125,7 +125,8 @@ class SeqLossUtilTest(unittest.TestCase):
         labels_len = torch.tensor([7, 7, 5])
         # yapf: enable
 
-        actual = seq_loss_util.label_trans_table(labels, labels_len)
+        actual = seq_loss_util.label_trans_allowance_table(
+            labels, labels_len, seq_loss_util.TableType.CTC)
 
         expected = torch.tensor(
             [[[  0.0,   0.0, LOG_0, LOG_0, LOG_0, LOG_0, LOG_0],
@@ -153,6 +154,82 @@ class SeqLossUtilTest(unittest.TestCase):
 
         # Checks the actual output with respect to the expected output.
         torch.testing.assert_close(actual, expected)
+
+    def test_label_trans_allowance_table_shc_type_0(self):
+        """Tests the label_trans_allowance_table_shc_type_0 method."""
+
+        # yapf: disable
+        labels = torch.tensor([[0, 1, 2, 3, 4, 5],   # <-- [0, 1, 2]
+                               [0, 1, 2, 3, 2, 3],   # <-- [0, 1, 1]
+                               [0, 1, 2, 3, 0, 0]])  # <-- [0, 1]
+        labels_len = torch.tensor([6, 6, 4])
+        # yapf: enable
+
+        actual = seq_loss_util.label_trans_allowance_table(
+            labels, labels_len, seq_loss_util.TableType.SHC_TYPE_0)
+
+        expected = torch.tensor(
+            [[[LOG_0,   0.0, LOG_0, LOG_0, LOG_0, LOG_0],
+              [LOG_0,   0.0,   0.0, LOG_0, LOG_0, LOG_0],
+              [LOG_0, LOG_0, LOG_0,   0.0, LOG_0, LOG_0],
+              [LOG_0, LOG_0, LOG_0,   0.0,   0.0, LOG_0],
+              [LOG_0, LOG_0, LOG_0, LOG_0, LOG_0,   0.0],
+              [LOG_0, LOG_0, LOG_0, LOG_0, LOG_0,   0.0]],
+             [[LOG_0,   0.0, LOG_0, LOG_0, LOG_0, LOG_0],
+              [LOG_0,   0.0,   0.0, LOG_0, LOG_0, LOG_0],
+              [LOG_0, LOG_0, LOG_0,   0.0, LOG_0, LOG_0],
+              [LOG_0, LOG_0, LOG_0,   0.0,   0.0, LOG_0],
+              [LOG_0, LOG_0, LOG_0, LOG_0, LOG_0,   0.0],
+              [LOG_0, LOG_0, LOG_0, LOG_0, LOG_0,   0.0]],
+             [[LOG_0,   0.0, LOG_0, LOG_0, LOG_0, LOG_0],
+              [LOG_0,   0.0,   0.0, LOG_0, LOG_0, LOG_0],
+              [LOG_0, LOG_0, LOG_0,   0.0, LOG_0, LOG_0],
+              [LOG_0, LOG_0, LOG_0,   0.0,   0.0, LOG_0],
+              [LOG_0, LOG_0, LOG_0, LOG_0, LOG_0,   0.0],
+              [LOG_0, LOG_0, LOG_0, LOG_0, LOG_0,   0.0]]],
+             dtype=torch.float32) # yapf: disable
+
+        # Checks the actual output with respect to the expected output.
+        torch.testing.assert_close(actual, expected)
+
+
+#    def test_label_trans_allowance_table_shc_type_1(self):
+#        """Tests the label_trans_allowance_table_shc_type_0 method."""
+#
+#        # yapf: disable
+#        labels = torch.tensor([[0, 1, 2, 3, 4, 5],   # <-- [0, 1, 2]
+#                               [0, 1, 2, 3, 2, 3],   # <-- [0, 1, 1]
+#                               [0, 1, 2, 3, 0, 0]])  # <-- [0, 1]
+#        labels_len = torch.tensor([6, 6, 4])
+#        # yapf: enable
+#
+#        actual = seq_loss_util.label_trans_allowance_table(
+#            labels, labels_len, seq_loss_util.TableType.SHC_TYPE_1)
+#
+#        expected = torch.tensor(
+#            [
+#             [[  0.0,   0.0, LOG_0, LOG_0, LOG_0, LOG_0],
+#              [LOG_0,   0.0,   0.0, LOG_0, LOG_0, LOG_0],
+#              [LOG_0, LOG_0,   0.0,   0.0, LOG_0, LOG_0],
+#              [LOG_0, LOG_0, LOG_0,   0.0,   0.0, LOG_0],
+#              [LOG_0, LOG_0, LOG_0, LOG_0,   0.0,   0.0],
+#              [LOG_0, LOG_0, LOG_0, LOG_0, LOG_0,   0.0]],
+#             [[  0.0,   0.0, LOG_0, LOG_0, LOG_0, LOG_0],
+#              [LOG_0,   0.0,   0.0, LOG_0, LOG_0, LOG_0],
+#              [LOG_0, LOG_0,   0.0,   0.0, LOG_0, LOG_0],
+#              [LOG_0, LOG_0, LOG_0,   0.0,   0.0, LOG_0],
+#              [LOG_0, LOG_0, LOG_0, LOG_0,   0.0,   0.0],
+#              [LOG_0, LOG_0, LOG_0, LOG_0, LOG_0,   0.0]],
+#             [[  0.0,   0.0, LOG_0, LOG_0, LOG_0, LOG_0],
+#              [LOG_0,   0.0,   0.0, LOG_0, LOG_0, LOG_0],
+#              [LOG_0, LOG_0,   0.0,   0.0, LOG_0, LOG_0],
+#              [LOG_0, LOG_0, LOG_0,   0.0,   0.0, LOG_0],
+#              [LOG_0, LOG_0, LOG_0, LOG_0,   0.0,   0.0],
+#              [LOG_0, LOG_0, LOG_0, LOG_0, LOG_0,   0.0]]],
+#             dtype=torch.float32) # yapf: disable
+#
+#        # Checks the actual output with respect to the expected output.
+#        torch.testing.assert_close(actual, expected)
 
     def test_calculate_log_label_prob(self):
         batch_size = 2
@@ -208,9 +285,10 @@ class SeqLossUtilTest(unittest.TestCase):
                                [0, 1, 0, 0, 0]])
         labels_len = torch.tensor([5, 5, 3])
         # yapf: enable
-        actual = seq_loss_util.label_trans_table(labels, labels_len)
+        actual = seq_loss_util.label_trans_allowance_table_ctc(
+            labels, labels_len)
 
-        label_trans_table = torch.tensor(
+        label_trans_allowance_table_ctc = torch.tensor(
             [[[  0.0,   0.0, LOG_0, LOG_0, LOG_0],
               [LOG_0,   0.0,   0.0,   0.0, LOG_0],
               [LOG_0, LOG_0,   0.0,   0.0, LOG_0],
@@ -242,7 +320,8 @@ class SeqLossUtilTest(unittest.TestCase):
         logits_len = torch.tensor([6, 5, 4])
 
         (alpha, beta, log_seq_prob_final) = seq_loss_util.calculate_alpha_beta(
-            label_trans_table, log_pred_label_prob, labels_len, logits_len)
+            label_trans_allowance_table_ctc, log_pred_label_prob, labels_len,
+            logits_len)
 
         # yapf: disable
         expected_alpha = torch.tensor(
