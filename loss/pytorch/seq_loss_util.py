@@ -184,6 +184,12 @@ class TableType(enum.Enum):
     SHC_TYPE_1 = 2
 
 
+class ThresholdType(enum.Enum):
+    NO_THRESHOLD = 0
+    ENTROPY = 1
+    MAX_PROB = 2
+
+
 def label_trans_allowance_table_ctc(labels, labels_len):
     """Constructs a table containing the label transition allowance flags.
 
@@ -364,7 +370,15 @@ class CtcLoss(torch.autograd.Function):
     """A class for calculating the CTC loss."""
 
     @staticmethod
-    def forward(ctx, labels, labels_len, logits, logits_len):
+    def forward(ctx,
+                labels,
+                labels_len,
+                logits,
+                logits_len,
+                table_type: TableType = TableType.CTC,
+                threshold_type: ThresholdType = ThresholdType.NO_THRESHOLD,
+                threshold: float = 0.1,
+                uniform_flag: bool = True):
         """Calculates the Connectionist Temporal Classification (CTC) loss.
 
         Args:
@@ -487,7 +501,7 @@ class CtcLoss(torch.autograd.Function):
         gradient = torch.multiply(gradient, torch.unsqueeze(seq_mask, axis=2))
         gradient = torch.multiply(gradient, torch.reshape(grad, (-1, 1, 1)))
 
-        return None, None, gradient, None
+        return None, None, gradient, None, None, None, None, None
 
 
 def calculate_alpha_beta(label_trans_table, log_label_prob, label_len,
@@ -607,3 +621,39 @@ def calculate_alpha_beta(label_trans_table, log_label_prob, label_len,
         log_alpha, accum_log_alpha_max, logit_len, label_len)
 
     return log_alpha, log_beta, log_seq_prob_final
+
+
+def apply_postprocessing(ground_truth_prob: torch.Tensor,
+                         logits_len: torch.Tensor,
+                         threshold_type: ThresholdType,
+                         threshold: float,
+                         uniform: bool = True):
+    if threshold_type == ThresholdType.NO_THRESHOLD:
+        return ground_truth_prob
+    elif threshold_type == ThresholdType.ENTROPY:
+        flag = ((torch.sum(torch.special.entr(ground_truth_prob), axis=2) /
+                 torch.log(torch.tensor(ground_truth_prob.shape[2])))
+                <= threshold)
+    elif threshold_type == ThresholdType.MAX_PROB:
+        flag = torch.max(ground_truth_prob, axis=2).values >= threshold
+    else:
+        raise ValueError("Unsupported threshold type.")
+    flag = torch.unsqueeze(flag, 2).type(torch.float32)
+
+    # Makes the one hot representation based on argmax.
+    one_hot = torch.nn.functional.one_hot(
+        torch.argmax(ground_truth_prob, dim=2),
+        ground_truth_prob.shape[2]).type(torch.float32)
+
+    if uniform:
+        others = torch.ones_like(
+            ground_truth_prob) / ground_truth_prob.shape[2]
+    else:
+        others = ground_truth_prob
+
+    mask = torch.unsqueeze(
+        sequence_mask(logits_len,
+                      ground_truth_prob.shape[1],
+                      dtype=ground_truth_prob.dtype), axis=2) # yapf: disable
+
+    return (one_hot * flag + (1 - flag) * others) * mask
