@@ -9,7 +9,7 @@ The following classes are implemented.
 from __future__ import (absolute_import, division, print_function,
                         unicode_literals)
 
-__author__ = "Chanwoo Kim(chanw.com@samsung.com)"
+__author__ = "Chanwoo Kim(chanwcom@gmail.com)"
 
 # Standard imports
 import enum

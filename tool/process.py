@@ -1,6 +1,5 @@
 #!/usr/bin/python
 
-
 #pylint: disable=
 
 from __future__ import (absolute_import, division, print_function,
@@ -21,9 +20,9 @@ with open(sys.argv[1], encoding="utf-8") as file:
         words = transcript.split()
 
         # Removes words[0] ~ words[3] to retrieve the ground truth script.
-        transcript =  " ".join(words[4:]).upper()
+        transcript = " ".join(words[4:]).upper()
         transcript = re.sub(r"\.", "", transcript)
-        transcript = f"<s> {transcript} <\s>"
+        transcript = f"<s> {transcript} </s>"
 
         intent_slot = re.sub(r".*\[IN:", "", line)
 
@@ -33,6 +32,8 @@ with open(sys.argv[1], encoding="utf-8") as file:
         assert match
         slot = match.group(1).upper()
         slot = re.sub(r"\.", "", slot)
-        slot = f"<s> {slot} <\s>"
+        slot = f"<s> {slot} </s>"
 
-        print(f"[{words[0]}] {transcript} __\"INTENT\"__:{intent}  __\"SLOT\"__:{slot}")
+        print(
+            f"[{words[0]}] {transcript} __\"INTENT\"__:{intent}  __\"SLOT\"__:{slot}"
+        )

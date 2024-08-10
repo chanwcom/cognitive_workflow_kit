@@ -83,20 +83,19 @@ with open(trans_file, "rt") as file:
     writer = tf.io.TFRecordWriter(
         shard_name, options=tf.io.TFRecordOptions(compression_type="GZIP"))
 
-    # Creates a SpeechData object.
-    speech_data = speech_data_pb2.SpeechData()
-
     example_index = 0
 
     line = True
     while line:
         line = file.readline().rstrip()
         if line:
+            # Creates a SpeechData object.
+            speech_data = speech_data_pb2.SpeechData()
 
-            result = re.match(r"\[(\S*)\]\s*(.*)", line)
+            result = re.match(r"\[(\S*)\]\s*(.*)__\"INTENT\"__.*", line)
 
             wave_fn = result.group(1)
-            transcript = result.group(2)
+            transcript = result.group(2).strip()
             wave_fn = os.path.join(db_top, wave_fn)
 
             # Opens the wave data.
@@ -128,6 +127,17 @@ with open(trans_file, "rt") as file:
             speech_data.wave_header.CopyFrom(wave_header)
             speech_data.samples = data.tobytes()
             speech_data.transcript = transcript
+
+            # Attributes adding
+            match = re.match(r".*__\"INTENT\"__:(\S+).*", line)
+            map_field = speech_data.attributes.add()
+            map_field.key = "INTENT"
+            map_field.value = match.group(1)
+
+            match = re.match(r".*__\"SLOT\"__:(.*)", line)
+            map_field = speech_data.attributes.add()
+            map_field.key = "SLOT"
+            map_field.value = match.group(1)
 
             writer.write(speech_data.SerializeToString())
 

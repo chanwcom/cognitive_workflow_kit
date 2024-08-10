@@ -13,6 +13,26 @@ py_binary(
 )
 
 py_binary(
+    name = "convert_to_tfrecord_librispeech",
+    srcs = [
+        "convert_to_tfrecord_librispeech.py",
+    ],
+    deps = [
+        "//data/format:speech_data_pb2",
+    ],
+)
+
+py_binary(
+    name = "convert_to_tfrecord_libri_light",
+    srcs = [
+        "convert_to_tfrecord_libri_light.py",
+    ],
+    deps = [
+        "//data/format:speech_data_pb2",
+    ],
+)
+
+py_binary(
     name = "wav2vec_huggingface",
     srcs = [
         "wav2vec_huggingface.py",
