@@ -178,7 +178,7 @@ def _calculate_unnormalized_log_seq_prob(log_alpha, accum_log_seq_prob_sum,
     return final_log_alpha + final_accum
 
 
-class TableType(enum.Enum):
+class LabelType(enum.Enum):
     CTC = 0
     SHC_TYPE_0 = 1
     SHC_TYPE_1 = 2
@@ -361,12 +361,12 @@ def label_trans_table_shc_type1(labels, labels_len):
 
 # TODO TODO(chanwcom)
 # Refactor as a class
-def label_trans_allowance_table(labels, label_len, table_type: TableType):
-    if table_type == TableType.CTC:
+def label_trans_allowance_table(labels, label_len, table_type: LabelType):
+    if table_type == LabelType.CTC:
         table = label_trans_allowance_table_ctc(labels, label_len)
-    elif table_type == TableType.SHC_TYPE_0:
+    elif table_type == LabelType.SHC_TYPE_0:
         table = label_trans_table_shc_type0(labels, label_len)
-    elif table_type == TableType.SHC_TYPE_1:
+    elif table_type == LabelType.SHC_TYPE_1:
         table = label_trans_table_shc_type1(labels, label_len)
     else:
         raise ValueError("Unsupported type.")
@@ -383,7 +383,7 @@ class CtcLoss(torch.autograd.Function):
                 labels_len,
                 logits,
                 logits_len,
-                table_type: TableType = TableType.CTC,
+                table_type: LabelType = LabelType.CTC,
                 update_non_blank_token_index: bool = True,
                 threshold_type: ThresholdType = ThresholdType.NO_THRESHOLD,
                 threshold: float = 0.1,
@@ -423,13 +423,13 @@ class CtcLoss(torch.autograd.Function):
         inputs = {}
         inputs["SEQ_DATA"] = labels
         inputs["SEQ_LEN"] = labels_len
-        if table_type == TableType.CTC:
+        if table_type == LabelType.CTC:
             inputs = to_blank_augmented_labels(inputs, 0, True,
                                                update_non_blank_token_index)
             # TODO  TODO(chanwcom )The following is the correc one.
             #inputs = to_blank_augmented_labels(inputs, 0, True, False)
-        elif (table_type == TableType.SHC_TYPE_0
-              or table_type == TableType.SHC_TYPE_1):
+        elif (table_type == LabelType.SHC_TYPE_0
+              or table_type == LabelType.SHC_TYPE_1):
             raise NotImplementedError
             # How to find num_classes?
             # It is not easy for Hugging face fine tuning.

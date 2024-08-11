@@ -291,7 +291,7 @@ class SeqLossUtilTest(unittest.TestCase):
         # yapf: enable
 
         actual = seq_loss_util.label_trans_allowance_table(
-            labels, labels_len, seq_loss_util.TableType.CTC)
+            labels, labels_len, seq_loss_util.LabelType.CTC)
 
         expected = torch.tensor(
             [[[  0.0,   0.0, LOG_0, LOG_0, LOG_0, LOG_0, LOG_0],
@@ -331,7 +331,7 @@ class SeqLossUtilTest(unittest.TestCase):
         # yapf: enable
 
         actual = seq_loss_util.label_trans_allowance_table(
-            labels, labels_len, seq_loss_util.TableType.SHC_TYPE_0)
+            labels, labels_len, seq_loss_util.LabelType.SHC_TYPE_0)
 
         expected = torch.tensor(
             [[[LOG_0,   0.0, LOG_0, LOG_0, LOG_0, LOG_0],
@@ -368,7 +368,7 @@ class SeqLossUtilTest(unittest.TestCase):
         # yapf: enable
 
         actual = seq_loss_util.label_trans_allowance_table(
-            labels, labels_len, seq_loss_util.TableType.SHC_TYPE_1)
+            labels, labels_len, seq_loss_util.LabelType.SHC_TYPE_1)
 
         expected = torch.tensor(
             [
@@ -616,7 +616,7 @@ class CtcLossTest(unittest.TestCase):
 
         actual_loss = seq_loss_util.CtcLoss.apply(
             self._labels, self._labels_len, self._logits, self._logits_len,
-            seq_loss_util.TableType.CTC,
+            seq_loss_util.LabelType.CTC,
             True,
             seq_loss_util.ThresholdType.ENTROPY,
             ENTROPY_TH,
@@ -655,7 +655,7 @@ class CtcLossTest(unittest.TestCase):
 
         actual_loss = seq_loss_util.CtcLoss.apply(
             self._labels, self._labels_len, self._logits, self._logits_len,
-            seq_loss_util.TableType.CTC,
+            seq_loss_util.LabelType.CTC,
             True,
             seq_loss_util.ThresholdType.ENTROPY,
             ENTROPY_TH,
