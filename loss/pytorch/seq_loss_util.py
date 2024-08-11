@@ -384,6 +384,7 @@ class CtcLoss(torch.autograd.Function):
                 logits,
                 logits_len,
                 table_type: TableType = TableType.CTC,
+                update_non_blank_token_index: bool = True,
                 threshold_type: ThresholdType = ThresholdType.NO_THRESHOLD,
                 threshold: float = 0.1,
                 processing_type: ProcessingType = ProcessingType.UNCHANGED):
@@ -413,6 +414,30 @@ class CtcLoss(torch.autograd.Function):
 
         # Checks the consistency of the batch size.
         assert labels.shape[0] == logits.shape[0]
+
+        # Converting the sequences.
+        # Note that the following is only for HuggingFace case.
+        # In case of HuggingFace, the boundary blanks should be added and non
+        # -blank token indices should NOT be updated.
+
+        inputs = {}
+        inputs["SEQ_DATA"] = labels
+        inputs["SEQ_LEN"] = labels_len
+        if table_type == TableType.CTC:
+            inputs = to_blank_augmented_labels(inputs, 0, True,
+                                               update_non_blank_token_index)
+            # TODO  TODO(chanwcom )The following is the correc one.
+            #inputs = to_blank_augmented_labels(inputs, 0, True, False)
+        elif (table_type == TableType.SHC_TYPE_0
+              or table_type == TableType.SHC_TYPE_1):
+            raise NotImplementedError
+            # How to find num_classes?
+            # It is not easy for Hugging face fine tuning.
+            #inputs =  to_onset_augmented_labels(inputs, num_classes)
+        else:
+            raise ValueEror("Unsupported label sequence format type.")
+        labels = inputs["SEQ_DATA"]
+        labels_len = inputs["SEQ_LEN"]
 
         log_label_prob = calculate_log_label_prob(
             labels, torch.softmax(logits, dim=-1))
@@ -528,7 +553,7 @@ class CtcLoss(torch.autograd.Function):
         gradient, = ctx.saved_tensors
         gradient = torch.multiply(gradient, torch.reshape(grad, (-1, 1, 1)))
 
-        return None, None, gradient, None, None, None, None, None
+        return None, None, gradient, None, None, None, None, None, None
 
 
 def calculate_alpha_beta(label_trans_table, log_label_prob, label_len,

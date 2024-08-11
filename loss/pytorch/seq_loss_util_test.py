@@ -570,35 +570,20 @@ class CtcLossTest(unittest.TestCase):
 
     def test_ctc_loss(self):
         """Tests the ctc_loss method."""
-
-        blank_augmented_label = seq_loss_util.to_blank_augmented_labels({
-            "SEQ_DATA":
-            self._labels,
-            "SEQ_LEN":
-            self._labels_len
-        })
-
-        actual_loss = seq_loss_util.CtcLoss.apply(
-            blank_augmented_label["SEQ_DATA"],
-            blank_augmented_label["SEQ_LEN"],
-            self._logits, self._logits_len)  # yapf: disable
+        actual_loss = seq_loss_util.CtcLoss.apply(self._labels,
+                                                  self._labels_len,
+                                                  self._logits,
+                                                  self._logits_len)
 
         expected_loss = torch.tensor([6.115841, 4.7813644])
 
         torch.testing.assert_close(expected_loss, actual_loss)
 
     def test_ctc_loss_gradient(self):
-        blank_augmented_label = seq_loss_util.to_blank_augmented_labels({
-            "SEQ_DATA":
-            self._labels,
-            "SEQ_LEN":
-            self._labels_len
-        })
-
-        actual_loss = seq_loss_util.CtcLoss.apply(
-            blank_augmented_label["SEQ_DATA"],
-            blank_augmented_label["SEQ_LEN"],
-            self._logits, self._logits_len)  # yapf: disable
+        actual_loss = seq_loss_util.CtcLoss.apply(self._labels,
+                                                  self._labels_len,
+                                                  self._logits,
+                                                  self._logits_len)
 
         actual_loss.backward(torch.ones_like(actual_loss))
 
@@ -627,20 +612,12 @@ class CtcLossTest(unittest.TestCase):
                                    rtol=1e-05)
 
     def test_shc_loss_gradient_entropy_th_zero(self):
-        blank_augmented_label = seq_loss_util.to_blank_augmented_labels({
-            "SEQ_DATA":
-            self._labels,
-            "SEQ_LEN":
-            self._labels_len
-        })
-
         ENTROPY_TH = 0.5
 
         actual_loss = seq_loss_util.CtcLoss.apply(
-            blank_augmented_label["SEQ_DATA"],
-            blank_augmented_label["SEQ_LEN"],
-            self._logits, self._logits_len,
+            self._labels, self._labels_len, self._logits, self._logits_len,
             seq_loss_util.TableType.CTC,
+            True,
             seq_loss_util.ThresholdType.ENTROPY,
             ENTROPY_TH,
             seq_loss_util.ProcessingType.ZERO
@@ -674,20 +651,12 @@ class CtcLossTest(unittest.TestCase):
                                    rtol=1e-05)
 
     def test_shc_loss_gradient_entropy_th_uniform(self):
-        blank_augmented_label = seq_loss_util.to_blank_augmented_labels({
-            "SEQ_DATA":
-            self._labels,
-            "SEQ_LEN":
-            self._labels_len
-        })
-
         ENTROPY_TH = 0.5
 
         actual_loss = seq_loss_util.CtcLoss.apply(
-            blank_augmented_label["SEQ_DATA"],
-            blank_augmented_label["SEQ_LEN"],
-            self._logits, self._logits_len,
+            self._labels, self._labels_len, self._logits, self._logits_len,
             seq_loss_util.TableType.CTC,
+            True,
             seq_loss_util.ThresholdType.ENTROPY,
             ENTROPY_TH,
             seq_loss_util.ProcessingType.UNIFORM
