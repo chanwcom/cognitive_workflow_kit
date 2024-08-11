@@ -190,6 +190,14 @@ class ThresholdType(enum.Enum):
     MAX_PROB = 2
 
 
+class ProcessingType(enum.Enum):
+    # Processing type is meaningful only when ENTROPY or MAX_PROB is selected
+    # as the threshold type.
+    UNCHANGED = 0
+    UNIFORM = 1
+    ZERO = 2
+
+
 def label_trans_allowance_table_ctc(labels, labels_len):
     """Constructs a table containing the label transition allowance flags.
 
@@ -378,7 +386,7 @@ class CtcLoss(torch.autograd.Function):
                 table_type: TableType = TableType.CTC,
                 threshold_type: ThresholdType = ThresholdType.NO_THRESHOLD,
                 threshold: float = 0.1,
-                uniform_flag: bool = True):
+                processing_type: ProcessingType = ProcessingType.UNCHANGED):
         """Calculates the Connectionist Temporal Classification (CTC) loss.
 
         Args:
@@ -410,7 +418,7 @@ class CtcLoss(torch.autograd.Function):
             labels, torch.softmax(logits, dim=-1))
 
         trans_table = label_trans_allowance_table(labels, labels_len,
-                                                  TableType.CTC)
+                                                  table_type)
 
         # Alpha and beta should be calculated.
         log_alpha, log_beta, log_seq_prob = calculate_alpha_beta(
@@ -444,16 +452,6 @@ class CtcLoss(torch.autograd.Function):
 
         loss = -torch.multiply(log_seq_prob, invalid_length_mask)
 
-        ctx.save_for_backward(log_gamma, labels, labels_len, logits,
-                              logits_len)
-
-        return loss
-
-    @staticmethod
-    def backward(ctx, grad):
-
-        log_gamma, labels, labels_len, logits, logits_len = ctx.saved_tensors
-
         max_label_len = torch.max(labels_len)
         num_classes = logits.shape[2]
         log_ground_truth_prob = torch.ones_like(logits,
@@ -481,8 +479,27 @@ class CtcLoss(torch.autograd.Function):
             log_ground_truth_prob = torch.logaddexp(log_ground_truth_prob,
                                                     updates)
 
-        gradient = -(torch.exp(log_ground_truth_prob) -
-                     torch.softmax(logits, dim=2))
+        # TODO TODO(chanwcom)
+        # Post processing needs to be done here.
+        #processing_type: ProcessingType = ProcessingType.UNCHANGED,
+        #uniform_flag: bool = True):
+
+        ground_truth_prob = torch.exp(log_ground_truth_prob)
+
+        if threshold_type != ThresholdType.NO_THRESHOLD:
+            if processing_type == ProcessingType.UNIFORM:
+                uniform_flag = True
+            else:
+                uniform_flag = False
+            ground_truth_prob, flag = apply_postprocessing(
+                ground_truth_prob, logits_len, threshold_type, threshold,
+                uniform_flag)
+
+        gradient = -(ground_truth_prob - torch.softmax(logits, dim=2))
+
+        if (threshold_type != ThresholdType.NO_THRESHOLD
+                and processing_type == ProcessingType.ZERO):
+            gradient = torch.multiply(gradient, flag)
 
         # To ignore an invalid loss case.
         #
@@ -499,6 +516,14 @@ class CtcLoss(torch.autograd.Function):
 
         # The dimension of "gradient" is (batch_size, logit_len, num_classes)
         gradient = torch.multiply(gradient, torch.unsqueeze(seq_mask, axis=2))
+
+        ctx.save_for_backward(gradient)
+
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad):
+        gradient, = ctx.saved_tensors
         gradient = torch.multiply(gradient, torch.reshape(grad, (-1, 1, 1)))
 
         return None, None, gradient, None, None, None, None, None
@@ -656,4 +681,4 @@ def apply_postprocessing(ground_truth_prob: torch.Tensor,
                       ground_truth_prob.shape[1],
                       dtype=ground_truth_prob.dtype), axis=2) # yapf: disable
 
-    return (one_hot * flag + (1 - flag) * others) * mask
+    return ((one_hot * flag + (1 - flag) * others) * mask, flag)

@@ -176,7 +176,7 @@ class PostProcessingTest(unittest.TestCase):
     def test_apply_postprocessing_entropy_uniform_true(self):
         ENTROPY_TH = 0.26
         UNIFORM_FLAG = True
-        actual = seq_loss_util.apply_postprocessing(
+        actual, _ = seq_loss_util.apply_postprocessing(
             self._ground_truth_prob["SEQ_DATA"],
             self._ground_truth_prob["SEQ_LEN"],
             seq_loss_util.ThresholdType.ENTROPY,
@@ -201,7 +201,7 @@ class PostProcessingTest(unittest.TestCase):
     def test_apply_postprocessing_entropy_uniform_false(self):
         ENTROPY_TH = 0.26
         UNIFORM_FLAG = False
-        actual = seq_loss_util.apply_postprocessing(
+        actual, _ = seq_loss_util.apply_postprocessing(
             self._ground_truth_prob["SEQ_DATA"],
             self._ground_truth_prob["SEQ_LEN"],
             seq_loss_util.ThresholdType.ENTROPY,
@@ -226,7 +226,7 @@ class PostProcessingTest(unittest.TestCase):
     def test_apply_postprocessing_max_prob_uniform_true(self):
         MAX_PROB_TH = 0.9
         UNIFORM_FLAG = True
-        actual = seq_loss_util.apply_postprocessing(
+        actual, _ = seq_loss_util.apply_postprocessing(
             self._ground_truth_prob["SEQ_DATA"],
             self._ground_truth_prob["SEQ_LEN"],
             seq_loss_util.ThresholdType.MAX_PROB,
@@ -251,7 +251,7 @@ class PostProcessingTest(unittest.TestCase):
     def test_apply_postprocessing_max_prob_uniform_false(self):
         MAX_PROB_TH = 0.9
         UNIFORM_FLAG = False
-        actual = seq_loss_util.apply_postprocessing(
+        actual, _ = seq_loss_util.apply_postprocessing(
             self._ground_truth_prob["SEQ_DATA"],
             self._ground_truth_prob["SEQ_LEN"],
             seq_loss_util.ThresholdType.MAX_PROB,
