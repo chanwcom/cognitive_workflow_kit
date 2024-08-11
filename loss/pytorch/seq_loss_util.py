@@ -491,6 +491,7 @@ class CtcLoss(torch.autograd.Function):
                 uniform_flag = True
             else:
                 uniform_flag = False
+
             ground_truth_prob, flag = apply_postprocessing(
                 ground_truth_prob, logits_len, threshold_type, threshold,
                 uniform_flag)
@@ -499,6 +500,7 @@ class CtcLoss(torch.autograd.Function):
 
         if (threshold_type != ThresholdType.NO_THRESHOLD
                 and processing_type == ProcessingType.ZERO):
+
             gradient = torch.multiply(gradient, flag)
 
         # To ignore an invalid loss case.
@@ -653,6 +655,7 @@ def apply_postprocessing(ground_truth_prob: torch.Tensor,
                          threshold_type: ThresholdType,
                          threshold: float,
                          uniform: bool = True):
+
     if threshold_type == ThresholdType.NO_THRESHOLD:
         return ground_truth_prob
     elif threshold_type == ThresholdType.ENTROPY:
