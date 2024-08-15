@@ -17,7 +17,6 @@ import platform
 from enum import Enum
 
 # Third-party imports
-from google.protobuf import message
 from packaging import version
 
 # At least Python 3.4 is required because of the usage of Enum.
@@ -70,7 +69,7 @@ class AbstractOperation(abc.ABC):
     # created internally.
     # yapf: disable
     @abc.abstractmethod
-    def __init__(self, params_proto: message.Message=None,
+    def __init__(self, message=None,
             *args, **kwargs) -> None:
         # yapf: enable
         """Creates a Operation object.

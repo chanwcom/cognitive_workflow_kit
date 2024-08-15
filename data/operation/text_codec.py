@@ -15,8 +15,8 @@ import os
 
 # Third-party imports
 try:
-    import tensorflow as tf
-    import tensorflow_text as tf_text
+    import sentencepiece as sp
+    import torch
 except ImportError as e:
     print("There are some packages need to be installed.")
 from packaging import version
@@ -25,8 +25,16 @@ from packaging import version
 from data.operation import text_codec_params
 from operation import operation
 
-assert version.parse(tf.__version__) >= version.parse("2.0.0"), (
-    "at least tensorflow 2.0 is required.")
+
+def make_padded_batch(inputs: [torch.Tensor],
+                      padding_value: int = 0) -> torch.Tensor:
+    return torch.nn.utils.rnn.pad_sequence(inputs, batch_first=True)
+
+
+def padded_batch_to_ragged_list(inputs: list, padding_value: int = 0) -> list:
+    # Padding value must be smaller than all other values.
+    lengths = [torch.sum(torch.tensor(row) > padding_value) for row in inputs]
+    return [row[0:row_length] for row_length, row in zip(lengths, inputs)]
 
 
 # TODO(chanw.com) This class should be derived from a TextCodec class
@@ -50,11 +58,9 @@ class SentencePieceTextCodec(operation.AbstractOperation):
             raise FileExistsError("{0} does not exist.".format(
                 self._params.model_name))
 
-        serialized_model = open(self._params.model_name, "rb").read()
-
-        self._sp_tokenizer = tf_text.SentencepieceTokenizer(
-            model=serialized_model,
-            out_type=tf.int32,
+        self._sp_tokenizer = sp.SentencePieceProcessor(
+            model_file=self._params.model_name,
+            out_type=int,
             add_bos=self._params.add_bos,
             add_eos=self._params.add_eos)
 
@@ -69,7 +75,7 @@ class SentencePieceTextCodec(operation.AbstractOperation):
 
         self._params = params
 
-    def process(self, inputs):
+    def process(self, inputs: dict):
         """Returns the output tensor given an input tensor.
 
         The operation may be either encoding or decoding.
@@ -96,27 +102,25 @@ class SentencePieceTextCodec(operation.AbstractOperation):
             "The inputs to this method must be a dictionary having \"SEQ_DATA\" "
             "and \"SEQ_LEN\" as keys.")
 
-        assert tf.is_tensor(inputs["SEQ_DATA"]), (
-            "inputs[\"SEQ_DATA\"] must be a Tensor type.")
-        assert tf.is_tensor(
-            inputs["SEQ_LEN"]), ("inputs[\"SEQ_LEN\"] must be a Tensor type.")
+        if isinstance(inputs["SEQ_DATA"], torch.Tensor):
+            inputs_data = inputs["SEQ_DATA"].numpy().tolist()
+        elif isinstance(inputs["SEQ_DATA"], list):
+            inputs_data = inputs["SEQ_DATA"]
+        else:
+            raise ValueError("Unsupported type!")
 
         outputs = {}
         if self._params.processing_mode == (
                 text_codec_params.ProcessingMode.ENCODING):
-            data = self._sp_tokenizer.tokenize(inputs["SEQ_DATA"])
-            outputs["SEQ_LEN"] = data.row_lengths()
-            outputs["SEQ_DATA"] = data.to_tensor()
+            data = self._sp_tokenizer.tokenize(inputs_data)
+            outputs["SEQ_LEN"] = torch.tensor([len(row) for row in data])
+            outputs["SEQ_DATA"] = make_padded_batch(
+                [torch.tensor(row) for row in data])
         elif self._params.processing_mode == (
                 text_codec_params.ProcessingMode.DECODING):
-            # Converts the input into a RaggedTensor.
-            if not isinstance(inputs["SEQ_DATA"], tf.RaggedTensor):
-                inputs["SEQ_DATA"] = tf.RaggedTensor.from_tensor(
-                    inputs["SEQ_DATA"], lengths=inputs["SEQ_LEN"])
-
-            data = self._sp_tokenizer.detokenize(inputs["SEQ_DATA"])
-            outputs["SEQ_DATA"] = data
-            outputs["SEQ_LEN"] = tf.ones((inputs["SEQ_DATA"].nrows(), ),
-                                         dtype=tf.dtypes.int32)
+            outputs["SEQ_DATA"] = self._sp_tokenizer.decode(
+                padded_batch_to_ragged_list(inputs_data))
+            num_rows = len(inputs_data)
+            outputs["SEQ_LEN"] = torch.ones((num_rows, ), dtype=torch.int32)
 
         return outputs

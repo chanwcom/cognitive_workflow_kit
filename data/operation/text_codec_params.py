@@ -12,6 +12,7 @@ class ProcessingMode(Enum):
 @dataclass
 class TextCodecParams:
     model_name: str
-    add_bos: bool
-    add_eos: bool
     processing_mode: ProcessingMode
+    add_bos: bool = True
+    add_eos: bool = True
+    padding_value: int = 0
