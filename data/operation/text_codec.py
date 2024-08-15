@@ -33,7 +33,8 @@ def make_padded_batch(inputs: [torch.Tensor],
 
 def padded_batch_to_ragged_list(inputs: list, padding_value: int = 0) -> list:
     # Padding value must be smaller than all other values.
-    lengths = [torch.sum(torch.tensor(row) > padding_value) for row in inputs]
+    lengths = [torch.sum(torch.tensor(row) != padding_value) for row in inputs]
+
     return [row[0:row_length] for row_length, row in zip(lengths, inputs)]
 
 
