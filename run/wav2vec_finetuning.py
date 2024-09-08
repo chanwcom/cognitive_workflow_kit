@@ -27,7 +27,7 @@ from loss.pytorch import seq_loss_util
 
 # Prevents Tensorflow from using the entire GPU memory.
 #
-# Since we use Tensorflow and Pytorch simultaneously, Tensorflow shouldl not
+# Since we use Tensorflow and Pytorch simultaneously, Tensorflow should not
 # occupy the entire memory. Instead of allocating the entire GPU memory, GPU
 # memory allocated to Tensorflow grows based on its need. Refer to the
 # following website for more information:
