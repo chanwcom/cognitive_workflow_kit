@@ -679,8 +679,7 @@ def apply_postprocessing(ground_truth_prob: torch.Tensor,
     if threshold_type == ThresholdType.NO_THRESHOLD:
         return ground_truth_prob
     elif threshold_type == ThresholdType.ENTROPY:
-        flag = ((torch.sum(torch.special.entr(ground_truth_prob), axis=2) /
-                 torch.log(torch.tensor(ground_truth_prob.shape[2])))
+        flag = (torch.sum(torch.special.entr(ground_truth_prob), axis=2)
                 <= threshold)
     elif threshold_type == ThresholdType.MAX_PROB:
         flag = torch.max(ground_truth_prob, axis=2).values >= threshold

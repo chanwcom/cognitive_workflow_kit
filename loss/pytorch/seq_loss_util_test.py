@@ -174,7 +174,7 @@ class PostProcessingTest(unittest.TestCase):
                                                          dtype=torch.int32)
 
     def test_apply_postprocessing_entropy_uniform_true(self):
-        ENTROPY_TH = 0.26
+        ENTROPY_TH = 0.3604
         UNIFORM_FLAG = True
         actual, _ = seq_loss_util.apply_postprocessing(
             self._ground_truth_prob["SEQ_DATA"],
@@ -199,7 +199,7 @@ class PostProcessingTest(unittest.TestCase):
         self.assertTrue(torch.equal(expected, actual))
 
     def test_apply_postprocessing_entropy_uniform_false(self):
-        ENTROPY_TH = 0.26
+        ENTROPY_TH = 0.3604
         UNIFORM_FLAG = False
         actual, _ = seq_loss_util.apply_postprocessing(
             self._ground_truth_prob["SEQ_DATA"],
@@ -612,7 +612,7 @@ class CtcLossTest(unittest.TestCase):
                                    rtol=1e-05)
 
     def test_shc_loss_gradient_entropy_th_zero(self):
-        ENTROPY_TH = 0.5
+        ENTROPY_TH = 0.8047
 
         actual_loss = seq_loss_util.CtcLoss.apply(
             self._labels, self._labels_len, self._logits, self._logits_len,
@@ -651,7 +651,7 @@ class CtcLossTest(unittest.TestCase):
                                    rtol=1e-05)
 
     def test_shc_loss_gradient_entropy_th_uniform(self):
-        ENTROPY_TH = 0.5
+        ENTROPY_TH = 0.8047
 
         actual_loss = seq_loss_util.CtcLoss.apply(
             self._labels, self._labels_len, self._logits, self._logits_len,
