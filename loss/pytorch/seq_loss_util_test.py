@@ -689,5 +689,45 @@ class CtcLossTest(unittest.TestCase):
                                    rtol=1e-05)
 
 
+class InternalMethodTest(unittest.TestCase):
+
+    def test_apply_smoothing(self):
+        inputs = torch.tensor(
+            [[[0.00, 0.02, 0.98],
+              [0.00, 0.00, 1.00],
+              [0.80, 0.10, 0.10],
+              [0.03, 0.96, 0.01]]]) # yapf: disable
+
+        expected = torch.tensor(
+            [[[0.000, 0.100, 0.900],
+              [0.050, 0.050, 0.900],
+              [0.800, 0.100, 0.100],
+              [0.075, 0.900, 0.025]]]) # yapf: disable
+
+        smoothing_coeff = 0.1
+        actual = seq_loss_util._apply_smoothing(inputs, smoothing_coeff)
+
+        torch.testing.assert_close(actual, expected)
+
+    def test_apply_smoothing_zero_trailing(self):
+        inputs = torch.tensor(
+            [[[0.00, 0.02, 0.98],
+              [0.00, 1.00, 0.00],
+              [0.00, 0.00, 0.00],
+              [0.00, 0.00, 0.00]]]) # yapf: disable
+
+        expected = torch.tensor(
+            [[[0.000, 0.100, 0.900],
+              [0.050, 0.900, 0.050],
+              [0.000, 0.000, 0.000],
+              [0.000, 0.000, 0.000]]]) # yapf: disable
+
+        smoothing_coeff = 0.1
+
+        actual = seq_loss_util._apply_smoothing(inputs, smoothing_coeff)
+
+        torch.testing.assert_close(actual, expected)
+
+
 if __name__ == "__main__":
     unittest.main()
