@@ -188,6 +188,7 @@ class ThresholdType(enum.Enum):
     NO_THRESHOLD = 0
     ENTROPY = 1
     MAX_PROB = 2
+    ELS = 3
 
 
 class ProcessingType(enum.Enum):
@@ -678,6 +679,8 @@ def apply_postprocessing(ground_truth_prob: torch.Tensor,
 
     if threshold_type == ThresholdType.NO_THRESHOLD:
         return ground_truth_prob
+    elif threshold_type == ThresholdType.ELS:
+        return _apply_smoothing(ground_truth_prob, threshold)
     elif threshold_type == ThresholdType.ENTROPY:
         flag = (torch.sum(torch.special.entr(ground_truth_prob), axis=2)
                 <= threshold)
@@ -706,35 +709,35 @@ def apply_postprocessing(ground_truth_prob: torch.Tensor,
     return ((one_hot * flag + (1 - flag) * others) * mask, flag)
 
 
-def _apply_smoothing(inputs: torch.Tensor, smoothing_coeff: float):
+def _apply_smoothing(ground_truth_prob: torch.Tensor, smoothing_coeff: float):
     """Applies smoothing using the ELS algorithm.
 
     Args:
-        inputs: A tensor containing exp(alaph+beta)
+        ground_truth_prob: A tensor containing exp(alaph+beta)
             The shape is (batch_size, logit_length, num_classes)
-            Note that "inputs" does not contain log probabilities
+            Note that "ground_truth_prob" does not contain log probabilities
             but original probabilities that take values between 0 and 1.
         smoothing_coeff:
 
     Returns:
     """
     if smoothing_coeff == 0.0:
-        return inputs
+        return ground_truth_prob
 
     # Finds cases of an one-hot vector.
     #
     # In this case, division by zero error will occur if we do not pre-process
     # it. So temporarily add these vectors  with 1e-10.
-    ids = torch.where(inputs == 1)
+    ids = torch.where(ground_truth_prob == 1)
 
-    outputs = inputs.clone().detach()
+    outputs = ground_truth_prob.clone().detach()
 
     # It has the effect of adding a small value to the entire [i, t, :] so
     # that division by zero will not happen.
     outputs[ids[0], ids[1], :] = 1e-10
 
     # Values higher than 1 - (smoothing_coeff) are replaced with zeros.
-    ids_too_large = torch.where(inputs > 1 - smoothing_coeff)
+    ids_too_large = torch.where(ground_truth_prob > 1 - smoothing_coeff)
     wo_largest = outputs.clone().detach()
     wo_largest[ids_too_large] = 0.0
 
@@ -748,7 +751,7 @@ def _apply_smoothing(inputs: torch.Tensor, smoothing_coeff: float):
     # and subsequently added to other values belonging to the same time step.
 
     smoothing_values = (torch.maximum(
-        torch.max(inputs, axis=2).values - (1 - smoothing_coeff),
+        torch.max(ground_truth_prob, axis=2).values - (1 - smoothing_coeff),
         torch.Tensor([0.0])))
 
     scaling_coeff = torch.div(
