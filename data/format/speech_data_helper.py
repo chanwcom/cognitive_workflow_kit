@@ -12,6 +12,7 @@ __author__ = "Chanwoo Kim(chanwcom@gmail.com)"
 
 # Standard imports
 import uuid
+import typing
 
 # Third-party imports
 import tensorflow as tf
@@ -112,9 +113,9 @@ class SpeechDataToWave(operation.AbstractOperation):
         return outputs
 
 
-def parse_speech_data(speech_data_string,
-                      string_descriptor,
-                      out_type=tf.dtypes.float32):
+def parse_speech_data(speech_data_string: typing.Union[tf.Tensor, str],
+                      string_descriptor: bytes,
+                      out_type: tf.dtypes.DType = tf.dtypes.float32):
     """Parses a single example serialized in SpeechData proto-message.
 
     Args:

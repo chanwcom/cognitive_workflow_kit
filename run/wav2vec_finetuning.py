@@ -198,16 +198,10 @@ class MyTrainer(Trainer):
 
 
 class MyCtcTrainer(Trainer):
-
+    # TODO(chanwcom)
+    # Is inputs the right name? Target might be more natural.
     def compute_loss(self, model, inputs, return_outputs=False):
         with torch.device(inputs["input_values"].device.type):
-            blank_augmented_inputs = {}
-            blank_augmented_inputs["SEQ_DATA"] = inputs["labels"]
-            blank_augmented_inputs["SEQ_LEN"] = torch.sum(
-                (inputs["labels"] >= 0).type(torch.int32), axis=1)
-            blank_augmented_inputs = seq_loss_util.to_blank_augmented_labels(
-                blank_augmented_inputs, 0, True, False)
-
             target = inputs.pop("labels")
             outputs = model(**inputs)
 
@@ -216,13 +210,13 @@ class MyCtcTrainer(Trainer):
                                         fill_value=logits.shape[1]).to(
                                             logits.device)
 
-            target = blank_augmented_inputs["SEQ_DATA"]
-            target_lengths = blank_augmented_inputs["SEQ_LEN"]
+            target = inputs["SEQ_DATA"]
+            target_lengths = inputs["SEQ_LEN"]
 
             ctc_loss = seq_loss_util.CtcLoss()
             loss = ctc_loss.apply(target, target_lengths,
-                                  logits.log_softmax(2),
-                                  logits_lengths).mean()
+                                  logits.log_softmax(2), logits_lengths,
+                                  seq_loss_util.TableType.CTC, False).mean()
 
         if return_outputs:
             return loss, outputs
