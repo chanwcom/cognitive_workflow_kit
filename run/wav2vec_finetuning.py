@@ -202,7 +202,8 @@ class MyCtcTrainer(Trainer):
 
 
 class MyCtcTrainer(Trainer):
-
+    # TODO(chanwcom)
+    # Is inputs the right name? Target might be more natural.
     def compute_loss(self, model, inputs, return_outputs=False):
         with torch.device(inputs["input_values"].device.type):
             target = inputs.pop("labels")
