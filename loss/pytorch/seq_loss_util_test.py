@@ -108,11 +108,176 @@ class SeqFormatConversionTest(unittest.TestCase):
         self.assertTrue(
             torch.equal(expected_output["SEQ_LEN"], actual_output["SEQ_LEN"]))
 
+    def test_to_blank_augmented_labels_default_blank_index(self):
+        blank_index = 0
+
+        actual_output = seq_loss_util.to_blank_augmented_labels(
+            self._y_sparse, blank_index)
+
+        expected_output = {}
+        expected_output["SEQ_DATA"] = torch.tensor(
+            [[0, 2, 0, 4, 0, 5, 0, 3, 0, 6, 0],
+             [0, 2, 0, 5, 0, 3, 0, 6, 0, 0, 0]],
+            dtype=torch.int32)
+        expected_output["SEQ_LEN"] = torch.tensor([11, 9], dtype=torch.int32)
+
+        self.assertTrue(
+            torch.equal(expected_output["SEQ_DATA"],
+                        actual_output["SEQ_DATA"]))
+        self.assertTrue(
+            torch.equal(expected_output["SEQ_LEN"], actual_output["SEQ_LEN"]))
+
+    def test_to_onset_augmented_labels(self):
+        # The shape of y_true_sparse is (batch_size, label_seq_len).
+        num_classes = 6
+
+        actual_output = seq_loss_util.to_onset_augmented_labels(
+            self._y_sparse, num_classes)
+
+        expected_output = {}
+        # yapf: disable
+        expected_output["SEQ_DATA"] = torch.tensor(
+            [[2, 3, 6, 7, 8, 9,  4,  5, 10, 11],
+             [2, 3, 8, 9, 4, 5, 10, 11,  0,  0]],
+            dtype=torch.int32)
+        # yapf: enable
+        expected_output["SEQ_LEN"] = torch.tensor([10, 8], dtype=torch.int32)
+
+        self.assertTrue(
+            torch.equal(expected_output["SEQ_DATA"],
+                        actual_output["SEQ_DATA"]))
+        self.assertTrue(
+            torch.equal(expected_output["SEQ_LEN"], actual_output["SEQ_LEN"]))
+
+
+class PostProcessingTest(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._ = {}
+        # B = 2, T = 5, C = 3
+        # yapf: disable
+        cls._ground_truth_prob = {}
+        cls._ground_truth_prob["SEQ_DATA"] = torch.tensor(
+                   [[[0.89, 0.11, 0.00, 0.00],
+                     [0.45, 0.45, 0.05, 0.05],
+                     [0.00, 0.85, 0.15, 0.00],
+                     [0.05, 0.45, 0.45, 0.05],
+                     [0.02, 0.01, 0.96, 0.01]],
+                    [[0.70, 0.20, 0.10, 0.00],
+                     [0.91, 0.03, 0.03, 0.03],
+                     [0.02, 0.94, 0.02, 0.02],
+                     [0.01, 0.01, 0.97, 0.01],
+                     [0.00, 0.00, 0.00, 0.00]]], dtype=torch.float32)
+        # yapf: enable
+        cls._ground_truth_prob["SEQ_LEN"] = torch.tensor([5, 4],
+                                                         dtype=torch.int32)
+
+    def test_apply_postprocessing_entropy_uniform_true(self):
+        ENTROPY_TH = 0.3604
+        UNIFORM_FLAG = True
+        actual, _ = seq_loss_util.apply_postprocessing(
+            self._ground_truth_prob["SEQ_DATA"],
+            self._ground_truth_prob["SEQ_LEN"],
+            seq_loss_util.ThresholdType.ENTROPY,
+            ENTROPY_TH,
+            UNIFORM_FLAG,
+        )
+        expected = torch.tensor(
+            [[[1.00, 0.00, 0.00, 0.00],
+              [0.25, 0.25, 0.25, 0.25],
+              [0.25, 0.25, 0.25, 0.25],
+              [0.25, 0.25, 0.25, 0.25],
+              [0.00, 0.00, 1.00, 0.00]],
+             [[0.25, 0.25, 0.25, 0.25],
+              [0.25, 0.25, 0.25, 0.25],
+              [0.00, 1.00, 0.00, 0.00],
+              [0.00, 0.00, 1.00, 0.00],
+              [0.00, 0.00, 0.00, 0.00]]],
+            dtype=torch.float32) # yapf: disable
+
+        self.assertTrue(torch.equal(expected, actual))
+
+    def test_apply_postprocessing_entropy_uniform_false(self):
+        ENTROPY_TH = 0.3604
+        UNIFORM_FLAG = False
+        actual, _ = seq_loss_util.apply_postprocessing(
+            self._ground_truth_prob["SEQ_DATA"],
+            self._ground_truth_prob["SEQ_LEN"],
+            seq_loss_util.ThresholdType.ENTROPY,
+            ENTROPY_TH,
+            UNIFORM_FLAG,
+        )
+        expected = torch.tensor(
+            [[[1.00, 0.00, 0.00, 0.00],
+              [0.45, 0.45, 0.05, 0.05],
+              [0.00, 0.85, 0.15, 0.00],
+              [0.05, 0.45, 0.45, 0.05],
+              [0.00, 0.00, 1.00, 0.00]],
+             [[0.70, 0.20, 0.10, 0.00],
+              [0.91, 0.03, 0.03, 0.03],
+              [0.00, 1.00, 0.00, 0.00],
+              [0.00, 0.00, 1.00, 0.00],
+              [0.00, 0.00, 0.00, 0.00]]],
+            dtype=torch.float32) # yapf: disable
+
+        self.assertTrue(torch.equal(expected, actual))
+
+    def test_apply_postprocessing_max_prob_uniform_true(self):
+        MAX_PROB_TH = 0.9
+        UNIFORM_FLAG = True
+        actual, _ = seq_loss_util.apply_postprocessing(
+            self._ground_truth_prob["SEQ_DATA"],
+            self._ground_truth_prob["SEQ_LEN"],
+            seq_loss_util.ThresholdType.MAX_PROB,
+            MAX_PROB_TH,
+            UNIFORM_FLAG,
+        )
+        expected = torch.tensor(
+            [[[0.25, 0.25, 0.25, 0.25],
+              [0.25, 0.25, 0.25, 0.25],
+              [0.25, 0.25, 0.25, 0.25],
+              [0.25, 0.25, 0.25, 0.25],
+              [0.00, 0.00, 1.00, 0.00]],
+             [[0.25, 0.25, 0.25, 0.25],
+              [1.00, 0.00, 0.00, 0.00],
+              [0.00, 1.00, 0.00, 0.00],
+              [0.00, 0.00, 1.00, 0.00],
+              [0.00, 0.00, 0.00, 0.00]]],
+            dtype=torch.float32) # yapf: disable
+
+        self.assertTrue(torch.equal(expected, actual))
+
+    def test_apply_postprocessing_max_prob_uniform_false(self):
+        MAX_PROB_TH = 0.9
+        UNIFORM_FLAG = False
+        actual, _ = seq_loss_util.apply_postprocessing(
+            self._ground_truth_prob["SEQ_DATA"],
+            self._ground_truth_prob["SEQ_LEN"],
+            seq_loss_util.ThresholdType.MAX_PROB,
+            MAX_PROB_TH,
+            UNIFORM_FLAG,
+        )
+        expected = torch.tensor(
+            [[[0.89, 0.11, 0.00, 0.00],
+              [0.45, 0.45, 0.05, 0.05],
+              [0.00, 0.85, 0.15, 0.00],
+              [0.05, 0.45, 0.45, 0.05],
+              [0.00, 0.00, 1.00, 0.00]],
+             [[0.70, 0.20, 0.10, 0.00],
+              [1.00, 0.00, 0.00, 0.00],
+              [0.00, 1.00, 0.00, 0.00],
+              [0.00, 0.00, 1.00, 0.00],
+              [0.00, 0.00, 0.00, 0.00]]],
+            dtype=torch.float32) # yapf: disable
+
+        self.assertTrue(torch.equal(expected, actual))
+
 
 class SeqLossUtilTest(unittest.TestCase):
 
-    def test_label_trans_table(self):
-        """Tests the label_trans_table method.
+    def test_label_trans_allowance_table_ctc(self):
+        """Tests the label_trans_allowance_table_ctc method.
 
         In this unit test, it is assumed that "0" corresponds to the blank
         label.
@@ -125,7 +290,8 @@ class SeqLossUtilTest(unittest.TestCase):
         labels_len = torch.tensor([7, 7, 5])
         # yapf: enable
 
-        actual = seq_loss_util.label_trans_table(labels, labels_len)
+        actual = seq_loss_util.label_trans_allowance_table(
+            labels, labels_len, seq_loss_util.LabelType.CTC)
 
         expected = torch.tensor(
             [[[  0.0,   0.0, LOG_0, LOG_0, LOG_0, LOG_0, LOG_0],
@@ -154,6 +320,81 @@ class SeqLossUtilTest(unittest.TestCase):
         # Checks the actual output with respect to the expected output.
         torch.testing.assert_close(actual, expected)
 
+    def test_label_trans_allowance_table_shc_type_0(self):
+        """Tests the label_trans_allowance_table_shc_type_0 method."""
+
+        # yapf: disable
+        labels = torch.tensor([[0, 1, 2, 3, 4, 5],   # <-- [0, 1, 2]
+                               [0, 1, 2, 3, 2, 3],   # <-- [0, 1, 1]
+                               [0, 1, 2, 3, 0, 0]])  # <-- [0, 1]
+        labels_len = torch.tensor([6, 6, 4])
+        # yapf: enable
+
+        actual = seq_loss_util.label_trans_allowance_table(
+            labels, labels_len, seq_loss_util.LabelType.SHC_TYPE_0)
+
+        expected = torch.tensor(
+            [[[LOG_0,   0.0, LOG_0, LOG_0, LOG_0, LOG_0],
+              [LOG_0,   0.0,   0.0, LOG_0, LOG_0, LOG_0],
+              [LOG_0, LOG_0, LOG_0,   0.0, LOG_0, LOG_0],
+              [LOG_0, LOG_0, LOG_0,   0.0,   0.0, LOG_0],
+              [LOG_0, LOG_0, LOG_0, LOG_0, LOG_0,   0.0],
+              [LOG_0, LOG_0, LOG_0, LOG_0, LOG_0,   0.0]],
+             [[LOG_0,   0.0, LOG_0, LOG_0, LOG_0, LOG_0],
+              [LOG_0,   0.0,   0.0, LOG_0, LOG_0, LOG_0],
+              [LOG_0, LOG_0, LOG_0,   0.0, LOG_0, LOG_0],
+              [LOG_0, LOG_0, LOG_0,   0.0,   0.0, LOG_0],
+              [LOG_0, LOG_0, LOG_0, LOG_0, LOG_0,   0.0],
+              [LOG_0, LOG_0, LOG_0, LOG_0, LOG_0,   0.0]],
+             [[LOG_0,   0.0, LOG_0, LOG_0, LOG_0, LOG_0],
+              [LOG_0,   0.0,   0.0, LOG_0, LOG_0, LOG_0],
+              [LOG_0, LOG_0, LOG_0,   0.0, LOG_0, LOG_0],
+              [LOG_0, LOG_0, LOG_0,   0.0,   0.0, LOG_0],
+              [LOG_0, LOG_0, LOG_0, LOG_0, LOG_0,   0.0],
+              [LOG_0, LOG_0, LOG_0, LOG_0, LOG_0,   0.0]]],
+             dtype=torch.float32) # yapf: disable
+
+        # Checks the actual output with respect to the expected output.
+        torch.testing.assert_close(actual, expected)
+
+    def test_label_trans_allowance_table_shc_type_1(self):
+        """Tests the label_trans_allowance_table_shc_type_0 method."""
+
+        # yapf: disable
+        labels = torch.tensor([[0, 1, 2, 3, 4, 5],   # <-- [0, 1, 2]
+                               [0, 1, 2, 3, 2, 3],   # <-- [0, 1, 1]
+                               [0, 1, 2, 3, 0, 0]])  # <-- [0, 1]
+        labels_len = torch.tensor([6, 6, 4])
+        # yapf: enable
+
+        actual = seq_loss_util.label_trans_allowance_table(
+            labels, labels_len, seq_loss_util.LabelType.SHC_TYPE_1)
+
+        expected = torch.tensor(
+            [
+             [[  0.0,   0.0, LOG_0, LOG_0, LOG_0, LOG_0],
+              [LOG_0,   0.0,   0.0, LOG_0, LOG_0, LOG_0],
+              [LOG_0, LOG_0,   0.0,   0.0, LOG_0, LOG_0],
+              [LOG_0, LOG_0, LOG_0,   0.0,   0.0, LOG_0],
+              [LOG_0, LOG_0, LOG_0, LOG_0,   0.0,   0.0],
+              [LOG_0, LOG_0, LOG_0, LOG_0, LOG_0,   0.0]],
+             [[  0.0,   0.0, LOG_0, LOG_0, LOG_0, LOG_0],
+              [LOG_0,   0.0,   0.0, LOG_0, LOG_0, LOG_0],
+              [LOG_0, LOG_0,   0.0,   0.0, LOG_0, LOG_0],
+              [LOG_0, LOG_0, LOG_0,   0.0,   0.0, LOG_0],
+              [LOG_0, LOG_0, LOG_0, LOG_0,   0.0,   0.0],
+              [LOG_0, LOG_0, LOG_0, LOG_0, LOG_0,   0.0]],
+             [[  0.0,   0.0, LOG_0, LOG_0, LOG_0, LOG_0],
+              [LOG_0,   0.0,   0.0, LOG_0, LOG_0, LOG_0],
+              [LOG_0, LOG_0,   0.0,   0.0, LOG_0, LOG_0],
+              [LOG_0, LOG_0, LOG_0,   0.0,   0.0, LOG_0],
+              [LOG_0, LOG_0, LOG_0, LOG_0,   0.0,   0.0],
+              [LOG_0, LOG_0, LOG_0, LOG_0, LOG_0,   0.0]]],
+             dtype=torch.float32) # yapf: disable
+
+        # Checks the actual output with respect to the expected output.
+        torch.testing.assert_close(actual, expected)
+
     def test_calculate_log_label_prob(self):
         batch_size = 2
         max_logit_len = 6
@@ -171,7 +412,7 @@ class SeqLossUtilTest(unittest.TestCase):
         logits = np.random.normal(
             size=(batch_size, max_logit_len, num_classes)).astype(np.float32)
         # yapf: enable
-        softmax_output = torch.softmax(torch.Tensor(logits), dim=2)
+        softmax_output = torch.softmax(torch.tensor(logits), dim=2)
 
         actual_output = seq_loss_util.calculate_log_label_prob(
             labels, softmax_output)
@@ -208,9 +449,10 @@ class SeqLossUtilTest(unittest.TestCase):
                                [0, 1, 0, 0, 0]])
         labels_len = torch.tensor([5, 5, 3])
         # yapf: enable
-        actual = seq_loss_util.label_trans_table(labels, labels_len)
+        actual = seq_loss_util.label_trans_allowance_table_ctc(
+            labels, labels_len)
 
-        label_trans_table = torch.tensor(
+        label_trans_allowance_table_ctc = torch.tensor(
             [[[  0.0,   0.0, LOG_0, LOG_0, LOG_0],
               [LOG_0,   0.0,   0.0,   0.0, LOG_0],
               [LOG_0, LOG_0,   0.0,   0.0, LOG_0],
@@ -242,7 +484,8 @@ class SeqLossUtilTest(unittest.TestCase):
         logits_len = torch.tensor([6, 5, 4])
 
         (alpha, beta, log_seq_prob_final) = seq_loss_util.calculate_alpha_beta(
-            label_trans_table, log_pred_label_prob, labels_len, logits_len)
+            label_trans_allowance_table_ctc, log_pred_label_prob, labels_len,
+            logits_len)
 
         # yapf: disable
         expected_alpha = torch.tensor(
@@ -298,18 +541,17 @@ class SeqLossUtilTest(unittest.TestCase):
 
 class CtcLossTest(unittest.TestCase):
 
-    @classmethod
-    def setUpClass(cls):
+    def setUp(self):
         # The shape of labels is (batch_size, labels_len).
-        cls._labels = torch.tensor([[1, 2, 3], [3, 2, 0]])
-        cls._labels_len = torch.tensor([3, 2])
+        self._labels = torch.tensor([[1, 2, 3], [3, 2, 0]])
+        self._labels_len = torch.tensor([3, 2])
 
         # A tensor containing prediction values from the softmax layer.
 
         # The shape of y_pred is (batch_size, pred_seq_len, num_classes).
         # The number of classes is 5.
         # yapf: disable
-        cls._logits = torch.tensor([[[0.6, 0.1, 0.1, 0.1, 0.1],
+        self._logits = torch.tensor([[[0.6, 0.1, 0.1, 0.1, 0.1],
                                      [0.1, 0.6, 0.1, 0.1, 0.1],
                                      [0.3, 0.1, 0.1, 0.3, 0.1],
                                      [0.3, 0.1, 0.1, 0.3, 0.1],
@@ -324,39 +566,24 @@ class CtcLossTest(unittest.TestCase):
                                      [0.0, 0.0, 0.0, 0.0, 0.0],
                                      [0.0, 0.0, 0.0, 0.0, 0.0]]], requires_grad=True)
         # yapf: enable
-        cls._logits_len = torch.tensor([7, 5])
+        self._logits_len = torch.tensor([7, 5])
 
     def test_ctc_loss(self):
         """Tests the ctc_loss method."""
-
-        blank_augmented_label = seq_loss_util.to_blank_augmented_labels({
-            "SEQ_DATA":
-            self._labels,
-            "SEQ_LEN":
-            self._labels_len
-        })
-
-        actual_loss = seq_loss_util.CtcLoss.apply(
-            blank_augmented_label["SEQ_DATA"],
-            blank_augmented_label["SEQ_LEN"],
-            self._logits, self._logits_len)  # yapf: disable
+        actual_loss = seq_loss_util.CtcLoss.apply(self._labels,
+                                                  self._labels_len,
+                                                  self._logits,
+                                                  self._logits_len)
 
         expected_loss = torch.tensor([6.115841, 4.7813644])
 
         torch.testing.assert_close(expected_loss, actual_loss)
 
     def test_ctc_loss_gradient(self):
-        blank_augmented_label = seq_loss_util.to_blank_augmented_labels({
-            "SEQ_DATA":
-            self._labels,
-            "SEQ_LEN":
-            self._labels_len
-        })
-
-        actual_loss = seq_loss_util.CtcLoss.apply(
-            blank_augmented_label["SEQ_DATA"],
-            blank_augmented_label["SEQ_LEN"],
-            self._logits, self._logits_len)  # yapf: disable
+        actual_loss = seq_loss_util.CtcLoss.apply(self._labels,
+                                                  self._labels_len,
+                                                  self._logits,
+                                                  self._logits_len)
 
         actual_loss.backward(torch.ones_like(actual_loss))
 
@@ -383,6 +610,123 @@ class CtcLossTest(unittest.TestCase):
                                    actual_output,
                                    atol=1e-05,
                                    rtol=1e-05)
+
+    def test_shc_loss_gradient_entropy_th_zero(self):
+        ENTROPY_TH = 0.8047
+
+        actual_loss = seq_loss_util.CtcLoss.apply(
+            self._labels, self._labels_len, self._logits, self._logits_len,
+            seq_loss_util.LabelType.CTC,
+            True,
+            seq_loss_util.ThresholdType.ENTROPY,
+            ENTROPY_TH,
+            seq_loss_util.ProcessingType.ZERO
+        )  # yapf: disable
+
+
+        actual_loss.backward(torch.ones_like(actual_loss))
+
+        # yapf: disable
+        expected_output = torch.tensor(
+            [[[ 0.29188, 0.17703, -0.82297,  0.17703,  0.17703],
+              [ 0.00000, 0.00000, -0.00000,  0.00000,  0.00000],
+              [ 0.00000, 0.00000, -0.00000, -0.00000,  0.00000],
+              [ 0.00000, 0.00000,  0.00000, -0.00000,  0.00000],
+              [ 0.00000, 0.00000,  0.00000, -0.00000, -0.00000],
+              [ 0.00000, 0.00000,  0.00000,  0.00000, -0.00000],
+              [ 0.20000, 0.20000,  0.20000,  0.20000, -0.80000]],
+             [[-0.70812, 0.17703,  0.17703,  0.17703,  0.17703],
+              [ 0.17703, 0.17703,  0.17703,  0.17703, -0.70812],
+              [-0.00000, 0.00000,  0.00000, -0.00000, -0.00000],
+              [-0.00000, 0.00000,  0.00000, -0.00000,  0.00000],
+              [-0.70812, 0.17703,  0.17703,  0.17703,  0.17703],
+              [ 0.00000, 0.00000,  0.00000,  0.00000,  0.00000],
+              [ 0.00000, 0.00000,  0.00000,  0.00000,  0.00000]]])
+        # yapf:enable
+        actual_output = self._logits.grad
+
+        torch.testing.assert_close(expected_output,
+                                   actual_output,
+                                   atol=1e-05,
+                                   rtol=1e-05)
+
+    def test_shc_loss_gradient_entropy_th_uniform(self):
+        ENTROPY_TH = 0.8047
+
+        actual_loss = seq_loss_util.CtcLoss.apply(
+            self._labels, self._labels_len, self._logits, self._logits_len,
+            seq_loss_util.LabelType.CTC,
+            True,
+            seq_loss_util.ThresholdType.ENTROPY,
+            ENTROPY_TH,
+            seq_loss_util.ProcessingType.UNIFORM
+        )  # yapf: disable
+
+        actual_loss.backward(torch.ones_like(actual_loss))
+
+        # yapf: disable
+        expected_output = torch.tensor(
+            [[[ 0.29188,  0.17703, -0.82297,  0.17703,  0.17703],
+              [-0.02297,  0.09188, -0.02297, -0.02297, -0.02297],
+              [ 0.02441, -0.01627, -0.01627,  0.02441, -0.01627],
+              [ 0.02441, -0.01627, -0.01627,  0.02441, -0.01627],
+              [ 0.09188, -0.02297, -0.02297, -0.02297, -0.02297],
+              [-0.02297, -0.02297, -0.02297, -0.02297,  0.09188],
+              [ 0.20000,  0.20000,  0.20000,  0.20000, -0.80000]],
+             [[-0.70812,  0.17703,  0.17703,  0.17703,  0.17703],
+              [ 0.17703,  0.17703,  0.17703,  0.17703, -0.70812],
+              [ 0.09188, -0.02297, -0.02297, -0.02297, -0.02297],
+              [-0.02297, -0.02297,  0.09188, -0.02297, -0.02297],
+              [-0.70812,  0.17703,  0.17703,  0.17703,  0.17703],
+              [ 0.00000,  0.00000,  0.00000,  0.00000,  0.00000],
+              [ 0.00000,  0.00000,  0.00000,  0.00000,  0.00000]]])
+        # yapf:enable
+        actual_output = self._logits.grad
+
+        torch.testing.assert_close(expected_output,
+                                   actual_output,
+                                   atol=1e-05,
+                                   rtol=1e-05)
+
+
+class InternalMethodTest(unittest.TestCase):
+
+    def test_apply_smoothing(self):
+        inputs = torch.tensor(
+            [[[0.00, 0.02, 0.98],
+              [0.00, 0.00, 1.00],
+              [0.80, 0.10, 0.10],
+              [0.03, 0.96, 0.01]]]) # yapf: disable
+
+        expected = torch.tensor(
+            [[[0.000, 0.100, 0.900],
+              [0.050, 0.050, 0.900],
+              [0.800, 0.100, 0.100],
+              [0.075, 0.900, 0.025]]]) # yapf: disable
+
+        smoothing_coeff = 0.1
+        actual = seq_loss_util._apply_smoothing(inputs, smoothing_coeff)
+
+        torch.testing.assert_close(actual, expected)
+
+    def test_apply_smoothing_zero_trailing(self):
+        inputs = torch.tensor(
+            [[[0.00, 0.02, 0.98],
+              [0.00, 1.00, 0.00],
+              [0.00, 0.00, 0.00],
+              [0.00, 0.00, 0.00]]]) # yapf: disable
+
+        expected = torch.tensor(
+            [[[0.000, 0.100, 0.900],
+              [0.050, 0.900, 0.050],
+              [0.000, 0.000, 0.000],
+              [0.000, 0.000, 0.000]]]) # yapf: disable
+
+        smoothing_coeff = 0.1
+
+        actual = seq_loss_util._apply_smoothing(inputs, smoothing_coeff)
+
+        torch.testing.assert_close(actual, expected)
 
 
 if __name__ == "__main__":

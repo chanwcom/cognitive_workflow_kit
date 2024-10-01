@@ -1,5 +1,8 @@
 #!/usr/bin/python3
 
+# 1. Make it derived from Operation
+# 2. Remove the hard coded part in the...
+
 # Standard imports
 import uuid
 import re
