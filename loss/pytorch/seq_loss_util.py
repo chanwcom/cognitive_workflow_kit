@@ -752,11 +752,11 @@ def _apply_smoothing(ground_truth_prob: torch.Tensor, smoothing_coeff: float):
 
     smoothing_values = (torch.maximum(
         torch.max(ground_truth_prob, axis=2).values - (1 - smoothing_coeff),
-        torch.Tensor([0.0])))
+        torch.Tensor([0.0]).to(ground_truth_prob.device)))
 
     scaling_coeff = torch.div(
         smoothing_values + sum_wo_largest,
-        torch.maximum(sum_wo_largest, torch.Tensor([1e-10])))
+        torch.maximum(sum_wo_largest, torch.Tensor([1e-10]).to(ground_truth_prob.device)))
 
     outputs = torch.unsqueeze(scaling_coeff, dim=-1) * outputs
 
