@@ -83,8 +83,8 @@ class PaddedBatchDatasetOp(Tf2DatasetOp):
         super(Tf2DatasetOp, self).__init__(params)
 
     def process(self, dataset: tf.data.Dataset) -> tf.data.Dataset:
-        return dataset.padded_batch(batch_size=params.batch_size,
-                                    drop_remainder=params.drop_reminader)
+        return dataset.padded_batch(batch_size=self.params.batch_size,
+                                    drop_remainder=self.params.drop_remainder)
 
 
 #class BasicDatasetOperation(Tf2DatasetOp):

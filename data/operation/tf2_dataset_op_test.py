@@ -84,6 +84,64 @@ class BatchDatasetOpTest(tf.test.TestCase):
         self.assertAllEqual(expected[0], actual[0])
 
 
+class PaddedBatchDatasetOpTest(tf.test.TestCase):
+    """A class for unit-testing the NTPDatasetOp class."""
+
+    @classmethod
+    def setUpClass(cls):
+
+        def data_generator():
+            "A generator method"
+            data_list = [
+                tf.constant([1, 2]),
+                tf.constant([1]),
+                tf.constant([1, 2, 3]),
+                tf.constant([2, 3, 4]),
+                tf.constant([3, 5])
+            ]
+
+            for data in data_list:
+                yield data
+
+        cls._dataset = tf.data.Dataset.from_generator(
+            data_generator,
+            output_signature=tf.TensorSpec(shape=[None],
+                                           dtype=tf.dtypes.int32))
+
+    def test_process(self):
+        params = dataset_op_params.PaddedBatchDatasetOpParams(batch_size=3)
+        op = tf2_dataset_op.PaddedBatchDatasetOp(params)
+        actual = []
+
+        dataset = op.process(self._dataset)
+        for data in dataset:
+            actual.append(data)
+
+        expected = [
+            tf.constant([[1, 2, 0], [1, 0, 0], [1, 2, 3]]),
+            tf.constant([[2, 3, 4], [3, 5, 0]])
+        ]
+
+        self.assertEqual(len(expected), len(actual))
+        self.assertAllEqual(expected[0], actual[0])
+        self.assertAllEqual(expected[1], actual[1])
+
+    def test_process_with_dropping_remainder(self):
+        params = dataset_op_params.PaddedBatchDatasetOpParams(
+            batch_size=3, drop_remainder=True)
+        op = tf2_dataset_op.PaddedBatchDatasetOp(params)
+        actual = []
+
+        dataset = op.process(self._dataset)
+        for data in dataset:
+            actual.append(data)
+
+        expected = [tf.constant([[1, 2, 0], [1, 0, 0], [1, 2, 3]])]
+
+        self.assertEqual(len(expected), len(actual))
+        self.assertAllEqual(expected[0], actual[0])
+
+
 #class BasicDatasetOpTest(tf.test.TestCase):
 #    """A class for unit-testing the BasicDatasetOperation class."""
 #    def setUp(self):
