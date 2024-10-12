@@ -50,8 +50,9 @@ class NTPDatasetOpTest(tf.test.TestCase):
 class BatchDatasetOpTest(tf.test.TestCase):
     """A class for unit-testing the NTPDatasetOp class."""
 
-    def setUp(self):
-        self._dataset = tf.data.Dataset.from_tensor_slices([1, 2, 3, 4, 5])
+    @classmethod
+    def setUp(cls):
+        cls._dataset = tf.data.Dataset.from_tensor_slices([1, 2, 3, 4, 5])
 
     def test_process(self):
         params = dataset_op_params.BatchDatasetOpParams(batch_size=3)
@@ -140,6 +141,51 @@ class PaddedBatchDatasetOpTest(tf.test.TestCase):
 
         self.assertEqual(len(expected), len(actual))
         self.assertAllEqual(expected[0], actual[0])
+
+
+class OptionalDatasetOpTest(tf.test.TestCase):
+    """A class for testing the OptionalDatasetOp class."""
+
+    @classmethod
+    def setUp(cls):
+        cls._dataset = tf.data.Dataset.from_tensor_slices([1, 2, 3, 4, 5])
+
+        # Patches the batch, cache, and prefetch methods using "Mock".
+        #
+        # Note that the return value must be the original input, since the
+        # return value will be used as the dataset processed. Without this
+        # "return_value" of the original input, the mock object will returned
+        # instead.
+        tf.data.Dataset.cache = mock.Mock(return_value=cls._dataset)
+        tf.data.Dataset.prefetch = mock.Mock(return_value=cls._dataset)
+
+    def test_process_with_use_cache(self):
+        params = dataset_op_params.OptionalDatasetOpParams(
+            optional_op_type=dataset_op_params.OptionalDatasetOpParams.Type.
+            USE_CACHE)
+        op = tf2_dataset_op.OptionalDatasetOp(params)
+        actual = []
+
+        dataset = op.process(self._dataset)
+        for data in dataset:
+            actual.append(data)
+
+        self._dataset.cache.assert_called_once()
+        self._dataset.prefetch.eassert_not_called()
+
+    def test_process_with_prefetch(self):
+        params = dataset_op_params.OptionalDatasetOpParams(
+            optional_op_type=dataset_op_params.OptionalDatasetOpParams.Type.
+            USE_PREFETCH)
+        op = tf2_dataset_op.OptionalDatasetOp(params)
+        actual = []
+
+        dataset = op.process(self._dataset)
+        for data in dataset:
+            actual.append(data)
+
+        self._dataset.cache.assert_not_called()
+        self._dataset.prefetch.assert_called_once()
 
 
 #class BasicDatasetOpTest(tf.test.TestCase):

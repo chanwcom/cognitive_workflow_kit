@@ -12,6 +12,7 @@ from operation import operation_params
 @dataclass
 class DatasetOpCreationParams(operation_params.AbstractOpCreationParams):
     class_name: str
+    class_type: str
     class_params: operation_params.AbstractOpParams
 
 
@@ -39,5 +40,10 @@ class PaddedBatchDatasetOpParams(DatasetOpParams):
 
 @dataclass
 class OptionalDatasetOpParams(DatasetOpParams):
-    use_cache: bool = False
-    use_prefetch: bool = False
+
+    class Type(Enum):
+        NONE = 1
+        USE_CACHE = 2
+        USE_PREFETCH = 3
+
+    optional_op_type: Type = Type.NONE

@@ -29,6 +29,7 @@ from data.operation import dataset_op_params
 
 class Tf2DatasetOp(operation.AbstractOp):
     """An abstract class for TF2_DATASET type."""
+
     @abc.abstractmethod
     def __init__(self, params: dataset_op_params.DatasetOpCreationParams):
         super(Tf2DatasetOp, self).__init__(params)
@@ -63,7 +64,7 @@ class NTPDatasetOp(Tf2DatasetOp):
 
 
 class BatchDatasetOp(Tf2DatasetOp):
-    """A class for combining consecutive examples into a batch."""
+    """A class for grouping consecutive examples into a batch."""
 
     def __init__(self, params: dataset_op_params.BatchDatasetOpParams) -> None:
         super(Tf2DatasetOp, self).__init__(params)
@@ -76,7 +77,7 @@ class BatchDatasetOp(Tf2DatasetOp):
 
 
 class PaddedBatchDatasetOp(Tf2DatasetOp):
-    """A class for combining consecutive sequence examples into a padded batch.
+    """A class for grouping consecutive "sequence" examples into a padded batch.
 
     Zero-padding will be applied to make the sequence lengths all the same."""
 
@@ -88,6 +89,28 @@ class PaddedBatchDatasetOp(Tf2DatasetOp):
     def process(self, dataset: tf.data.Dataset) -> tf.data.Dataset:
         return dataset.padded_batch(batch_size=self.params.batch_size,
                                     drop_remainder=self.params.drop_remainder)
+
+
+class OptionalDatasetOp(Tf2DatasetOp):
+    """A class for performing optional operations on dataset."""
+
+    def __init__(self,
+                 params: dataset_op_params.OptionalDatasetOpParams) -> None:
+        super(Tf2DatasetOp, self).__init__(params)
+        assert isinstance(params, dataset_op_params.OptionalDatasetOpParams)
+
+    def process(self, dataset: tf.data.Dataset) -> tf.data.Dataset:
+        OptionalType = dataset_op_params.OptionalDatasetOpParams.Type
+        if self.params.optional_op_type == OptionalType.NONE:
+            out_dataset = dataset
+        elif self.params.optional_op_type == OptionalType.USE_CACHE:
+            dataset = dataset.cache()
+        elif self.params.optional_op_type == OptionalType.USE_PREFETCH:
+            dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE)
+        else:
+            raise TypeError("Unsupported Type.")
+
+        return dataset
 
 
 #class BasicDatasetOperation(Tf2DatasetOp):
