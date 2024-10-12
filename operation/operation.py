@@ -40,6 +40,7 @@ class Message(Enum):
     NEED_MORE_INPUT_DATA = 2
 
 
+# TODO(chanwcom) Rename to AbstractOp.
 class AbstractOperation(abc.ABC):
     """An abstract class for performing some "operations".
 
@@ -133,3 +134,6 @@ class AbstractOperation(abc.ABC):
         """
 
         raise NotImplementedError
+
+
+AbstractOp = AbstractOperation

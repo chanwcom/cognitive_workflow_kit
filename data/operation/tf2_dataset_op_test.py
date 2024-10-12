@@ -8,7 +8,7 @@ __author__ = "Chanwoo Kim(chanw.com@samsung.com)"
 
 # Standard imports
 import os
-import unittest
+from unittest import mock
 
 # Third-party imports
 import tensorflow as tf
@@ -27,11 +27,13 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 class NTPDatasetOpTest(tf.test.TestCase):
     """A class for unit-testing the NTPDatasetOp class."""
+
     def setUp(self):
-        self._dataset = tf.data.Dataset.from_tensor_slices([[1, 2, 3], [4, 5, 6]])
+        self._dataset = tf.data.Dataset.from_tensor_slices([[1, 2, 3],
+                                                            [4, 5, 6]])
 
     def test_process(self):
-        params =dataset_op_params.NTPDatasetOpParams()
+        params = dataset_op_params.NTPDatasetOpParams()
         op = tf2_dataset_op.NTPDatasetOp(params)
         actual = []
 
@@ -45,7 +47,44 @@ class NTPDatasetOpTest(tf.test.TestCase):
         self.assertAllEqual(expected, actual)
 
 
-#class BasicDatasetOperationTest(unittest.TestCase):
+class BatchDatasetOpTest(tf.test.TestCase):
+    """A class for unit-testing the NTPDatasetOp class."""
+
+    def setUp(self):
+        self._dataset = tf.data.Dataset.from_tensor_slices([1, 2, 3, 4, 5])
+
+    def test_process(self):
+        params = dataset_op_params.BatchDatasetOpParams(batch_size=3)
+        op = tf2_dataset_op.BatchDatasetOp(params)
+        actual = []
+
+        dataset = op.process(self._dataset)
+        for data in dataset:
+            actual.append(data)
+
+        expected = [tf.constant([1, 2, 3]), tf.constant([4, 5])]
+
+        self.assertEqual(len(expected), len(actual))
+        self.assertAllEqual(expected[0], actual[0])
+        self.assertAllEqual(expected[1], actual[1])
+
+    def test_process_with_dropping_remainder(self):
+        params = dataset_op_params.BatchDatasetOpParams(batch_size=3,
+                                                        drop_remainder=True)
+        op = tf2_dataset_op.BatchDatasetOp(params)
+        actual = []
+
+        dataset = op.process(self._dataset)
+        for data in dataset:
+            actual.append(data)
+
+        expected = [tf.constant([1, 2, 3])]
+
+        self.assertEqual(len(expected), len(actual))
+        self.assertAllEqual(expected[0], actual[0])
+
+
+#class BasicDatasetOpTest(tf.test.TestCase):
 #    """A class for unit-testing the BasicDatasetOperation class."""
 #    def setUp(self):
 #        # Prepares the input and patches the batch and the cache methods.
@@ -94,7 +133,6 @@ class NTPDatasetOpTest(tf.test.TestCase):
 #
 #        self._input_dataset.batch.assert_called_once_with(200)
 #        self._input_dataset.cache.assert_not_called()
-
 
 #class DatasetFilterOperationTest(tf.test.TestCase):
 #    """A class for unit-testing the DatasetFilterOperation class."""
@@ -440,7 +478,6 @@ class NTPDatasetOpTest(tf.test.TestCase):
 #            self.assertAllEqual(expected[1]["SEQ_DATA"], actual[1]["SEQ_DATA"])
 #            self.assertAllEqual(expected[1]["SEQ_LEN"],  actual[1]["SEQ_LEN"])
 #            # yapf: enable
-
 
 if __name__ == "__main__":
     tf.test.main()

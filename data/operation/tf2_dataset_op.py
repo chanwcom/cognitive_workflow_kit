@@ -26,11 +26,12 @@ import tensorflow as tf
 from operation import operation
 from data.operation import dataset_op_params
 
+
 class Tf2DatasetOp(operation.AbstractOp):
     """An abstract class for TF2_DATASET type."""
-    @abc.abstractmethod
+
     def __init__(self, params: dataset_op_params.DatasetOpCreationParams):
-        super(Tf2DatasetOp, self).__init__(params_proto)
+        super(Tf2DatasetOp, self).__init__(params)
 
     @abc.abstractmethod
     def process(self, dataset: tf.data.Dataset) -> tf.data.Dataset:
@@ -52,12 +53,38 @@ class NTPDatasetOp(Tf2DatasetOp):
     Next Token Prediction (NTP) is widely used for a generative Language Model
     (LM) training.
     """
-    def __init__(self,
-                 params: dataset_op_params.NTPDatasetOpParams) -> None:
+
+    def __init__(self, params: dataset_op_params.NTPDatasetOpParams) -> None:
         super(Tf2DatasetOp, self).__init__(params)
 
     def process(self, dataset: tf.data.Dataset) -> tf.data.Dataset:
-        return dataset.map(lambda line: (line[:-1], line[1: ]))
+        return dataset.map(lambda line: (line[:-1], line[1:]))
+
+
+class BatchDatasetOp(Tf2DatasetOp):
+    """A class for combining consecutive examples into a batch."""
+
+    def __init__(self, params: dataset_op_params.BatchDatasetOpParams) -> None:
+        super(Tf2DatasetOp, self).__init__(params)
+
+    def process(self, dataset: tf.data.Dataset) -> tf.data.Dataset:
+        return dataset.batch(batch_size=self.params.batch_size,
+                             drop_remainder=self.params.drop_remainder,
+                             num_parallel_calls=tf.data.AUTOTUNE)
+
+
+class PaddedBatchDatasetOp(Tf2DatasetOp):
+    """A class for combining consecutive sequence examples into a padded batch.
+
+    Zero-padding will be applied to make the sequence lengths all the same."""
+
+    def __init__(self,
+                 params: dataset_op_params.PaddedBatchDatasetOpParams) -> None:
+        super(Tf2DatasetOp, self).__init__(params)
+
+    def process(self, dataset: tf.data.Dataset) -> tf.data.Dataset:
+        return dataset.padded_batch(batch_size=params.batch_size,
+                                    drop_remainder=params.drop_reminader)
 
 
 #class BasicDatasetOperation(Tf2DatasetOp):
