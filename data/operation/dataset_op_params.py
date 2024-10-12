@@ -1,0 +1,22 @@
+#
+#
+__author__ = "Chanwoo Kim(chanwcom@gmail.com)"
+# Standard imports
+from dataclasses import dataclass
+from enum import Enum
+
+# Custom imports
+from operation import operation_params
+
+@dataclass
+class DatasetOpCreationParams(operation_params.AbstractOpCreationParams):
+    class_name: str
+    class_params: operation_params.AbstractOpParams
+
+@dataclass
+class DatasetOpParams(operation_params.AbstractOpParams):
+    pass
+
+@dataclass
+class NTPDatasetOpParams(DatasetOpParams):
+    pass

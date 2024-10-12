@@ -26,3 +26,25 @@ py_test(
     ],
     legacy_create_init = False,
 )
+
+py_library(
+    name = "tf2_dataset_op",
+    srcs = [
+        "tf2_dataset_op.py",
+        "dataset_op_params.py"
+    ],
+    deps = [
+        "//operation:operation",
+    ],
+)
+
+py_test(
+    name = "tf2_dataset_op_test",
+    srcs = [
+        "tf2_dataset_op_test.py",
+    ],
+    deps = [
+        ":tf2_dataset_op",
+    ],
+    legacy_create_init = False,
+)
