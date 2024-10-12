@@ -15,7 +15,12 @@ __author__ = "Chanwoo Kim(chanwcom@gmail.com)"
 
 # Standard imports
 import abc
+from dataclasses import dataclass
 
 @dataclass
-class AbstractOperationParams(abc.ABC)
-    """A base class for all initialization parameter classes."""
+class AbstractOpCreationParams(abc.ABC):
+    """An abstract base class for creating all operation classes."""
+
+@dataclass
+class AbstractOpParams(abc.ABC):
+    """An abstract base class for all operation parameter classes."""
