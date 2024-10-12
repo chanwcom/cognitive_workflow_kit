@@ -29,7 +29,7 @@ from data.operation import dataset_op_params
 
 class Tf2DatasetOp(operation.AbstractOp):
     """An abstract class for TF2_DATASET type."""
-
+    @abc.abstractmethod
     def __init__(self, params: dataset_op_params.DatasetOpCreationParams):
         super(Tf2DatasetOp, self).__init__(params)
 
@@ -56,6 +56,7 @@ class NTPDatasetOp(Tf2DatasetOp):
 
     def __init__(self, params: dataset_op_params.NTPDatasetOpParams) -> None:
         super(Tf2DatasetOp, self).__init__(params)
+        assert isinstance(params, dataset_op_params.NTPDatasetOpParams)
 
     def process(self, dataset: tf.data.Dataset) -> tf.data.Dataset:
         return dataset.map(lambda line: (line[:-1], line[1:]))
@@ -66,6 +67,7 @@ class BatchDatasetOp(Tf2DatasetOp):
 
     def __init__(self, params: dataset_op_params.BatchDatasetOpParams) -> None:
         super(Tf2DatasetOp, self).__init__(params)
+        assert isinstance(params, dataset_op_params.BatchDatasetOpParams)
 
     def process(self, dataset: tf.data.Dataset) -> tf.data.Dataset:
         return dataset.batch(batch_size=self.params.batch_size,
@@ -81,6 +83,7 @@ class PaddedBatchDatasetOp(Tf2DatasetOp):
     def __init__(self,
                  params: dataset_op_params.PaddedBatchDatasetOpParams) -> None:
         super(Tf2DatasetOp, self).__init__(params)
+        assert isinstance(params, dataset_op_params.PaddedBatchDatasetOpParams)
 
     def process(self, dataset: tf.data.Dataset) -> tf.data.Dataset:
         return dataset.padded_batch(batch_size=self.params.batch_size,
