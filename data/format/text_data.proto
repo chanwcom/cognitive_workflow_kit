@@ -5,32 +5,15 @@ syntax = "proto3";
 
 package learning;
 
-// A protocol buffer message for storing the format of the waveform.
-message WaveHeader {
-    // The number of audio channels.
-    optional int32 number_of_channels = 1;
-
-    // The sampling rate of the wave data.
-    optional double sampling_rate_hz = 2;
-
-    enum AtomicType {
-        INT4 = 0;
-        INT8 = 1;
-        INT16 = 2;
-        INT32 = 3;
-        FLOAT16 = 4;
-        FLOAT32 = 5;
-        FLOAT64 = 6;
-    }
-
-    // The atomic type of the wave data.
-    optional AtomicType atomic_type = 3;
-}
-
 // A protocol buffer message for storing speech.
-message SpeechData {
+//
+// Consider combining SpeechData in speech_data.proto and TextData in text_data.proto.
+message TextData {
     // A unique ID for this speech data.
-    optional string utterance_id = 1;
+    //
+    // Rename utterance_id in SpeechData that is defined in "speech_data.proto"
+    // to "example_id" to have the same structure
+    optional string example_id = 1;
 
     // The format of the speech data.
     optional WaveHeader wave_header = 2;

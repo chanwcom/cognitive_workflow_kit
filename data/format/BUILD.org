@@ -12,15 +12,15 @@ py_proto_library(
     ],
 )
 
-py_proto_library(
-    name = "example_pb2",
-    srcs = [
-        "example.proto"
-    ],
-    deps = [
-         "@com_google_protobuf//:protobuf_python",
-    ],
-)
+#py_proto_library(
+#    name = "example_pb2",
+#    srcs = [
+#        "example.proto"
+#    ],
+#    deps = [
+#         "@com_google_protobuf//:protobuf_python",
+#    ],
+#)
 
 py_library(
     name = "speech_data_helper",
