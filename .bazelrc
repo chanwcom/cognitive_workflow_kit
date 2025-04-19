@@ -1,0 +1,13 @@
+# The following options may be used when building the toolkit under a virtual environment.
+# Refer to the following page about the command line options for more information.
+#
+# https://bazel.build/reference/command-line-reference
+#
+# We tested that the following setting works under the Conda environment.
+
+# build --python_path=/home/chanwcom/.conda/envs/py3_11_xai604/bin/python
+# run --python_path=/home/chanwcom/.conda/envs/py3_11_xai604/bin/python
+
+# You may find out the location of PYTHONPATH by running the following command:
+# export PYTHONPATH=$(python -c "import site; print(site.getsitepackages()[0])")
+# test --test_env=PYTHONPATH=/home/chanwcom/.conda/envs/py3_11_xai604/lib/python3.11/site-packages
