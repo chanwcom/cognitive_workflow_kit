@@ -6,12 +6,15 @@ from __future__ import (absolute_import, division, print_function,
                         unicode_literals)
 
 __author__ = "Chanwoo Kim(chanwcom@gmail.com)"
+# Standard imports
+import enum
 
 # Third-party imports
 import numpy as np
 import torch
 
-#LOG_0 = torch.tensor(np.log(np.finfo(np.float64).tiny).astype(np.float32))
+# TODO(chanwcom) Replace with this one. But unit tests need to be updated.
+#LOG_00 = torch.tensor(np.log(np.finfo(np.float64).tiny).astype(np.float32))
 
 LOG_0 = torch.tensor(np.log(1e-307)).type(torch.float32)
 
@@ -103,6 +106,25 @@ def to_blank_augmented_labels(
     return output
 
 
+def to_onset_augmented_labels(inputs: dict, num_classes: int) -> dict:
+    assert isinstance(inputs, dict)
+    assert {"SEQ_DATA", "SEQ_LEN"} <= inputs.keys()
+
+    output = {}
+    output["SEQ_LEN"] = 2 * inputs["SEQ_LEN"]
+
+    in_data = 2 * inputs["SEQ_DATA"].clone().detach()
+
+    data = torch.stack((in_data, in_data + 1), axis=2)
+    data = torch.reshape(data, (inputs["SEQ_DATA"].shape[0], -1))
+    mask = sequence_mask(output["SEQ_LEN"],
+                         maxlen=data.shape[1],
+                         dtype=data.dtype)
+    output["SEQ_DATA"] = data * mask
+
+    return output
+
+
 # Third-party imports
 # * https://github.com/amaas/stanford-ctc/blob/master/ctc/ctc.py
 # * https://github.com/HawkAaron/warp-transducer/blob/master/tensorflow_binding/src/warprnnt_op.cc
@@ -156,8 +178,29 @@ def _calculate_unnormalized_log_seq_prob(log_alpha, accum_log_seq_prob_sum,
     return final_log_alpha + final_accum
 
 
-def label_trans_table(labels, labels_len):
-    """Constructs a table containing the label transition flags.
+class LabelType(enum.Enum):
+    CTC = 0
+    SHC_TYPE_0 = 1
+    SHC_TYPE_1 = 2
+
+
+class ThresholdType(enum.Enum):
+    NO_THRESHOLD = 0
+    ENTROPY = 1
+    MAX_PROB = 2
+    ELS = 3
+
+
+class ProcessingType(enum.Enum):
+    # Processing type is meaningful only when ENTROPY or MAX_PROB is selected
+    # as the threshold type.
+    UNCHANGED = 0
+    UNIFORM = 1
+    ZERO = 2
+
+
+def label_trans_allowance_table_ctc(labels, labels_len):
+    """Constructs a table containing the label transition allowance flags.
 
     We assume that label_seq should contain "blank labels" described in the
     original CTC paper.
@@ -216,11 +259,136 @@ def label_trans_table(labels, labels_len):
     return trans_table
 
 
+def label_trans_table_shc_type0(labels, labels_len):
+    """Constructs a table containing the label transition allowance flags.
+
+    We assume that label_seq should contain "blank labels" described in the
+    original CTC paper.
+    The shape of the returned tensor is (batch_size, max_seq_len, max_seq_len).
+    The transition rule is as follows:
+
+    Depending on whether the transition from the i-th label to the j-th label
+    in the label sequence is allowed,
+      a[b, i, j] = 0,         if this transition is allowed.
+      a[b, i, j] = LOG_0:     if this transition is not allowed.
+
+    Args:
+        label_seq: A dictionary containing a batch of label sequences.
+            * "DATA": A tensor containing label sequences.
+                The shape is (batch_size, max_seq_length). Note that the data
+                should follow the blank label rule, which states that "blank"
+                labels should be interleaved with real labels. In addition to
+                this, blank symbols are prepended and appended to the sequence.
+            * "SEQ_LEN": A tensor containing the length of each label sequence.
+                The shape is (batch_size).
+    Returns:
+        A tensor containing flags whether transitions are allowed.
+            The shape is (batch_size, max_label_seq_len, max_seq_len)
+    """
+
+    max_seq_len = torch.max(labels_len)
+    l0 = torch.arange(1, max_seq_len, 2, dtype=torch.int32)
+    l1 = torch.arange(max_seq_len, dtype=torch.int32)
+
+    # Indices corresponding to i -> i.
+    indices0 = torch.stack([l0, l0], axis=1)
+
+    # Indices corresponding to i -> i + 1.
+    indices1 = torch.stack([l1[:-1], l1[:-1] + 1], axis=1)
+
+    # Constructs the transition table.
+    indices = torch.concat([indices0, indices1], axis=0)
+    values = torch.zeros([indices.shape[0]])
+
+    trans_table = torch.full(size=(max_seq_len, max_seq_len), fill_value=LOG_0)
+    trans_table[torch.unbind(indices, axis=1)] = 0
+
+    batch_size = labels.shape[0]
+    trans_table = torch.tile(torch.unsqueeze(trans_table, axis=0),
+                             [batch_size, 1, 1])
+
+    return trans_table
+
+
+def label_trans_table_shc_type1(labels, labels_len):
+    """Constructs a table containing the label transition allowance flags.
+
+    We assume that label_seq should contain "blank labels" described in the
+    original CTC paper.
+    The shape of the returned tensor is (batch_size, max_seq_len, max_seq_len).
+    The transition rule is as follows:
+
+    Depending on whether the transition from the i-th label to the j-th label
+    in the label sequence is allowed,
+      a[b, i, j] = 0,         if this transition is allowed.
+      a[b, i, j] = LOG_0:     if this transition is not allowed.
+
+    Args:
+        label_seq: A dictionary containing a batch of label sequences.
+            * "DATA": A tensor containing label sequences.
+                The shape is (batch_size, max_seq_length). Note that the data
+                should follow the blank label rule, which states that "blank"
+                labels should be interleaved with real labels. In addition to
+                this, blank symbols are prepended and appended to the sequence.
+            * "SEQ_LEN": A tensor containing the length of each label sequence.
+                The shape is (batch_size).
+    Returns:
+        A tensor containing flags whether transitions are allowed.
+            The shape is (batch_size, max_label_seq_len, max_seq_len)
+    """
+
+    max_seq_len = torch.max(labels_len)
+    l = torch.arange(max_seq_len, dtype=torch.int32)
+
+    # Indices corresponding to i -> i.
+    indices0 = torch.stack([l, l], axis=1)
+
+    # Indices corresponding to i -> i + 1.
+    indices1 = torch.stack([l[:-1], l[:-1] + 1], axis=1)
+
+    # Constructs the transition table.
+    indices = torch.concat([indices0, indices1], axis=0)
+    values = torch.zeros([indices.shape[0]])
+
+    trans_table = torch.full(size=(max_seq_len, max_seq_len), fill_value=LOG_0)
+    trans_table[torch.unbind(indices, axis=1)] = 0
+
+    batch_size = labels.shape[0]
+    trans_table = torch.tile(torch.unsqueeze(trans_table, axis=0),
+                             [batch_size, 1, 1])
+
+    return trans_table
+
+
+# TODO TODO(chanwcom)
+# Refactor as a class
+def label_trans_allowance_table(labels, label_len, label_type: LabelType):
+    if label_type == LabelType.CTC:
+        table = label_trans_allowance_table_ctc(labels, label_len)
+    elif label_type == LabelType.SHC_TYPE_0:
+        table = label_trans_table_shc_type0(labels, label_len)
+    elif label_type == LabelType.SHC_TYPE_1:
+        table = label_trans_table_shc_type1(labels, label_len)
+    else:
+        raise ValueError("Unsupported type.")
+
+    return table
+
+
 class CtcLoss(torch.autograd.Function):
     """A class for calculating the CTC loss."""
 
     @staticmethod
-    def forward(ctx, labels, labels_len, logits, logits_len):
+    def forward(ctx,
+                labels,
+                labels_len,
+                logits,
+                logits_len,
+                label_type: LabelType = LabelType.CTC,
+                update_non_blank_token_index: bool = True,
+                threshold_type: ThresholdType = ThresholdType.NO_THRESHOLD,
+                threshold: float = 0.1,
+                processing_type: ProcessingType = ProcessingType.UNCHANGED):
         """Calculates the Connectionist Temporal Classification (CTC) loss.
 
         Args:
@@ -248,10 +416,35 @@ class CtcLoss(torch.autograd.Function):
         # Checks the consistency of the batch size.
         assert labels.shape[0] == logits.shape[0]
 
+        # Converting the sequences.
+        # Note that the following is only for HuggingFace case.
+        # In case of HuggingFace, the boundary blanks should be added and non
+        # -blank token indices should NOT be updated.
+
+        inputs = {}
+        inputs["SEQ_DATA"] = labels
+        inputs["SEQ_LEN"] = labels_len
+        if label_type == LabelType.CTC:
+            inputs = to_blank_augmented_labels(inputs, 0, True,
+                                               update_non_blank_token_index)
+            # TODO  TODO(chanwcom )The following is the correc one.
+            #inputs = to_blank_augmented_labels(inputs, 0, True, False)
+        elif (label_type == LabelType.SHC_TYPE_0
+              or label_type == LabelType.SHC_TYPE_1):
+            raise NotImplementedError
+            # How to find num_classes?
+            # It is not easy for Hugging face fine tuning.
+            #inputs =  to_onset_augmented_labels(inputs, num_classes)
+        else:
+            raise ValueEror("Unsupported label sequence format type.")
+        labels = inputs["SEQ_DATA"]
+        labels_len = inputs["SEQ_LEN"]
+
         log_label_prob = calculate_log_label_prob(
             labels, torch.softmax(logits, dim=-1))
 
-        trans_table = label_trans_table(labels, labels_len)
+        trans_table = label_trans_allowance_table(labels, labels_len,
+                                                  label_type)
 
         # Alpha and beta should be calculated.
         log_alpha, log_beta, log_seq_prob = calculate_alpha_beta(
@@ -285,16 +478,6 @@ class CtcLoss(torch.autograd.Function):
 
         loss = -torch.multiply(log_seq_prob, invalid_length_mask)
 
-        ctx.save_for_backward(log_gamma, labels, labels_len, logits,
-                              logits_len)
-
-        return loss
-
-    @staticmethod
-    def backward(ctx, grad):
-
-        log_gamma, labels, labels_len, logits, logits_len = ctx.saved_tensors
-
         max_label_len = torch.max(labels_len)
         num_classes = logits.shape[2]
         log_ground_truth_prob = torch.ones_like(logits,
@@ -322,8 +505,24 @@ class CtcLoss(torch.autograd.Function):
             log_ground_truth_prob = torch.logaddexp(log_ground_truth_prob,
                                                     updates)
 
-        gradient = -(torch.exp(log_ground_truth_prob) -
-                     torch.softmax(logits, dim=2))
+        ground_truth_prob = torch.exp(log_ground_truth_prob)
+
+        if threshold_type != ThresholdType.NO_THRESHOLD:
+            if processing_type == ProcessingType.UNIFORM:
+                uniform_flag = True
+            else:
+                uniform_flag = False
+
+            ground_truth_prob, flag = apply_postprocessing(
+                ground_truth_prob, logits_len, threshold_type, threshold,
+                uniform_flag)
+
+        gradient = -(ground_truth_prob - torch.softmax(logits, dim=2))
+
+        if (threshold_type != ThresholdType.NO_THRESHOLD
+                and processing_type == ProcessingType.ZERO):
+
+            gradient = torch.multiply(gradient, flag)
 
         # To ignore an invalid loss case.
         #
@@ -340,9 +539,17 @@ class CtcLoss(torch.autograd.Function):
 
         # The dimension of "gradient" is (batch_size, logit_len, num_classes)
         gradient = torch.multiply(gradient, torch.unsqueeze(seq_mask, axis=2))
+
+        ctx.save_for_backward(gradient)
+
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad):
+        gradient, = ctx.saved_tensors
         gradient = torch.multiply(gradient, torch.reshape(grad, (-1, 1, 1)))
 
-        return None, None, gradient, None
+        return None, None, gradient, None, None, None, None, None, None
 
 
 def calculate_alpha_beta(label_trans_table, log_label_prob, label_len,
@@ -462,3 +669,98 @@ def calculate_alpha_beta(label_trans_table, log_label_prob, label_len,
         log_alpha, accum_log_alpha_max, logit_len, label_len)
 
     return log_alpha, log_beta, log_seq_prob_final
+
+
+def apply_postprocessing(ground_truth_prob: torch.Tensor,
+                         logits_len: torch.Tensor,
+                         threshold_type: ThresholdType,
+                         threshold: float,
+                         uniform: bool = True):
+
+    if threshold_type == ThresholdType.NO_THRESHOLD:
+        return ground_truth_prob
+    elif threshold_type == ThresholdType.ELS:
+        return _apply_smoothing(ground_truth_prob, threshold)
+    elif threshold_type == ThresholdType.ENTROPY:
+        flag = (torch.sum(torch.special.entr(ground_truth_prob), axis=2)
+                <= threshold)
+    elif threshold_type == ThresholdType.MAX_PROB:
+        flag = torch.max(ground_truth_prob, axis=2).values >= threshold
+    else:
+        raise ValueError("Unsupported threshold type.")
+    flag = torch.unsqueeze(flag, 2).type(torch.float32)
+
+    # Makes the one hot representation based on argmax.
+    one_hot = torch.nn.functional.one_hot(
+        torch.argmax(ground_truth_prob, dim=2),
+        ground_truth_prob.shape[2]).type(torch.float32)
+
+    if uniform:
+        others = torch.ones_like(
+            ground_truth_prob) / ground_truth_prob.shape[2]
+    else:
+        others = ground_truth_prob
+
+    mask = torch.unsqueeze(
+        sequence_mask(logits_len,
+                      ground_truth_prob.shape[1],
+                      dtype=ground_truth_prob.dtype), axis=2) # yapf: disable
+
+    return ((one_hot * flag + (1 - flag) * others) * mask, flag)
+
+
+def _apply_smoothing(ground_truth_prob: torch.Tensor, smoothing_coeff: float):
+    """Applies smoothing using the ELS algorithm.
+
+    Args:
+        ground_truth_prob: A tensor containing exp(alaph+beta)
+            The shape is (batch_size, logit_length, num_classes)
+            Note that "ground_truth_prob" does not contain log probabilities
+            but original probabilities that take values between 0 and 1.
+        smoothing_coeff:
+
+    Returns:
+    """
+    if smoothing_coeff == 0.0:
+        return ground_truth_prob
+
+    # Finds cases of an one-hot vector.
+    #
+    # In this case, division by zero error will occur if we do not pre-process
+    # it. So temporarily add these vectors  with 1e-10.
+    ids = torch.where(ground_truth_prob == 1)
+
+    outputs = ground_truth_prob.clone().detach()
+
+    # It has the effect of adding a small value to the entire [i, t, :] so
+    # that division by zero will not happen.
+    outputs[ids[0], ids[1], :] = 1e-10
+
+    # Values higher than 1 - (smoothing_coeff) are replaced with zeros.
+    ids_too_large = torch.where(ground_truth_prob > 1 - smoothing_coeff)
+    wo_largest = outputs.clone().detach()
+    wo_largest[ids_too_large] = 0.0
+
+    # Obtains the sum without the largest values.
+    sum_wo_largest = torch.sum(wo_largest, axis=2)
+
+    # Finds the maximum value along the label axis. Subtracts this value by
+    # (1 - smoothing coeff) and floors by zero.
+    #
+    # This will be the amount that will be subtracted from the maximum value
+    # and subsequently added to other values belonging to the same time step.
+
+    smoothing_values = (torch.maximum(
+        torch.max(ground_truth_prob, axis=2).values - (1 - smoothing_coeff),
+        torch.Tensor([0.0]).to(ground_truth_prob.device)))
+
+    scaling_coeff = torch.div(
+        smoothing_values + sum_wo_largest,
+        torch.maximum(sum_wo_largest, torch.Tensor([1e-10]).to(ground_truth_prob.device)))
+
+    outputs = torch.unsqueeze(scaling_coeff, dim=-1) * outputs
+
+    # Replaces too large values with 1.0-smoothing_coeff.
+    outputs[ids_too_large] = 1.0 - smoothing_coeff
+
+    return outputs

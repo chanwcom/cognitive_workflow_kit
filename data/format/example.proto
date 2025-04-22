@@ -1,0 +1,85 @@
+// This proto file containes proto messages for waveforms.
+//
+// Author: Chanwoo Kim (chanwcom@gmail.com)
+syntax = "proto3";
+
+package learning;
+
+// A protocol buffer message for storing the format of the waveform.
+message WaveHeader {
+    // The number of audio channels.
+    optional int32 number_of_channels = 1;
+
+    // The sampling rate of the wave data.
+    optional double sampling_rate_hz = 2;
+
+    enum AtomicType {
+        INT4 = 0;
+        INT8 = 1;
+        INT16 = 2;
+        INT32 = 3;
+        FLOAT16 = 4;
+        FLOAT32 = 5;
+        FLOAT64 = 6;
+    }
+
+    // The atomic type of the wave data.
+    optional AtomicType atomic_type = 3;
+}
+
+
+
+
+// A protocol buffer message for storing speech.
+message AudioData {
+    // The format of the speech data.
+    optional WaveHeader wave_header = 1;
+
+    // Buffer for storing the raw wave data.
+    //
+    // For multi-channel wave data, samples are stored in an interleaved way.
+    // Each element MUST be stored according to the little endian convention.
+    optional bytes samples = 2;
+}
+
+// A protocol buffer message for storing speech.
+message TextData {
+    // The format of the speech data.
+    optional string lang = 1;
+
+    // A text transcript .
+    optional string transcript = 2;
+
+}
+
+
+message Example {
+// A protocol buffer message for storing an example.
+    optional string example_id = 1;
+    // A unique ID for this example
+
+    repeated AudioData audio_data = 2;
+
+    repeated TextData text_data = 3;
+    // Defined as a repeated field, since there may be more than one setence.
+    //
+    // As an example, in machine translation, we have the input and the output text.
+
+    message MapField {
+        string key = 1;
+        string value = 2;
+    }
+
+    repeated MapField attributes = 5;
+    // An optional field storing additional meta data.
+    //
+    // For example, we may store "INTENT" and "SLOT_VALUES" use for Natural
+    // Language Understanding (NLU).
+    //
+    // TODO(chanwcom) Add an example of specifying INTENT and SLOT_VALUE.
+    // Map is not supported with tf.io.decode_proto. So, we use repeated field
+    // instead.
+    //
+    // https://www.tensorflow.org/api_docs/python/tf/io/decode_proto
+    // https://protobuf.dev/programming-guides/proto3/#backwards
+}

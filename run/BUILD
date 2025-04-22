@@ -17,6 +17,20 @@ py_binary(
 )
 
 py_binary(
+    name = "processor_test",
+    srcs = [
+        "processor_test.py",
+    ],
+    imports = [
+      "..",
+    ],
+    deps = [
+        "//data/format:speech_data_helper",
+        "//loss/pytorch:seq_loss_util",
+    ],
+)
+
+py_binary(
     name = "wav2vec_inference",
     srcs = [
         "wav2vec_inference.py",

@@ -27,7 +27,7 @@ from loss.pytorch import seq_loss_util
 
 # Prevents Tensorflow from using the entire GPU memory.
 #
-# Since we use Tensorflow and Pytorch simultaneously, Tensorflow shouldl not
+# Since we use Tensorflow and Pytorch simultaneously, Tensorflow should not
 # occupy the entire memory. Instead of allocating the entire GPU memory, GPU
 # memory allocated to Tensorflow grows based on its need. Refer to the
 # following website for more information:
@@ -45,15 +45,15 @@ if gpus:
         # Memory growth must be set before GPUs have been initialized.
         print(e)
 
-db_top_dir = "/home/chanwcom/databases/"
-train_top_dir = os.path.join(db_top_dir, "stop/music_train_tfrecord")
-test_top_dir = os.path.join(db_top_dir,
-                            "stop/test_0_music_random_300_tfrecord")
+db_top_dir = "/mnt/data/database/libri_speech/tfrecord"
+train_top_dir = db_top_dir
+test_top_dir = db_top_dir
 
 # yapf: disable
 op = speech_data_helper.SpeechDataToWave()
 train_dataset = tf.data.TFRecordDataset(
-    glob.glob(os.path.join(train_top_dir, "*tfrecord-*")),
+    #glob.glob(os.path.join(train_top_dir, "libri_light_10min.tfrecord-*")),
+    glob.glob(os.path.join(train_top_dir, "libri_light_1h.tfrecord-*")),
               compression_type="GZIP")
 train_dataset = train_dataset.batch(1)
 train_dataset = train_dataset.prefetch(tf.data.experimental.AUTOTUNE)
@@ -63,7 +63,7 @@ train_dataset = train_dataset.map(
 
 # yapf: disable
 test_dataset = tf.data.TFRecordDataset(
-    glob.glob(os.path.join(test_top_dir, "*tfrecord-*")),
+    glob.glob(os.path.join(test_top_dir, "test-clean.tfrecord-*")),
               compression_type="GZIP")
 test_dataset = test_dataset.batch(1)
 test_dataset = test_dataset.prefetch(tf.data.experimental.AUTOTUNE)
@@ -154,18 +154,23 @@ model = AutoModelForCTC.from_pretrained(
 
 training_args = TrainingArguments(
     output_dir=
-    "/home/chanwcom/local_repositories/cognitive_workflow_kit/tool/models/asr_stop_model_final3",
-    per_device_train_batch_size=40,
-    gradient_accumulation_steps=2,
-    learning_rate=1e-4,
+    "/mnt/data/home/chanwcom/experiment/asr_libri_light_1hr_model_01",
+    # In case of STOP
+    #per_device_train_batch_size=40,
+    #warmup_steps=1000,
+    #max_steps=10000,
+    #learning_rate=1e-4,
+    per_device_train_batch_size=24,
     warmup_steps=1000,
-    max_steps=10000,
+    max_steps=2000, # Roughly 63 % WER Maybe masking, layer dropout etc # Wav2Vec Config page
+    gradient_accumulation_steps=2,
+    learning_rate=5e-5,
     gradient_checkpointing=True,
     fp16=True,
     eval_strategy="steps",
-    per_device_eval_batch_size=40,
-    save_steps=5000,
-    eval_steps=100,
+    per_device_eval_batch_size=24,
+    save_steps=2000,
+    eval_steps=200,
     logging_steps=25,
     load_best_model_at_end=True,
     metric_for_best_model="wer",
@@ -174,8 +179,7 @@ training_args = TrainingArguments(
 )
 
 
-class MyTrainer(Trainer):
-
+class MyCtcTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False):
         target = inputs.pop("labels")
         outputs = model(**inputs)
@@ -204,19 +208,26 @@ class MyCtcTrainer(Trainer):
         with torch.device(inputs["input_values"].device.type):
             target = inputs.pop("labels")
             outputs = model(**inputs)
-
             logits = outputs["logits"]
             logits_lengths = torch.full(size=(logits.shape[0], ),
                                         fill_value=logits.shape[1]).to(
                                             logits.device)
 
-            target = inputs["SEQ_DATA"]
-            target_lengths = inputs["SEQ_LEN"]
+            target_lengths =  torch.sum(
+                 (target >= 0).type(torch.int32), axis=1)
 
             ctc_loss = seq_loss_util.CtcLoss()
+
+            # Default CTC
             loss = ctc_loss.apply(target, target_lengths,
-                                  logits.log_softmax(2), logits_lengths,
-                                  seq_loss_util.TableType.CTC, False).mean()
+                                  logits.log_softmax(2),
+                                  logits_lengths,
+                                  seq_loss_util.LabelType.CTC,
+                                  False,  # Update non-blank sequence
+                                  seq_loss_util.ThresholdType.NO_THRESHOLD,
+                                  0.1, # threshold,
+                                  seq_loss_util.ProcessingType.UNCHANGED,
+                                  ).mean()
 
         if return_outputs:
             return loss, outputs
