@@ -1,24 +1,33 @@
 package(default_visibility = ["//visibility:public"])
 
-load("@com_google_protobuf//:protobuf.bzl", "py_proto_library")
+load("@protobuf//bazel:proto_library.bzl", "proto_library")
+load("@rules_python//python:proto.bzl", "py_proto_library")
 
 py_proto_library(
     name = "speech_data_pb2",
+    deps = [
+        ":speech_data",
+    ],
+)
+
+proto_library(
+    name = "speech_data",
     srcs = [
         "speech_data.proto"
-    ],
-    deps = [
-         "@com_google_protobuf//:protobuf_python",
     ],
 )
 
 py_proto_library(
     name = "example_pb2",
+    deps = [
+         ":example",
+    ],
+)
+
+proto_library(
+    name = "example",
     srcs = [
         "example.proto"
-    ],
-    deps = [
-         "@com_google_protobuf//:protobuf_python",
     ],
 )
 
