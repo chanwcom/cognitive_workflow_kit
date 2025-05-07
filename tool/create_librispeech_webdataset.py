@@ -1,3 +1,37 @@
+#!/usr/bin/python3
+"""Convert LibriSpeech dataset into WebDataset format.
+
+This script scans a LibriSpeech split (e.g., train-clean-100) and creates
+.tar shard files containing FLAC audio and transcripts using the WebDataset format.
+
+Example usage:
+    # Convert train-clean-100 with default shard size
+    python create_librispeech_webdataset.py \
+        --dataset_dir ./LibriSpeech/train-clean-100 \
+        --output_dir ./wds/train-clean-100 \
+        --shard_size 1000
+
+    # Convert dev-clean with smaller shard size
+    python create_librispeech_webdataset.py \
+        --dataset_dir ./LibriSpeech/dev-clean \
+        --output_dir ./wds/dev-clean \
+        --shard_size 500
+
+    # Batch process splits
+    for split in train-clean-100 train-clean-360 train-other-500; do
+        python create_librispeech_webdataset.py \
+            --dataset_dir ./LibriSpeech/$split \
+            --output_dir ./wds/$split \
+            --shard_size 2000
+    done
+
+    # Debug mode with very small shard
+    python create_librispeech_webdataset.py \
+        --dataset_dir ./LibriSpeech/dev-clean \
+        --output_dir ./wds/dev-clean-debug \
+        --shard_size 10
+"""
+
 import os
 import argparse
 import tarfile
@@ -117,4 +151,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
