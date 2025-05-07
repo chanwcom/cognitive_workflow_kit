@@ -5,31 +5,31 @@ This script scans a LibriSpeech split (e.g., train-clean-100) and creates
 .tar shard files containing FLAC audio and transcripts using the WebDataset format.
 
 Example usage:
-    # Convert train-clean-100 with default shard size
+    # Convert train-clean-100 with default shard size (in GB)
     python create_librispeech_webdataset.py \
         --dataset_dir ./LibriSpeech/train-clean-100 \
         --output_dir ./wds/train-clean-100 \
-        --shard_size 1000
+        --shard_size_gb 1.0
 
     # Convert dev-clean with smaller shard size
     python create_librispeech_webdataset.py \
         --dataset_dir ./LibriSpeech/dev-clean \
         --output_dir ./wds/dev-clean \
-        --shard_size 500
+        --shard_size_gb 0.5
 
     # Batch process splits
     for split in train-clean-100 train-clean-360 train-other-500; do
         python create_librispeech_webdataset.py \
             --dataset_dir ./LibriSpeech/$split \
             --output_dir ./wds/$split \
-            --shard_size 2000
+            --shard_size_gb 1.5
     done
 
     # Debug mode with very small shard
     python create_librispeech_webdataset.py \
         --dataset_dir ./LibriSpeech/dev-clean \
         --output_dir ./wds/dev-clean-debug \
-        --shard_size 10
+        --shard_size_gb 0.1
 """
 
 import os
@@ -40,6 +40,8 @@ from pathlib import Path
 from tqdm import tqdm
 import soundfile as sf
 import webdataset as wds
+
+BYTES_PER_GB = 1 << 30
 
 def find_audio_transcript_pairs(root_dir):
     """Finds all (FLAC, transcript) pairs in a LibriSpeech-style directory.
@@ -54,10 +56,8 @@ def find_audio_transcript_pairs(root_dir):
     data_pairs = []
 
     for flac_path in flac_paths:
-        # LibriSpeech transcript files are per-chapter, not per-utterance.
         transcript_path = flac_path.with_suffix(".txt")
         if not transcript_path.exists():
-            # Construct transcript file path from speaker and chapter IDs.
             transcript_dir = flac_path.parent
             speaker_id = flac_path.parts[-3]
             chapter_id = flac_path.parts[-2]
@@ -65,57 +65,55 @@ def find_audio_transcript_pairs(root_dir):
             if not transcript_file.exists():
                 continue
 
-            # Load all utterance transcripts from the file into a dictionary.
             with open(transcript_file, "r", encoding="utf-8") as f:
                 lines = f.readlines()
             trans_dict = {
                 line.split(" ", 1)[0]: line.split(" ", 1)[1].strip() for line in lines
             }
 
-            uid = flac_path.stem  # e.g., "84-121123-0001"
+            uid = flac_path.stem
             if uid in trans_dict:
                 data_pairs.append((flac_path, trans_dict[uid]))
 
     return data_pairs
 
-def write_shards(data_pairs, output_dir, shard_size):
+def write_shards(data_pairs: list, output_dir: str, shard_size_gb: float):
     """Writes (FLAC, transcript) pairs into WebDataset shards.
 
     Args:
         data_pairs (list): List of (flac_path, transcript) tuples.
         output_dir (str): Path to directory where shards are written.
-        shard_size (int): Maximum number of samples per shard.
+        shard_size_gb (float): Maximum shard size in gigabytes.
     """
     os.makedirs(output_dir, exist_ok=True)
     shard_id = 0
+    current_size = 0
     sink = None
 
-    for idx, (flac_path, transcript) in enumerate(
-            tqdm(data_pairs, desc="Writing shards")):
-        # Start a new shard if current one reached max size.
-        if idx % shard_size == 0:
-            if sink is not None:
-                sink.close()
-            shard_path = os.path.join(output_dir, f"shard-{shard_id:06d}.tar")
-            sink = wds.ShardWriter(shard_path, maxcount=shard_size)
-            shard_id += 1
-
-        # Read audio as raw bytes to store in WebDataset.
+    for idx, (flac_path, transcript) in enumerate(tqdm(data_pairs, desc="Writing shards")):
         with open(flac_path, "rb") as f:
             audio_bytes = f.read()
 
-        # Create a unique key for this sample.
         sample_key = str(uuid.uuid4())
-
         sample = {
-            "__key__": sample_key,   # Required key for WebDataset
-            "flac": audio_bytes,     # Audio data in FLAC format
-            "txt": transcript,       # Raw transcript as string
+            "__key__": sample_key,
+            "flac": audio_bytes,
+            "txt": transcript,
         }
 
-        sink.write(sample)
+        est_sample_size = len(audio_bytes) + len(transcript.encode("utf-8"))
 
-    # Close the last shard writer.
+        if sink is None or current_size + est_sample_size > shard_size_gb * BYTES_PER_GB:
+            if sink is not None:
+                sink.close()
+            shard_path = os.path.join(output_dir, f"shard-{shard_id:06d}.tar")
+            sink = wds.ShardWriter(shard_path)
+            shard_id += 1
+            current_size = 0
+
+        sink.write(sample)
+        current_size += est_sample_size
+
     if sink is not None:
         sink.close()
 
@@ -135,19 +133,18 @@ def main():
         help="Output directory for WebDataset shards"
     )
     parser.add_argument(
-        "--shard_size",
-        type=int,
-        default=1000,
-        help="Number of samples per shard (default: 1000)"
+        "--shard_size_gb",
+        type=float,
+        default=1.0,
+        help="Maximum shard size in gigabytes (default: 1.0)"
     )
     args = parser.parse_args()
 
-    # Scan directory for audio-transcript pairs.
     data_pairs = find_audio_transcript_pairs(args.dataset_dir)
     print(f"Found {len(data_pairs)} audio-transcript pairs.")
 
-    # Write to WebDataset shards.
-    write_shards(data_pairs, args.output_dir, args.shard_size)
+    write_shards(data_pairs, args.output_dir, args.shard_size_gb)
 
 if __name__ == "__main__":
     main()
+
