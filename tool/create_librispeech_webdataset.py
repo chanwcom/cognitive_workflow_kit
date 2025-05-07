@@ -107,9 +107,9 @@ def write_shards(data_pairs: list, output_dir: str, shard_size_gb: float):
         if sink is None or current_size + est_sample_size > shard_size_gb * BYTES_PER_GB:
             if sink is not None:
                 sink.close()
-            shard_path = os.path.join(output_dir, f"shard-{shard_id:06d}.tar")
+            shard_path = os.path.join(output_dir, "shard-%06d.tar")
 
-
+            # TODO(chanwcom) Removes the hard-coded parts.
             sink = wds.ShardWriter(shard_path, maxcount=1000)
             shard_id += 1
             current_size = 0
