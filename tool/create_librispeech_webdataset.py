@@ -90,6 +90,7 @@ def write_shards(data_pairs: list, output_dir: str, shard_size_gb: float):
     current_size = 0
     sink = None
 
+
     for idx, (flac_path, transcript) in enumerate(tqdm(data_pairs, desc="Writing shards")):
         with open(flac_path, "rb") as f:
             audio_bytes = f.read()
@@ -107,7 +108,9 @@ def write_shards(data_pairs: list, output_dir: str, shard_size_gb: float):
             if sink is not None:
                 sink.close()
             shard_path = os.path.join(output_dir, f"shard-{shard_id:06d}.tar")
-            sink = wds.ShardWriter(shard_path)
+
+
+            sink = wds.ShardWriter(shard_path, maxcount=1000)
             shard_id += 1
             current_size = 0
 
