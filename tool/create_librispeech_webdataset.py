@@ -99,19 +99,19 @@ def write_shards(data_pairs, output_dir, shard_size_gb):
         output_dir (str): Path to directory where shards are written.
         shard_size_gb (float): Maximum shard size in gigabytes.
     """
-    # Ensure the output directory exists, create if it doesn't.
+    # Ensures the output directory exists, create if it doesn't.
     os.makedirs(output_dir, exist_ok=True)
 
-    # Initialize variables for shard ID and current shard size tracking.
+    # Initializes variables for shard ID and current shard size tracking.
     shard_id = 0
     current_size = 0
     sink = None
 
-    # Define the shard path format and initialize the ShardWriter.
+    # Defines the shard path format and initialize the ShardWriter.
     shard_path = os.path.join(output_dir, f"shard-%06d.tar")
     sink = wds.ShardWriter(shard_path, maxsize=shard_size_gb * (1 << 30))
 
-    # Iteratse through all data pairs (FLAC file path and transcript).
+    # Iterates through all data pairs (FLAC file path and transcript).
     for idx, (flac_path, transcript) in enumerate(
             tqdm(data_pairs, desc="Writing shards")):
 
@@ -122,7 +122,7 @@ def write_shards(data_pairs, output_dir, shard_size_gb):
         # Generates a unique key for the sample.
         sample_key = str(uuid.uuid4())
 
-        # Create a sample dictionary with the audio and transcript.
+        # Creates a sample dictionary with the audio and transcript.
         sample = {
             "__key__": sample_key,
             "flac": audio_bytes,
@@ -161,7 +161,7 @@ def main():
     parser.add_argument(
         "--min_shard_count",
         type=int,
-        default=0,
+        default=10,
         help="Minimum number of shards to generate. Overrides shard_size_gb "
              "if necessary."
     )
