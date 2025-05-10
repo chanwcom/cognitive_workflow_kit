@@ -2,7 +2,8 @@
 """Convert LibriSpeech dataset into WebDataset format.
 
 This script scans a LibriSpeech split (e.g., train-clean-100) and creates
-.tar shard files containing FLAC audio and transcripts using the WebDataset format.
+.tar shard files containing FLAC audio and transcripts using the WebDataset
+format.
 
 Example usage:
     # Convert train-clean-100 with default shard size (in GB)
@@ -34,11 +35,9 @@ Example usage:
 
 import os
 import argparse
-import tarfile
 import uuid
 from pathlib import Path
 from tqdm import tqdm
-import soundfile as sf
 import webdataset as wds
 
 BYTES_PER_GB = 1 << 30
@@ -68,7 +67,8 @@ def find_audio_transcript_pairs(root_dir):
             with open(transcript_file, "r", encoding="utf-8") as f:
                 lines = f.readlines()
             trans_dict = {
-                line.split(" ", 1)[0]: line.split(" ", 1)[1].strip() for line in lines
+                line.split(" ", 1)[0]: line.split(" ", 1)[1].strip()
+                for line in lines
             }
 
             uid = flac_path.stem
@@ -77,7 +77,22 @@ def find_audio_transcript_pairs(root_dir):
 
     return data_pairs
 
-def write_shards(data_pairs: list, output_dir: str, shard_size_gb: float):
+def estimate_total_size(data_pairs):
+    """Estimates total size of all samples in bytes.
+
+    Args:
+        data_pairs (list): List of (flac_path, transcript) tuples.
+
+    Returns:
+        int: Total estimated size in bytes.
+    """
+    total_size = 0
+    for flac_path, transcript in tqdm(data_pairs, desc="Estimating total size"):
+        total_size += os.path.getsize(flac_path)
+        total_size += len(transcript.encode("utf-8"))
+    return total_size
+
+def write_shards(data_pairs, output_dir, shard_size_gb):
     """Writes (FLAC, transcript) pairs into WebDataset shards.
 
     Args:
@@ -90,8 +105,8 @@ def write_shards(data_pairs: list, output_dir: str, shard_size_gb: float):
     current_size = 0
     sink = None
 
-
-    for idx, (flac_path, transcript) in enumerate(tqdm(data_pairs, desc="Writing shards")):
+    for idx, (flac_path, transcript) in enumerate(
+            tqdm(data_pairs, desc="Writing shards")):
         with open(flac_path, "rb") as f:
             audio_bytes = f.read()
 
@@ -104,12 +119,11 @@ def write_shards(data_pairs: list, output_dir: str, shard_size_gb: float):
 
         est_sample_size = len(audio_bytes) + len(transcript.encode("utf-8"))
 
-        if sink is None or current_size + est_sample_size > shard_size_gb * BYTES_PER_GB:
+        if (sink is None or
+                current_size + est_sample_size > shard_size_gb * BYTES_PER_GB):
             if sink is not None:
                 sink.close()
             shard_path = os.path.join(output_dir, "shard-%06d.tar")
-
-            # TODO(chanwcom) Removes the hard-coded parts.
             sink = wds.ShardWriter(shard_path, maxcount=1000)
             shard_id += 1
             current_size = 0
@@ -127,7 +141,8 @@ def main():
         "--dataset_dir",
         type=str,
         required=True,
-        help="Path to LibriSpeech split directory (e.g., ./LibriSpeech/train-clean-100)"
+        help="Path to LibriSpeech split directory "
+             "(e.g., ./LibriSpeech/train-clean-100)"
     )
     parser.add_argument(
         "--output_dir",
@@ -141,13 +156,29 @@ def main():
         default=1.0,
         help="Maximum shard size in gigabytes (default: 1.0)"
     )
+    parser.add_argument(
+        "--min_shard_count",
+        type=int,
+        default=0,
+        help="Minimum number of shards to generate. Overrides shard_size_gb "
+             "if necessary."
+    )
     args = parser.parse_args()
 
     data_pairs = find_audio_transcript_pairs(args.dataset_dir)
     print(f"Found {len(data_pairs)} audio-transcript pairs.")
 
-    write_shards(data_pairs, args.output_dir, args.shard_size_gb)
+    effective_shard_size_gb = args.shard_size_gb
+    if args.min_shard_count > 0:
+        total_size_bytes = estimate_total_size(data_pairs)
+        min_shard_gb = total_size_bytes / args.min_shard_count / BYTES_PER_GB
+        if min_shard_gb < args.shard_size_gb:
+            print(f"Adjusting shard size from {args.shard_size_gb:.3f} GB to "
+                  f"{min_shard_gb:.3f} GB to satisfy min_shard_count="
+                  f"{args.min_shard_count}")
+            effective_shard_size_gb = min_shard_gb
+
+    write_shards(data_pairs, args.output_dir, effective_shard_size_gb)
 
 if __name__ == "__main__":
     main()
-
