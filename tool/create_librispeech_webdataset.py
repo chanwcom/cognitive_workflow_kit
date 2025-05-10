@@ -6,13 +6,13 @@ This script scans a LibriSpeech split (e.g., train-clean-100) and creates
 format.
 
 Example usage:
-    # Convert train-clean-100 with default shard size (in GB)
+    # Converts train-clean-100 with default shard size (in GB)
     python create_librispeech_webdataset.py \
         --dataset_dir ./LibriSpeech/train-clean-100 \
         --output_dir ./wds/train-clean-100 \
         --shard_size_gb 1.0
 
-    # Convert dev-clean with smaller shard size
+    # Converts dev-clean with smaller shard size
     python create_librispeech_webdataset.py \
         --dataset_dir ./LibriSpeech/dev-clean \
         --output_dir ./wds/dev-clean \
