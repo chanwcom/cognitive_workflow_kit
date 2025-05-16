@@ -1,3 +1,6 @@
+import torch
+import librosa
+
 def small_energy_masking(mel_spec):
     mel_spec = mel_spec.to(mel_spec.device)
     peak_energy = torch.quantile(mel_spec, 0.95, dim=2, keepdim=True)
@@ -17,7 +20,7 @@ def small_energy_masking(mel_spec):
 
     return masked_mel_spec
 
-def generate_adversarial_speech(original_speech, speaker_encoder, num_iterations=50, epsilon=0.02, alpha=0.0004):
+def generate_adversarial_speech(original_speech): #, speaker_encoder, num_iterations=50, epsilon=0.02, alpha=0.0004):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     n_fft, hop_length, win_length = 512, 200, 400
     min_samples = 32000
@@ -48,6 +51,8 @@ def generate_adversarial_speech(original_speech, speaker_encoder, num_iterations
     # Get original embedding
     log_mel = torch.log(mel_spec.clamp(min=1e-12))
     spec_2d = log_mel.squeeze(0)
+
+    import pdb; pdb.set_trace()
     e = speaker_encoder(spec_2d)
     e = F.normalize(e, p=2, dim=1)
 
