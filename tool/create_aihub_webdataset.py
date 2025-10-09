@@ -1,187 +1,147 @@
-"""Converts the LibriSpeech dataset into WebDataset format.
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Filter dialogs from JSON files based on a given filter list and pack
+(audio, text, metadata) into WebDataset format.
 
-This script scans a LibriSpeech split (e.g., train-clean-100) and creates
-.tar shard files containing FLAC audio and transcripts using the WebDataset
-format.
+Each WebDataset sample contains:
+  - audio (.wav)
+  - text (.txt)
+  - metadata (.json) with both dataset-level and dialog-level info
 
 Example usage:
-    # Converts train-clean-100 with default shard size (in GB)
-    python create_librispeech_webdataset.py \
-        --dataset_dir ./LibriSpeech/train-clean-100 \
-        --output_dir ./wds/train-clean-100 \
-        --shard_size_gb 1.0
-
-    # Converts dev-clean with smaller shard size
-    python create_librispeech_webdataset.py \
-        --dataset_dir ./LibriSpeech/dev-clean \
-        --output_dir ./wds/dev-clean \
-        --shard_size_gb 0.5
-
-    # Batch process splits
-    for split in train-clean-100 train-clean-360 train-other-500; do
-        python create_librispeech_webdataset.py \
-            --dataset_dir ./LibriSpeech/$split \
-            --output_dir ./wds/$split \
-            --shard_size_gb 1.5
-    done
-
-    # Debug mode with very small shard
-    python create_librispeech_webdataset.py \
-        --dataset_dir ./LibriSpeech/dev-clean \
-        --output_dir ./wds/dev-clean-debug \
-        --shard_size_gb 0.1
+  ./filter_and_pack.py \
+    --filter-list A.txt \
+    --json-dir /path/to/jsons \
+    --data-root /data/root \
+    --output-pattern output-%06d.tar \
+    --max-per-shard 5000
 """
 
-import argparse
 import os
-import uuid
+import json
 from pathlib import Path
-from tqdm import tqdm
+import argparse
 import webdataset as wds
-from typing import List, Tuple
-BYTES_PER_GB = 1 << 30
 
 
-def find_audio_transcript_pairs(root_dir):
-    """Finds all (FLAC, transcript) pairs in a LibriSpeech-style directory.
-
-    Args:
-        root_dir (str or Path): Root directory of a LibriSpeech split.
-
-    Returns:
-        list: A list of tuples (flac_path, transcript_string).
-    """
-    flac_paths = list(Path(root_dir).rglob("*.flac"))
-    data_pairs = []
-
-    for flac_path in flac_paths:
-        transcript_path = flac_path.with_suffix(".txt")
-        if not transcript_path.exists():
-            transcript_dir = flac_path.parent
-            speaker_id = flac_path.parts[-3]
-            chapter_id = flac_path.parts[-2]
-            transcript_file = transcript_dir / f"{speaker_id}-{chapter_id}.trans.txt"
-            if not transcript_file.exists():
-                continue
-
-            with open(transcript_file, "r", encoding="utf-8") as f:
-                lines = f.readlines()
-            trans_dict = {
-                line.split(" ", 1)[0]: line.split(" ", 1)[1].strip()
-                for line in lines
-            }
-
-            uid = flac_path.stem
-            if uid in trans_dict:
-                data_pairs.append((flac_path, trans_dict[uid]))
-
-    return data_pairs
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Filter JSON dialogs and pack selected items into WebDataset format."
+    )
+    parser.add_argument(
+        "--filter-list",
+        required=True,
+        help="Path to text file containing filenames to include (e.g., A.txt).",
+    )
+    parser.add_argument(
+        "--json-dir",
+        required=True,
+        help="Directory containing JSON files with dataset/dialog information.",
+    )
+    parser.add_argument(
+        "--data-root",
+        required=True,
+        help="Root directory containing actual audio/text data.",
+    )
+    parser.add_argument(
+        "--output-pattern",
+        default="output-%06d.tar",
+        help="Output WebDataset shard pattern (default: output-%%06d.tar).",
+    )
+    parser.add_argument(
+        "--max-per-shard",
+        type=int,
+        default=5000,
+        help="Maximum number of samples per shard (default: 5000).",
+    )
+    return parser.parse_args()
 
 
-def estimate_total_size(data_pairs):
-    """Estimates total size of all samples in bytes.
-
-    Args:
-        data_pairs (list): List of (flac_path, transcript) tuples.
-
-    Returns:
-        int: Total estimated size in bytes.
-    """
-    total_size = 0
-    for flac_path, transcript in tqdm(data_pairs,
-                                      desc="Estimating total size"):
-        total_size += os.path.getsize(flac_path)
-        total_size += len(transcript.encode("utf-8"))
-    return total_size
+def load_target_files(txt_path):
+    """Load target file names from the filter list into a set."""
+    with open(txt_path, "r", encoding="utf-8") as f:
+        targets = set(line.strip() for line in f if line.strip())
+    print(f"[INFO] Loaded {len(targets):,} target file names from {txt_path}.")
+    return targets
 
 
-def write_shards(data_pairs: List[Tuple[str, str]], output_dir: str,
-                 shard_size_gb: float):
-    """Writes (FLAC, transcript) pairs into WebDataset shards.
+def process_json(json_path, target_files, data_root, sink):
+    """Process a single JSON file and write matching dialogs to WebDataset."""
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            js = json.load(f)
+    except Exception as e:
+        print(f"[WARN] Failed to load {json_path}: {e}")
+        return
 
-    Args:
-        data_pairs (list): List of (flac_path, transcript) tuples.
-        output_dir (str): Path to directory where shards are written.
-        shard_size_gb (float): Maximum shard size in gigabytes.
-    """
-    # Ensures the output directory exists, create if it doesn't.
-    os.makedirs(output_dir, exist_ok=True)
+    dataset_meta = js.get("dataSet", {})
+    dialogs = dataset_meta.get("dialogs", [])
 
-    # Initializes variables for shard ID and current shard size tracking.
-    shard_id = 0
-    current_size = 0
-    sink = None
+    for dialog in dialogs:
+        audio_path = dialog.get("audioPath")
+        if not audio_path:
+            continue
 
-    # Defines the shard path format and initialize the ShardWriter.
-    shard_path = os.path.join(output_dir, f"shard-%06d.tar")
-    sink = wds.ShardWriter(shard_path, maxsize=shard_size_gb * (1 << 30))
+        fname = Path(audio_path).name
+        if fname not in target_files:
+            continue
 
-    # Iterates through all data pairs (FLAC file path and transcript).
-    for idx, (flac_path,
-              transcript) in enumerate(tqdm(data_pairs,
-                                            desc="Writing shards")):
+        audio_full = Path(data_root) / audio_path
+        text_full = Path(data_root) / dialog.get("textPath", "")
 
-        # Reads the FLAC audio file into memory.
-        with open(flac_path, "rb") as f:
-            audio_bytes = f.read()
+        if not audio_full.exists() or not text_full.exists():
+            print(f"[SKIP] Missing file for {audio_full}")
+            continue
 
-        # Generates a unique key for the sample.
-        sample_key = str(uuid.uuid4())
-
-        # Creates a sample dictionary with the audio and transcript.
-        sample = {
-            "__key__": sample_key,
-            "flac": audio_bytes,
-            "txt": transcript,
+        metadata = {
+            "dataSet": {k: v for k, v in dataset_meta.items() if k != "dialogs"},
+            "dialog": dialog,
         }
 
-        # Writes the sample to the current shard.
-        sink.write(sample)
-
-    # Closes the ShardWriter after processing all the samples.
-    if sink is not None:
-        sink.close()
+        key = Path(fname).stem
+        try:
+            with open(audio_full, "rb") as fa, open(text_full, "rb") as ft:
+                sink.write({
+                    "__key__": key,
+                    "wav": fa.read(),
+                    "txt": ft.read(),
+                    "json": json.dumps(metadata, ensure_ascii=False),
+                })
+        except Exception as e:
+            print(f"[ERROR] Failed to write {audio_full}: {e}")
 
 
 def main():
-    """Main entry point: parses arguments and creates shards."""
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset_dir",
-                        type=str,
-                        required=True,
-                        help="Path to LibriSpeech split directory "
-                        "(e.g., ./LibriSpeech/train-clean-100)")
-    parser.add_argument("--output_dir",
-                        type=str,
-                        required=True,
-                        help="Output directory for WebDataset shards")
-    parser.add_argument("--shard_size_gb",
-                        type=float,
-                        default=1.0,
-                        help="Maximum shard size in gigabytes (default: 1.0)")
-    parser.add_argument(
-        "--min_shard_count",
-        type=int,
-        default=10,
-        help="Minimum number of shards to generate. Overrides shard_size_gb "
-        "if necessary.")
-    args = parser.parse_args()
+    """Main entry point."""
+    args = parse_args()
 
-    data_pairs = find_audio_transcript_pairs(args.dataset_dir)
-    print(f"Found {len(data_pairs)} audio-transcript pairs.")
+    # Validate inputs
+    json_dir = Path(args.json_dir)
+    if not json_dir.exists():
+        raise FileNotFoundError(f"JSON directory not found: {json_dir}")
 
-    effective_shard_size_gb = args.shard_size_gb
-    if args.min_shard_count > 0:
-        total_size_bytes = estimate_total_size(data_pairs)
-        min_shard_gb = total_size_bytes / args.min_shard_count / BYTES_PER_GB
-        if min_shard_gb < args.shard_size_gb:
-            print(f"Adjusting shard size from {args.shard_size_gb:.3f} GB to "
-                  f"{min_shard_gb:.3f} GB to satisfy min_shard_count="
-                  f"{args.min_shard_count}")
-            effective_shard_size_gb = min_shard_gb
+    data_root = Path(args.data_root)
+    if not data_root.exists():
+        raise FileNotFoundError(f"Data root not found: {data_root}")
 
-    write_shards(data_pairs, args.output_dir, effective_shard_size_gb)
+    target_files = load_target_files(args.filter_list)
+
+    sink = wds.ShardWriter(args.output_pattern, maxcount=args.max_per_shard)
+
+    json_files = sorted(json_dir.glob("*.json"))
+    print(f"[INFO] Found {len(json_files):,} JSON files to process.")
+
+    for idx, json_path in enumerate(json_files, start=1):
+        process_json(json_path, target_files, data_root, sink)
+        if idx % 100 == 0:
+            print(f"[PROGRESS] Processed {idx}/{len(json_files)} JSON files")
+
+    sink.close()
+    print("[DONE] Finished writing WebDataset shards.")
 
 
 if __name__ == "__main__":
     main()
+
