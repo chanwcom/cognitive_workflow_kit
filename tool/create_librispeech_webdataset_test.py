@@ -11,6 +11,7 @@ from create_librispeech_webdataset import (
 
 
 class TestCreateLibriSpeechWebDataset(unittest.TestCase):
+
     def setUp(self):
         """Set up a temporary LibriSpeech-like structure with one audio-text pair."""
         self.temp_dir = tempfile.mkdtemp()
@@ -42,7 +43,8 @@ class TestCreateLibriSpeechWebDataset(unittest.TestCase):
     def test_estimate_total_size(self):
         pairs = find_audio_transcript_pairs(self.temp_dir)
         total_size = estimate_total_size(pairs)
-        expected_size = len(b"FAKEFLACDATA") + len("Hello world".encode("utf-8"))
+        expected_size = len(b"FAKEFLACDATA") + len(
+            "Hello world".encode("utf-8"))
         self.assertEqual(total_size, expected_size)
 
     def test_write_shards(self):
@@ -50,7 +52,8 @@ class TestCreateLibriSpeechWebDataset(unittest.TestCase):
         output_dir = tempfile.mkdtemp()
 
         try:
-            write_shards(pairs, output_dir, shard_size_gb=0.00001)  # very small to force split
+            write_shards(pairs, output_dir,
+                         shard_size_gb=0.00001)  # very small to force split
             shard_files = list(Path(output_dir).glob("shard-*.tar"))
             self.assertGreaterEqual(len(shard_files), 1)
             for shard_file in shard_files:

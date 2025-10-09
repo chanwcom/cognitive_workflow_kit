@@ -32,14 +32,15 @@ Example usage:
         --shard_size_gb 0.1
 """
 
-import os
 import argparse
+import os
 import uuid
 from pathlib import Path
 from tqdm import tqdm
 import webdataset as wds
-
+from typing import List, Tuple
 BYTES_PER_GB = 1 << 30
+
 
 def find_audio_transcript_pairs(root_dir):
     """Finds all (FLAC, transcript) pairs in a LibriSpeech-style directory.
@@ -76,6 +77,7 @@ def find_audio_transcript_pairs(root_dir):
 
     return data_pairs
 
+
 def estimate_total_size(data_pairs):
     """Estimates total size of all samples in bytes.
 
@@ -86,12 +88,15 @@ def estimate_total_size(data_pairs):
         int: Total estimated size in bytes.
     """
     total_size = 0
-    for flac_path, transcript in tqdm(data_pairs, desc="Estimating total size"):
+    for flac_path, transcript in tqdm(data_pairs,
+                                      desc="Estimating total size"):
         total_size += os.path.getsize(flac_path)
         total_size += len(transcript.encode("utf-8"))
     return total_size
 
-def write_shards(data_pairs, output_dir, shard_size_gb):
+
+def write_shards(data_pairs: List[Tuple[str, str]], output_dir: str,
+                 shard_size_gb: float):
     """Writes (FLAC, transcript) pairs into WebDataset shards.
 
     Args:
@@ -112,8 +117,9 @@ def write_shards(data_pairs, output_dir, shard_size_gb):
     sink = wds.ShardWriter(shard_path, maxsize=shard_size_gb * (1 << 30))
 
     # Iterates through all data pairs (FLAC file path and transcript).
-    for idx, (flac_path, transcript) in enumerate(
-            tqdm(data_pairs, desc="Writing shards")):
+    for idx, (flac_path,
+              transcript) in enumerate(tqdm(data_pairs,
+                                            desc="Writing shards")):
 
         # Reads the FLAC audio file into memory.
         with open(flac_path, "rb") as f:
@@ -136,35 +142,29 @@ def write_shards(data_pairs, output_dir, shard_size_gb):
     if sink is not None:
         sink.close()
 
+
 def main():
     """Main entry point: parses arguments and creates shards."""
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--dataset_dir",
-        type=str,
-        required=True,
-        help="Path to LibriSpeech split directory "
-             "(e.g., ./LibriSpeech/train-clean-100)"
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        required=True,
-        help="Output directory for WebDataset shards"
-    )
-    parser.add_argument(
-        "--shard_size_gb",
-        type=float,
-        default=1.0,
-        help="Maximum shard size in gigabytes (default: 1.0)"
-    )
+    parser.add_argument("--dataset_dir",
+                        type=str,
+                        required=True,
+                        help="Path to LibriSpeech split directory "
+                        "(e.g., ./LibriSpeech/train-clean-100)")
+    parser.add_argument("--output_dir",
+                        type=str,
+                        required=True,
+                        help="Output directory for WebDataset shards")
+    parser.add_argument("--shard_size_gb",
+                        type=float,
+                        default=1.0,
+                        help="Maximum shard size in gigabytes (default: 1.0)")
     parser.add_argument(
         "--min_shard_count",
         type=int,
         default=10,
         help="Minimum number of shards to generate. Overrides shard_size_gb "
-             "if necessary."
-    )
+        "if necessary.")
     args = parser.parse_args()
 
     data_pairs = find_audio_transcript_pairs(args.dataset_dir)
@@ -181,6 +181,7 @@ def main():
             effective_shard_size_gb = min_shard_gb
 
     write_shards(data_pairs, args.output_dir, effective_shard_size_gb)
+
 
 if __name__ == "__main__":
     main()
