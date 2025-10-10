@@ -241,10 +241,15 @@ def main():
     if args.min_shard_count > 0:
         total_size_bytes = estimate_total_size(
             json_files, target_files, label_root, audio_root)
-        min_shard_gb = total_size_bytes / args.min_shard_count / BYTES_PER_GB
+
+        print (f"[INFO] total size is {total_size_bytes} Bytes.")
+
+        # TODO(chanwcom): Improve it later
+        # Hack: margin.. to cover the meta data and some overhead (?)
+        min_shard_gb = total_size_bytes / args.min_shard_count / BYTES_PER_GB * 1.05
         if min_shard_gb < args.shard_size_gb:
-            print(f"[INFO] Adjusting shard size from {args.shard_size_gb:.3f} GB to "
-                  f"{min_shard_gb:.3f} GB to satisfy min_shard_count={args.min_shard_count}")
+            print(f"[INFO] Adjusting shard size from {args.shard_size_gb:.5f} GB to "
+                  f"{min_shard_gb:.5f} GB to satisfy min_shard_count={args.min_shard_count}")
             effective_shard_size_gb = min_shard_gb
 
     shard_path = str(output_dir / "shard-%06d.tar")
