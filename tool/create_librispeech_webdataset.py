@@ -182,14 +182,14 @@ def write_shards(data_pairs: List[Tuple[str, str]], output_dir: str,
         # Generates a unique key for the sample.
         sample_key = str(uuid.uuid4())
 
-        meta = extract_librispeech_metadata(flac_path)
-        import pdb; pdb.set_trace()
+        metadata = extract_librispeech_metadata(flac_path)
 
         # Creates a sample dictionary with the audio and transcript.
         sample = {
             "__key__": sample_key,
-            "flac": audio_bytes,
-            "txt": transcript,
+            "audio": audio_bytes,
+            "text": transcript,
+            "meta": json.dumps(metadata, ensure_ascii=False),
         }
 
         # Writes the sample to the current shard.
