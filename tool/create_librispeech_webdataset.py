@@ -35,6 +35,7 @@ Example usage:
 import argparse
 import os
 import uuid
+import json
 from pathlib import Path
 from tqdm import tqdm
 import webdataset as wds
