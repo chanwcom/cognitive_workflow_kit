@@ -22,7 +22,7 @@ Example usage:
         python create_librispeech_webdataset.py \
             --dataset_dir ./LibriSpeech/$split \
             --output_dir ./wds/$split \
-            --shard_size_gb 1.5
+            --shard_size_gb 5.0
     done
 
     # Debug mode with very small shard
@@ -38,9 +38,62 @@ import uuid
 from pathlib import Path
 from tqdm import tqdm
 import webdataset as wds
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 BYTES_PER_GB = 1 << 30
 
+def extract_librispeech_metadata(audio_path: str) -> dict:
+    """Extracts LibriSpeech-like metadata from a given audio file path.
+
+    This function parses file paths such as:
+        - /mnt/nas2dual/database/libri_light_finetuning/org_decompressed/1h/1/other/5287/39165/5287-39165-0001.flac
+        - /mnt/nas2dual/database/LibriSpeech/train-other-500/82/121544/82-121544-0081.flac
+
+    and extracts relevant metadata such as subset, speaker_id, chapter_id, and utterance_id.
+
+    Args:
+        audio_path: Full path to a .flac audio file.
+
+    Returns:
+        A dictionary containing extracted metadata.
+    """
+    path = Path(audio_path)
+
+    # Drop all directories before subset (e.g., "1h" or "train-other-500")
+    parts = path.parts
+
+    for i, part in enumerate(parts):
+        # endwith("h") is to handle libri-light fine tuning. (e.g. 1h, 10h)
+        if (part == "train-clean-100" or
+            part == "train-clean-360" or
+            part == "train-other-500" or
+            part == "dev-clean" or
+            part == "dev-other" or
+            part == "test-clean" or
+            part == "test-other" or
+            part == "1h" or
+            part == "9h"):
+            rel_parts = parts[i:]
+            break
+    else:
+        raise ValueError(f"Subset not found in path: {audio_path}")
+
+    # Example: ["train-other-500", "82", "121544", "82-121544-0081.flac"]
+    subset = rel_parts[0]
+
+    # Extract speaker_id, chapter_id, and utterance_id
+    filename = rel_parts[-1]
+    utt_base = Path(filename).stem  # e.g., "82-121544-0081"
+
+    try:
+        speaker_id, chapter_id, utt = utt_base.split("-")
+    except ValueError:
+        raise ValueError(f"Unexpected filename format: {filename}")
+
+    return {
+        "subset": subset,
+        "utt_base": utt_base,
+        "audio_path": str(Path(*rel_parts)),
+    }
 
 def find_audio_transcript_pairs(root_dir):
     """Finds all (FLAC, transcript) pairs in a LibriSpeech-style directory.
@@ -121,12 +174,16 @@ def write_shards(data_pairs: List[Tuple[str, str]], output_dir: str,
               transcript) in enumerate(tqdm(data_pairs,
                                             desc="Writing shards")):
 
+
         # Reads the FLAC audio file into memory.
         with open(flac_path, "rb") as f:
             audio_bytes = f.read()
 
         # Generates a unique key for the sample.
         sample_key = str(uuid.uuid4())
+
+        meta = extract_librispeech_metadata(flac_path)
+        import pdb; pdb.set_trace()
 
         # Creates a sample dictionary with the audio and transcript.
         sample = {
@@ -157,12 +214,12 @@ def main():
                         help="Output directory for WebDataset shards")
     parser.add_argument("--shard_size_gb",
                         type=float,
-                        default=1.0,
+                        default=5.0,
                         help="Maximum shard size in gigabytes (default: 1.0)")
     parser.add_argument(
         "--min_shard_count",
         type=int,
-        default=10,
+        default=5,
         help="Minimum number of shards to generate. Overrides shard_size_gb "
         "if necessary.")
     args = parser.parse_args()
