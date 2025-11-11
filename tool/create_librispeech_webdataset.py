@@ -40,7 +40,9 @@ from pathlib import Path
 from tqdm import tqdm
 import webdataset as wds
 from typing import Dict, List, Tuple
+
 BYTES_PER_GB = 1 << 30
+
 
 def extract_librispeech_metadata(audio_path: str) -> dict:
     """Extracts LibriSpeech-like metadata from a given audio file path.
@@ -64,15 +66,10 @@ def extract_librispeech_metadata(audio_path: str) -> dict:
 
     for i, part in enumerate(parts):
         # endwith("h") is to handle libri-light fine tuning. (e.g. 1h, 10h)
-        if (part == "train-clean-100" or
-            part == "train-clean-360" or
-            part == "train-other-500" or
-            part == "dev-clean" or
-            part == "dev-other" or
-            part == "test-clean" or
-            part == "test-other" or
-            part == "1h" or
-            part == "9h"):
+        if (part == "train-clean-100" or part == "train-clean-360"
+                or part == "train-other-500" or part == "dev-clean"
+                or part == "dev-other" or part == "test-clean"
+                or part == "test-other" or part == "1h" or part == "9h"):
             rel_parts = parts[i:]
             break
     else:
@@ -95,6 +92,7 @@ def extract_librispeech_metadata(audio_path: str) -> dict:
         "utt_base": utt_base,
         "audio_path": str(Path(*rel_parts)),
     }
+
 
 def find_audio_transcript_pairs(root_dir):
     """Finds all (FLAC, transcript) pairs in a LibriSpeech-style directory.
@@ -174,7 +172,6 @@ def write_shards(data_pairs: List[Tuple[str, str]], output_dir: str,
     for idx, (flac_path,
               transcript) in enumerate(tqdm(data_pairs,
                                             desc="Writing shards")):
-
 
         # Reads the FLAC audio file into memory.
         with open(flac_path, "rb") as f:

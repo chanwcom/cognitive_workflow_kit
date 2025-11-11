@@ -5,25 +5,25 @@ This script scans a LibriSpeech split (e.g., train-clean-100) and creates
 .tar shard files containing FLAC audio and transcripts using the WebDataset
 format.
 
-Example usage:   
+Example usage:
     python create_stop_webdataset.py \
-        --dataset_dir 
-        --output_dir 
-        --shard_size_gb 
+        --dataset_dir
+        --output_dir
+        --shard_size_gb
 
     # Convert dev-clean with smaller shard size
     python create_stop_webdataset.py \
-        --dataset_dir 
-        --output_dir 
-        --shard_size_gb 
+        --dataset_dir
+        --output_dir
+        --shard_size_gb
 
 
     # Batch process splits
     for split in train-clean-100 train-clean-360 train-other-500; do
           python create_stop_webdataset.py \
-        --dataset_dir 
-        --output_dir 
-        --shard_size_gb 
+        --dataset_dir
+        --output_dir
+        --shard_size_gb
     done
 
     # Debug mode with very small shard
@@ -38,7 +38,6 @@ import os
 import json
 import jsonschema
 import re
-import uuid
 import webdataset as wds
 
 from jsonschema import validate, ValidationError
