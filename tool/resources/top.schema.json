@@ -1,0 +1,22 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "http://example.com/multimodal_data_schema.json",
+  "title": "Multimodal Meta Data Schema (Optional and Arbitrary Types)",
+  "description": "Schema for audio, text, and image data. All fields are optional and types are arbitrary.",
+  "type": "object",
+  "properties": {
+    "audio": {
+      "description": "Audio data path or encoded data. Type is arbitrary as no 'type' keyword is specified."
+    },
+    "text": {
+      "description": "Text data or transcript. Type is arbitrary as no 'type' keyword is specified."
+    },
+    "image": {
+      "description": "Image data path or encoded data. Type is arbitrary as no 'type' keyword is specified."
+    }
+  },
+  
+  // By omitting the 'required' array, all fields in 'properties' are considered optional.
+  "additionalProperties": false
+}
+
