@@ -320,6 +320,45 @@ class SeqLossUtilTest(unittest.TestCase):
         # Checks the actual output with respect to the expected output.
         torch.testing.assert_close(actual, expected)
 
+    def test_label_trans_allowance_table_shc(self):
+        """Tests the label_trans_allowance_table_shc method."""
+
+        # yapf: disable
+        labels = torch.tensor([[2, 1, 3, 2, 3, 2],
+                               [1, 1, 2, 3, 2, 3],  
+                               [3, 1, 2, 3, 0, 0]])  
+        labels_len = torch.tensor([6, 6, 4])
+        # yapf: enable
+
+        actual = seq_loss_util.label_trans_allowance_table(
+            labels, labels_len, seq_loss_util.LabelType.SHC)
+
+        expected = torch.tensor(
+            [
+             [[  0.0,   0.0, LOG_0, LOG_0, LOG_0, LOG_0],
+              [LOG_0,   0.0,   0.0, LOG_0, LOG_0, LOG_0],
+              [LOG_0, LOG_0,   0.0,   0.0, LOG_0, LOG_0],
+              [LOG_0, LOG_0, LOG_0,   0.0,   0.0, LOG_0],
+              [LOG_0, LOG_0, LOG_0, LOG_0,   0.0,   0.0],
+              [LOG_0, LOG_0, LOG_0, LOG_0, LOG_0,   0.0]],
+             [[  0.0,   0.0, LOG_0, LOG_0, LOG_0, LOG_0],
+              [LOG_0,   0.0,   0.0, LOG_0, LOG_0, LOG_0],
+              [LOG_0, LOG_0,   0.0,   0.0, LOG_0, LOG_0],
+              [LOG_0, LOG_0, LOG_0,   0.0,   0.0, LOG_0],
+              [LOG_0, LOG_0, LOG_0, LOG_0,   0.0,   0.0],
+              [LOG_0, LOG_0, LOG_0, LOG_0, LOG_0,   0.0]],
+             [[  0.0,   0.0, LOG_0, LOG_0, LOG_0, LOG_0],
+              [LOG_0,   0.0,   0.0, LOG_0, LOG_0, LOG_0],
+              [LOG_0, LOG_0,   0.0,   0.0, LOG_0, LOG_0],
+              [LOG_0, LOG_0, LOG_0,   0.0,   0.0, LOG_0],
+              [LOG_0, LOG_0, LOG_0, LOG_0,   0.0,   0.0],
+              [LOG_0, LOG_0, LOG_0, LOG_0, LOG_0,   0.0]]],
+             dtype=torch.float32) # yapf: disable
+
+        # Checks the actual output with respect to the expected output.
+        torch.testing.assert_close(actual, expected)
+
+
     def test_label_trans_allowance_table_shc_type_0(self):
         """Tests the label_trans_allowance_table_shc_type_0 method."""
 

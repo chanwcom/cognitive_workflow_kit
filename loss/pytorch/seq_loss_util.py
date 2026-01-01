@@ -129,23 +129,23 @@ def to_onset_augmented_labels(inputs: dict, num_classes: int) -> dict:
 # * https://github.com/amaas/stanford-ctc/blob/master/ctc/ctc.py
 # * https://github.com/HawkAaron/warp-transducer/blob/master/tensorflow_binding/src/warprnnt_op.cc
 def calculate_log_label_prob(labels, softmax_output):
-    """Calculates log({\hat{y}_t}_{c_l}).
+    """Calculates the log probability $\log(\hat{y}_{t, c_l})$.
 
-    This calculates the log probability of each label in the label sequence
-    c_l 0 <= l <= L-1 predicted by the model at time t. The returned value is
-    a three-dimensional tensor, where value is stored in (b, t, l) where b is
-    the batch index, t is the time index, and l ls the label sequence index.
+    Computes the log probability of each label in the sequence $c_l$
+    ($0 \le l < L$) predicted by the model at each time step $t$.
+    The result is a 3D tensor where the value at $(b, t, l)$ corresponds
+    to the batch index $b$, time index $t$, and label sequence index $l$.
 
     Args:
-        labels: A tensor containing a batch of ground-truth label sequences.
-            Note that this label sequence should already include blank labels.
-            The shape is given by (batch_size, max_labels_len).
-        softmax_output: The output of the model.
-            The shape is given by:
+        labels: A tensor of shape (batch_size, max_labels_len) containing
+            ground-truth label sequences. These sequences should already
+            include blank labels.
+        softmax_output: The model output tensor of shape
             (batch_size, max_seq_len, num_classes).
 
     Returns:
-        The shape is (batch, max_logit_len, max_labels_len).
+        A tensor of shape (batch_size, max_seq_len, max_labels_len)
+        containing the calculated log probabilities.
     """
     max_logit_len = softmax_output.shape[1]
     labels = torch.tile(torch.unsqueeze(labels, dim=1), (1, max_logit_len, 1))
@@ -180,8 +180,9 @@ def _calculate_unnormalized_log_seq_prob(log_alpha, accum_log_seq_prob_sum,
 
 class LabelType(enum.Enum):
     CTC = 0
-    SHC_TYPE_0 = 1
-    SHC_TYPE_1 = 2
+    SHC = 1
+    SHC_TYPE_0 = 2
+    SHC_TYPE_1 = 3
 
 
 class ThresholdType(enum.Enum):
@@ -309,6 +310,54 @@ def label_trans_table_shc_type0(labels, labels_len):
 
     return trans_table
 
+def label_trans_table_shc(labels, labels_len):
+    """Constructs a table containing the label transition allowance flags.
+
+    We assume that label_seq should contain "blank labels" described in the
+    original CTC paper.
+    The shape of the returned tensor is (batch_size, max_seq_len, max_seq_len).
+    The transition rule is as follows:
+
+    Depending on whether the transition from the i-th label to the j-th label
+    in the label sequence is allowed,
+      a[b, i, j] = 0,         if this transition is allowed.
+      a[b, i, j] = LOG_0:     if this transition is not allowed.
+
+    Args:
+        label_seq: A dictionary containing a batch of label sequences.
+            * "DATA": A tensor containing label sequences.
+                The shape is (batch_size, max_seq_length). Note that the data
+                should follow the blank label rule, which states that "blank"
+                labels should be interleaved with real labels. In addition to
+                this, blank symbols are prepended and appended to the sequence.
+            * "SEQ_LEN": A tensor containing the length of each label sequence.
+                The shape is (batch_size).
+    Returns:
+        A tensor containing flags whether transitions are allowed.
+            The shape is (batch_size, max_label_seq_len, max_seq_len)
+    """
+
+    max_seq_len = torch.max(labels_len)
+    l = torch.arange(max_seq_len, dtype=torch.int32)
+
+    # Indices corresponding to i -> i.
+    indices0 = torch.stack([l, l], axis=1)
+
+    # Indices corresponding to i -> i + 1.
+    indices1 = torch.stack([l[:-1], l[:-1] + 1], axis=1)
+
+    # Constructs the transition table.
+    indices = torch.concat([indices0, indices1], axis=0)
+    values = torch.zeros([indices.shape[0]])
+
+    trans_table = torch.full(size=(max_seq_len, max_seq_len), fill_value=LOG_0)
+    trans_table[torch.unbind(indices, axis=1)] = 0
+
+    batch_size = labels.shape[0]
+    trans_table = torch.tile(torch.unsqueeze(trans_table, axis=0),
+                             [batch_size, 1, 1])
+
+    return trans_table
 
 def label_trans_table_shc_type1(labels, labels_len):
     """Constructs a table containing the label transition allowance flags.
@@ -365,6 +414,8 @@ def label_trans_table_shc_type1(labels, labels_len):
 def label_trans_allowance_table(labels, label_len, label_type: LabelType):
     if label_type == LabelType.CTC:
         table = label_trans_allowance_table_ctc(labels, label_len)
+    elif label_type == LabelType.SHC:
+        table = label_trans_table_shc(labels, label_len)
     elif label_type == LabelType.SHC_TYPE_0:
         table = label_trans_table_shc_type0(labels, label_len)
     elif label_type == LabelType.SHC_TYPE_1:
