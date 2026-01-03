@@ -17,7 +17,8 @@ import evaluate
 import numpy as np
 
 # Custom imports
-import sample_util
+from run import sample_util
+from loss.pytorch import seq_loss_util
 
 db_top_dir = "/mnt/data/database"
 train_top_dir = os.path.join(db_top_dir, "libri_light/1h")
@@ -195,9 +196,45 @@ training_args = TrainingArguments(
     push_to_hub=False,
 )
 
-# Create the Trainer instance to handle training and evaluation.
-# This ties together the model, datasets, tokenizer, data collator, and metrics.
-trainer = Trainer(
+
+class MyCtcTrainer(Trainer):
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        with torch.device(inputs["input_values"].device.type):
+            target = inputs.pop("labels")
+            outputs = model(**inputs)
+            logits = outputs["logits"]
+            logits_lengths = torch.full(size=(logits.shape[0], ),
+                                        fill_value=logits.shape[1]).to(
+                                            logits.device)
+
+            target_lengths =  torch.sum(
+                 (target >= 0).type(torch.int32), axis=1)
+
+            ctc_loss = seq_loss_util.CtcLoss()
+
+            # Default CTC
+            loss = ctc_loss.apply(target, target_lengths,
+                                  logits.log_softmax(2),
+                                  logits_lengths,
+                                  seq_loss_util.LabelType.CTC,
+                                  False,  # Update non-blank sequence
+                                  #seq_loss_util_exp.ThresholdType.NO_THRESHOLD,
+                                  #seq_loss_util_exp.ThresholdType.MAX_PROB,
+                                  #seq_loss_util_exp.ThresholdType.ELS,
+                                  #smoothing_coeff, # threshold,
+                                  #seq_loss_util_exp.ProcessingType.UNCHANGED,
+                                  #seq_loss_util_exp.ProcessingType.ZERO,
+                                  #seq_loss_util_exp.ProcessingType.UNIFORM,
+                                  ).mean()
+
+        if return_outputs:
+            return loss, outputs
+        else:
+            return loss
+
+
+trainer = MyCtcTrainer(
     model=model,
     args=training_args,
     train_dataset=train_dataset,
