@@ -1,43 +1,57 @@
 import torch
 import unittest
 
-
+# alpha가 0.2 일때 optimal 성능 보임.
+# 0.97인 LS보다 살짝 더 좋음.: 20.243 %
+# 20.426%
+# 
 def adaptive_label_smoothing(
     estimated_targets: torch.Tensor,
     model_outputs: torch.Tensor,
     alpha: float,
     eps: float = 1e-10
 ) -> torch.Tensor:
-    """Performs batch-wise adaptive label smoothing.
+    """Performs batch-wide label smoothing by matching entropy levels.
+
+    Calculates the average entropy difference between targets and model
+    outputs, then mixes a uniform distribution into the targets to bridge
+    the gap, ensuring consistent smoothing across the entire batch.
 
     Args:
-        estimated_targets: Soft target sequence of shape [B, T, C].
+        estimated_targets: Soft targets of shape [B, T, C].
         model_outputs: Model probabilities (Softmax) of shape [B, T, C].
-        alpha: Base smoothing coefficient.
-        eps: Threshold to identify active classes in targets.
+        eps: Small constant for numerical stability in log.
 
     Returns:
         torch.Tensor: Smoothed targets of shape [B, T, C].
     """
     assert estimated_targets.shape == model_outputs.shape, "Shape mismatch."
 
-    # Identify active indices: [B, T, C]
-    mask = (estimated_targets > eps).to(model_outputs.dtype)
+    # Compute mean entropy for targets and model outputs over [B, T].
+    # H = -sum(p * log(p))
+    h_target = -torch.mean(
+        torch.sum(estimated_targets * torch.log(estimated_targets + eps), dim=-1)
+    )
+    h_model = -torch.mean(
+        torch.sum(model_outputs * torch.log(model_outputs + eps), dim=-1)
+    )
 
-    # Calculate sum of probabilities for active classes: [B, T, 1]
-    p_step = torch.sum(model_outputs * mask, dim=-1, keepdim=True)
+    # Calculate required entropy gap to fill (only if model is more confident).
+    diff = torch.clamp(alpha * (h_model - h_target), min=0.0)
 
-    # Average confidence across time steps per batch: [B, 1, 1]
-    p_batch = torch.mean(p_step, dim=1, keepdim=True)
-
-    # Compute shared weight w for the entire sequence: [B, 1, 1]
-    w = alpha + (1.0 - alpha) * p_batch
-
-    # Bound the adaptive weight w.
-    w = torch.clamp(w, min = 0.0, max=1.0)
-
-    # Apply smoothing using batch-consistent weight w
+    # Maximum possible entropy (Uniform distribution).
     num_classes = estimated_targets.size(-1)
+    h_max = torch.log(torch.tensor(float(num_classes), device=estimated_targets.device))
+
+    # Calculate global smoothing weight 'w' based on the entropy gap.
+    # w=1 means no smoothing, w=0 means pure uniform distribution.
+    denom = torch.clamp(h_max - h_target, min=eps)
+    intensity = torch.clamp(diff / denom, max=1.0)
+
+    w = 1.0 - intensity
+    w = torch.clamp(w, min=0.9, max=1.0)
+
+    # Apply uniform smoothing across all samples and time steps.
     c_inv = 1.0 / num_classes
     smoothed_targets = (w * estimated_targets) + ((1.0 - w) * c_inv)
 
@@ -45,6 +59,34 @@ def adaptive_label_smoothing(
 
 
 def label_smoothing(
+    estimated_targets: torch.Tensor,
+    alpha: float,
+    eps: float = 1e-10,
+) -> torch.Tensor:
+    """Applies label smoothing only to active alignment indices.
+
+    Args:
+        estimated_targets: Target tensor of shape [..., C].
+        alpha: Smoothing coefficient (1.0 = no smoothing).
+        eps: Small value to avoid division by zero.
+
+    Returns:
+        A smoothed tensor of the same shape as input.
+    """
+    # Create mask for valid alignment paths: [B, T, C]
+    mask = (estimated_targets > eps).to(estimated_targets.dtype)
+
+    # Count active classes per timestep: [B, T, 1]
+    active_counts = mask.sum(dim=-1, keepdim=True)
+
+    # Distribute smoothing mass within active indices only
+    # Avoids putting probability on impossible tokens
+    uniform_restricted = mask / (active_counts + eps)
+
+    # Blend original targets with restricted uniform distribution
+    return (alpha * estimated_targets) + ((1.0 - alpha) * uniform_restricted)
+
+def label_smoothing_old(
     estimated_targets: torch.Tensor,
     alpha: float
 ) -> torch.Tensor:
