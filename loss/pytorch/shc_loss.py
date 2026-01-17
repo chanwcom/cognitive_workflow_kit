@@ -55,8 +55,7 @@ def shift_tensor_horizontally(
         raise ValueError("direction must be either 'left' or 'right'")
 
 
-def calculate_alpha_beta(label_trans_table, log_label_prob, label_len,
-                         logit_len, log_delta_prob):
+def calculate_alpha_beta(log_label_prob, label_len, logit_len, log_delta_prob):
     """Calculates the alpha and beta variables.
 
     This calculates the alpha and beta variables required for CTC computation.
@@ -65,8 +64,6 @@ def calculate_alpha_beta(label_trans_table, log_label_prob, label_len,
     TODO(chanwcom) Adds the paper link.
 
     Args:
-        label_trans_table: A tensor containing the transition tables.
-            The shape is (batch_size, max_label_seq_len, max_label_seq_len).
         log_label_prob: A tensor of posterior probabilities of each label.
             The shape is (batch_size, max_logit_len, max_label_len).
             Mathematically, it is given by the following equation:
@@ -180,3 +177,174 @@ def calculate_alpha_beta(label_trans_table, log_label_prob, label_len,
     return log_alpha, log_beta, log_seq_prob_final
 
 
+class ShcLoss(torch.autograd.Function):
+    """A class for calculating the CTC loss."""
+
+    @staticmethod
+    def forward(ctx,
+                labels,
+                labels_len,
+                logits,
+                logits_len,
+                label_type: LabelType = LabelType.CTC,
+                update_non_blank_token_index: bool = True,
+                threshold_type: ThresholdType = ThresholdType.NO_THRESHOLD,
+                threshold: float = 0.1,
+                processing_type: ProcessingType = ProcessingType.UNCHANGED):
+        """Calculates the Connectionist Temporal Classification (CTC) loss.
+
+        Args:
+            ctx: Contexts for this CtcLoss operation.
+            labels: A tensor containing batch of ground-truth label sequences.
+                Note that this label sequence should already include blank labels.
+                The shape is given by (batch_size, max_labels_len).
+            labels_len: The lengths of labels that has the shape of
+                (batch_size).
+            logits: The predicted "logit value". The shape is given by
+                (batch_size, max_logit_seq_len, num_classes).
+            logits_len: The len of logits that has the shape of (batch_size).
+
+        Note that zero values are assumed to be masked-values.
+
+        Returns:
+            A tuple containing (loss, grad)
+        """
+        # Checks whether the shape of labels is (B, L).
+        assert labels.dim() == 2
+
+        # Checks whether the shape of logits is (B, T, C)
+        assert logits.dim() == 3
+
+        # Checks the consistency of the batch size.
+        assert labels.shape[0] == logits.shape[0]
+
+        # Converting the sequences.
+        # Note that the following is only for HuggingFace case.
+        # In case of HuggingFace, the boundary blanks should be added and non
+        # -blank token indices should NOT be updated.
+
+        inputs = {}
+        inputs["SEQ_DATA"] = labels
+        inputs["SEQ_LEN"] = labels_len
+        if label_type == LabelType.CTC:
+            inputs = to_blank_augmented_labels(inputs, 0, True,
+                                               update_non_blank_token_index)
+            # TODO  TODO(chanwcom )The following is the correc one.
+            #inputs = to_blank_augmented_labels(inputs, 0, True, False)
+        elif (label_type == LabelType.SHC_TYPE_0
+              or label_type == LabelType.SHC_TYPE_1):
+            raise NotImplementedError
+            # How to find num_classes?
+            # It is not easy for Hugging face fine tuning.
+            #inputs =  to_onset_augmented_labels(inputs, num_classes)
+        else:
+            raise ValueEror("Unsupported label sequence format type.")
+        labels = inputs["SEQ_DATA"]
+        labels_len = inputs["SEQ_LEN"]
+
+        log_label_prob = calculate_log_label_prob(
+            labels, torch.softmax(logits, dim=-1))
+
+        # Alpha and beta should be calculated.
+        log_alpha, log_beta, log_seq_prob = calculate_alpha_beta(
+            log_label_prob, labels_len, logits_len)
+
+        # "gamma" is the posterior probability of the alignment variable $q_t$.
+        #
+        # The "alignment variable" $q_t$ is a random variable representing
+        # the distribution  of the label sequcne index $l$ at time $t$.
+        #
+        # gamma is defined by:
+        #   p(\mathbf{q_t} = l | \mathbbm{x}, \mathbbm{y}).
+        #
+        # gamma can be expressed in terms of \alpha and \beta as follows:
+        #   gamma_{t, l} = sum_{l \in {l | q_t = l}} \alpha_{t, l} \beta{t, l}
+        #                / sum_{l=0^L-1} \alpha_{t, l} \beta{t, l}.
+        #
+        # log_gamma is defined as follows:
+        #   log p(q_t = l| x, y) where t is the temporal index, and l is the
+        # blank-augmented label sequence index.
+        # The shape of log_gamma is (batch_size, max_logits_len, max_label_len).
+        log_gamma = log_alpha + log_beta
+        log_gamma = log_gamma - torch.logsumexp(
+            log_gamma, axis=2, keepdim=True)
+
+        # To ignore an invalid loss case.
+        #
+        # If labels_len < logits_len, then the loss is not valid.
+        invalid_length_mask = (torch.greater_equal(
+            logits_len, labels_len)).type(torch.float32)
+
+        loss = -torch.multiply(log_seq_prob, invalid_length_mask)
+
+        max_label_len = torch.max(labels_len)
+        num_classes = logits.shape[2]
+        log_ground_truth_prob = torch.ones_like(logits,
+                                                dtype=torch.float32) * LOG_0
+
+        # Calculates an estimated time-aligned ground-truth sequence.
+        #
+        # log_ground_truth_prob is \tilde{\mathbbm{y}_t}.
+        #
+        # Update is done for each label to reduce memory requirement.
+        # TODO(chanwcom)Is it really true?
+        # Check with real codes.
+        for l in range(max_label_len):
+            onehot = (1.0 - (torch.nn.functional.one_hot(
+                labels[:, l], num_classes))) * LOG_0
+
+            # For specific "l", multiply gamma_{t, l} with one_hot(c_l).
+            #
+            # For each example in a batch, it becomes a vector where the
+            # c_l element has the value of gamma{t, l}.
+            # Note that c_l is "j", which is the class index.
+            # Since logarithm is used, multiplictaion is changed with addition.
+            updates = (torch.unsqueeze(log_gamma[:, :, l], axis=2) +
+                       torch.unsqueeze(onehot, axis=1))
+            log_ground_truth_prob = torch.logaddexp(log_ground_truth_prob,
+                                                    updates)
+
+        ground_truth_prob = torch.exp(log_ground_truth_prob)
+
+        if threshold_type != ThresholdType.NO_THRESHOLD:
+            if processing_type == ProcessingType.UNIFORM:
+                uniform_flag = True
+            else:
+                uniform_flag = False
+
+            ground_truth_prob, flag = apply_postprocessing(
+                ground_truth_prob, logits_len, threshold_type, threshold,
+                uniform_flag)
+
+        gradient = -(ground_truth_prob - torch.softmax(logits, dim=2))
+
+        if (threshold_type != ThresholdType.NO_THRESHOLD
+                and processing_type == ProcessingType.ZERO):
+
+            gradient = torch.multiply(gradient, flag)
+
+        # To ignore an invalid loss case.
+        #
+        # If labels_len < logits_len, then the loss is not valid.
+        invalid_length_mask = (torch.greater_equal(
+            logits_len, labels_len)).type(torch.float32)
+        gradient = torch.multiply(
+            gradient, torch.reshape(invalid_length_mask, (-1, 1, 1)))
+
+        # Seqeunce mask
+        seq_mask = sequence_mask(logits_len,
+                                 maxlen=torch.max(logits_len))
+
+        # The dimension of "gradient" is (batch_size, logit_len, num_classes)
+        gradient = torch.multiply(gradient, torch.unsqueeze(seq_mask, axis=2))
+
+        ctx.save_for_backward(gradient)
+
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad):
+        gradient, = ctx.saved_tensors
+        gradient = torch.multiply(gradient, torch.reshape(grad, (-1, 1, 1)))
+
+        return None, None, gradient, None, None, None, None, None, None

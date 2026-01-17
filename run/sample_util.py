@@ -1,6 +1,6 @@
 # pylint: disable=import-error, no-member
 from __future__ import (absolute_import, division, print_function,
-                         unicode_literals)
+                        unicode_literals)
 
 __author__ = "Chanwoo Kim(chanwcom@gmail.com)"
 
@@ -8,69 +8,100 @@ __author__ = "Chanwoo Kim(chanwcom@gmail.com)"
 import glob
 import io
 import os
-from typing import Dict
+from typing import Dict, Any, Optional, Union
 
 # Third-party imports
+import sentencepiece as spm
 import torchaudio
 import webdataset as wds
 from transformers import AutoProcessor
 
-# Define processor globally (assumed to be initialized elsewhere in actual code)
+# Define processor globally
 processor = AutoProcessor.from_pretrained("facebook/wav2vec2-base")
 
-def preprocess_sample(sample: Dict, do_tokenization: bool=True) -> Dict:
+
+def preprocess_sample(
+    sample: Dict[str, Any],
+    do_tokenization: bool = True,
+    tokenizer_obj: Optional[Union[spm.SentencePieceProcessor, Any]] = None
+) -> Dict[str, Any]:
     """Preprocess a single raw sample from the WebDataset.
 
     This function loads the waveform from the raw bytes using torchaudio,
     extracts features using the processor's feature extractor, and tokenizes
     the transcript text.
-
+ 
     Args:
-        sample (Dict): A dictionary containing keys 'wav' (raw audio bytes)
-            and 'txt' (transcript bytes).
+        sample: Dictionary containing 'audio' (bytes) and 'text'.
+        do_tokenization: Whether to convert text to token IDs.
+        tokenizer_obj: Optional tokenizer (SentencePiece or HF). If None,
+            uses the global processor.tokenizer.
 
     Returns:
-        Dict: A dictionary with keys:
+        Dict with 'input_values' (audio features) and 'labels' (token IDs).            
             - 'input_values': processed audio feature tensor.
             - 'labels': list of token IDs corresponding to the transcript.
+ 
     """
+    # Load waveform from raw bytes using torchaudio
     waveform, sample_rate = torchaudio.load(io.BytesIO(sample["audio"]))
     input_values = processor.feature_extractor(
         waveform[0], sampling_rate=sample_rate
     ).input_values[0]
 
-    # Processes text to handle both bytes and a string.
-    if isinstance(sample["text"], bytes):
-        text = sample["text"].decode("utf-8").strip()
+    # Handle text decoding from bytes or string
+    text = sample["text"]
+    if isinstance(text, bytes):
+        text = text.decode("utf-8").strip()
     else:
-        text = sample["text"].strip()
+        text = text.strip()
 
+    # Tokenize text using the provided tokenizer or default processor
     if do_tokenization:
-        labels = processor.tokenizer(text).input_ids
+        if tokenizer_obj is None:
+            labels = processor.tokenizer(text).input_ids
+        elif isinstance(tokenizer_obj, spm.SentencePieceProcessor):
+            # SentencePiece encoding returns a list of integers
+            labels = tokenizer_obj.encode(text, out_type=int)
+        else:
+            labels = tokenizer_obj(text).input_ids
     else:
         labels = text
 
     return {"input_values": input_values, "labels": labels}
 
 
-def make_dataset(data_dir: str, do_tokenization: bool=True) -> wds.WebDataset:
-    """Create a WebDataset pipeline that loads and preprocesses data shards.
-
+def make_dataset(
+    data_dir: str,
+    do_tokenization: bool = True,
+    spm_model_path: Optional[str] = None
+) -> wds.WebDataset:
+    """Create a WebDataset pipeline with optional SentencePiece support.
     It reads all shards named 'shard-*.tar' in the given directory,
     extracts 'wav' and 'txt' entries as tuples, converts them into dictionaries,
     and applies the preprocessing function.
 
+
     Args:
-        data_dir (str): Path to the directory containing dataset shards.
+        data_dir: Path to directory containing 'shard-*.tar'.
+        do_tokenization: Whether to apply tokenization during mapping.
+        spm_model_path: Path to the SentencePiece *.model file.
 
     Returns:
-        wds.WebDataset: The prepared dataset pipeline with preprocessing.
+        A prepared WebDataset pipeline.
     """
+    # Initialize SentencePiece processor if a model path is provided
+    tokenizer_obj = None
+    if spm_model_path:
+        tokenizer_obj = spm.SentencePieceProcessor()
+        tokenizer_obj.load(spm_model_path)
+
+    # Define the pipeline: load -> decode -> structure -> preprocess
     dataset = (
         wds.WebDataset(glob.glob(os.path.join(data_dir, "shard-*.tar")))
-            .decode(wds.torch_audio)
-            .to_tuple("audio", "text", "meta")
-            .map(lambda sample: {"audio": sample[0], "text": sample[1], "meta": sample[2]})
-            .map(lambda inputs: preprocess_sample(inputs, do_tokenization))
+        .decode(wds.torch_audio)
+        .to_tuple("audio", "text", "meta")
+        .map(lambda x: {"audio": x[0], "text": x[1], "meta": x[2]})
+        .map(lambda x: preprocess_sample(x, do_tokenization, tokenizer_obj))
     )
     return dataset
