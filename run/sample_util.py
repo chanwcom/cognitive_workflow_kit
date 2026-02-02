@@ -49,12 +49,21 @@ def preprocess_sample(
         waveform[0], sampling_rate=sample_rate
     ).input_values[0]
 
+
     # Handle text decoding from bytes or string
     text = sample["text"]
+    # Hack
+    # TODO(chanwcom)
+    # Need to make the following changes:
+    # 1. Prepends and appends <s> and </s> only when those are required as options.
+    # 2. Even if this option is enabled, check whether <s> and </s> are already
+    #     there, and in this case, do not pre-pend or append.
+    text = f"<s> {text} </s>"
     if isinstance(text, bytes):
         text = text.decode("utf-8").strip()
     else:
         text = text.strip()
+
 
     # Tokenize text using the provided tokenizer or default processor
     if do_tokenization:
@@ -92,6 +101,7 @@ def make_dataset(
     """
     # Initialize SentencePiece processor if a model path is provided
     tokenizer_obj = None
+
     if spm_model_path:
         tokenizer_obj = spm.SentencePieceProcessor()
         tokenizer_obj.load(spm_model_path)
