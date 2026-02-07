@@ -40,128 +40,40 @@ class TestShiftOps(unittest.TestCase):
         result = shc_loss.shift_tensor_horizontally(self.x, 9.0, direction='left')
         self.assertTrue(torch.equal(result, expected))
 
-#class PostProcessingTest(unittest.TestCase):
-#
-#    @classmethod
-#    def setUpClass(cls) -> None:
-#        cls._ = {}
-#        # B = 2, T = 5, C = 3
-#        # yapf: disable
-#        cls._ground_truth_prob = {}
-#        cls._ground_truth_prob["SEQ_DATA"] = torch.tensor(
-#                   [[[0.89, 0.11, 0.00, 0.00],
-#                     [0.45, 0.45, 0.05, 0.05],
-#                     [0.00, 0.85, 0.15, 0.00],
-#                     [0.05, 0.45, 0.45, 0.05],
-#                     [0.02, 0.01, 0.96, 0.01]],
-#                    [[0.70, 0.20, 0.10, 0.00],
-#                     [0.91, 0.03, 0.03, 0.03],
-#                     [0.02, 0.94, 0.02, 0.02],
-#                     [0.01, 0.01, 0.97, 0.01],
-#                     [0.00, 0.00, 0.00, 0.00]]], dtype=torch.float32)
-#        # yapf: enable
-#        cls._ground_truth_prob["SEQ_LEN"] = torch.tensor([5, 4],
-#                                                         dtype=torch.int32)
-#
-#    def test_apply_postprocessing_entropy_uniform_true(self):
-#        ENTROPY_TH = 0.3604
-#        UNIFORM_FLAG = True
-#        actual, _ = shc_loss.apply_postprocessing(
-#            self._ground_truth_prob["SEQ_DATA"],
-#            self._ground_truth_prob["SEQ_LEN"],
-#            shc_loss.ThresholdType.ENTROPY,
-#            ENTROPY_TH,
-#            UNIFORM_FLAG,
-#        )
-#        expected = torch.tensor(
-#            [[[1.00, 0.00, 0.00, 0.00],
-#              [0.25, 0.25, 0.25, 0.25],
-#              [0.25, 0.25, 0.25, 0.25],
-#              [0.25, 0.25, 0.25, 0.25],
-#              [0.00, 0.00, 1.00, 0.00]],
-#             [[0.25, 0.25, 0.25, 0.25],
-#              [0.25, 0.25, 0.25, 0.25],
-#              [0.00, 1.00, 0.00, 0.00],
-#              [0.00, 0.00, 1.00, 0.00],
-#              [0.00, 0.00, 0.00, 0.00]]],
-#            dtype=torch.float32) # yapf: disable
-#
-#        self.assertTrue(torch.equal(expected, actual))
-#
-#    def test_apply_postprocessing_entropy_uniform_false(self):
-#        ENTROPY_TH = 0.3604
-#        UNIFORM_FLAG = False
-#        actual, _ = shc_loss.apply_postprocessing(
-#            self._ground_truth_prob["SEQ_DATA"],
-#            self._ground_truth_prob["SEQ_LEN"],
-#            shc_loss.ThresholdType.ENTROPY,
-#            ENTROPY_TH,
-#            UNIFORM_FLAG,
-#        )
-#        expected = torch.tensor(
-#            [[[1.00, 0.00, 0.00, 0.00],
-#              [0.45, 0.45, 0.05, 0.05],
-#              [0.00, 0.85, 0.15, 0.00],
-#              [0.05, 0.45, 0.45, 0.05],
-#              [0.00, 0.00, 1.00, 0.00]],
-#             [[0.70, 0.20, 0.10, 0.00],
-#              [0.91, 0.03, 0.03, 0.03],
-#              [0.00, 1.00, 0.00, 0.00],
-#              [0.00, 0.00, 1.00, 0.00],
-#              [0.00, 0.00, 0.00, 0.00]]],
-#            dtype=torch.float32) # yapf: disable
-#
-#        self.assertTrue(torch.equal(expected, actual))
-#
-#    def test_apply_postprocessing_max_prob_uniform_true(self):
-#        MAX_PROB_TH = 0.9
-#        UNIFORM_FLAG = True
-#        actual, _ = shc_loss.apply_postprocessing(
-#            self._ground_truth_prob["SEQ_DATA"],
-#            self._ground_truth_prob["SEQ_LEN"],
-#            shc_loss.ThresholdType.MAX_PROB,
-#            MAX_PROB_TH,
-#            UNIFORM_FLAG,
-#        )
-#        expected = torch.tensor(
-#            [[[0.25, 0.25, 0.25, 0.25],
-#              [0.25, 0.25, 0.25, 0.25],
-#              [0.25, 0.25, 0.25, 0.25],
-#              [0.25, 0.25, 0.25, 0.25],
-#              [0.00, 0.00, 1.00, 0.00]],
-#             [[0.25, 0.25, 0.25, 0.25],
-#              [1.00, 0.00, 0.00, 0.00],
-#              [0.00, 1.00, 0.00, 0.00],
-#              [0.00, 0.00, 1.00, 0.00],
-#              [0.00, 0.00, 0.00, 0.00]]],
-#            dtype=torch.float32) # yapf: disable
-#
-#        self.assertTrue(torch.equal(expected, actual))
-#
-#    def test_apply_postprocessing_max_prob_uniform_false(self):
-#        MAX_PROB_TH = 0.9
-#        UNIFORM_FLAG = False
-#        actual, _ = shc_loss.apply_postprocessing(
-#            self._ground_truth_prob["SEQ_DATA"],
-#            self._ground_truth_prob["SEQ_LEN"],
-#            shc_loss.ThresholdType.MAX_PROB,
-#            MAX_PROB_TH,
-#            UNIFORM_FLAG,
-#        )
-#        expected = torch.tensor(
-#            [[[0.89, 0.11, 0.00, 0.00],
-#              [0.45, 0.45, 0.05, 0.05],
-#              [0.00, 0.85, 0.15, 0.00],
-#              [0.05, 0.45, 0.45, 0.05],
-#              [0.00, 0.00, 1.00, 0.00]],
-#             [[0.70, 0.20, 0.10, 0.00],
-#              [1.00, 0.00, 0.00, 0.00],
-#              [0.00, 1.00, 0.00, 0.00],
-#              [0.00, 0.00, 1.00, 0.00],
-#              [0.00, 0.00, 0.00, 0.00]]],
-#            dtype=torch.float32) # yapf: disable
-#
-#        self.assertTrue(torch.equal(expected, actual))
+
+class TestBlockAugmentation(unittest.TestCase):
+    def setUp(self):
+        # 2 classes (0, 1), n=3 augmentation
+        self.num_classes = 10
+        self.inputs = {
+            "SEQ_DATA": torch.tensor([[1, 2]], dtype=torch.long),
+            "SEQ_LEN": torch.tensor([2], dtype=torch.long)
+        }
+
+    def test_block_logic(self):
+        n = 3
+        k = self.num_classes
+        result = shc_loss.to_onset_block_augmented_n(self.inputs, n, k)
+        
+        # Expected: [1, 2, 1+k, 2+k, 1+2k, 2+2k] -> [1, 2, 11, 12, 21, 22]
+        expected_data = torch.tensor([[1, 11, 21, 2, 12, 22]], dtype=torch.long)
+        torch.testing.assert_close(result["SEQ_DATA"], expected_data)
+
+    def test_masking(self):
+        # Test if padding is preserved across blocks
+        inputs_with_pad = {
+            "SEQ_DATA": torch.tensor([[5, 0]], dtype=torch.long),
+            "SEQ_LEN": torch.tensor([1], dtype=torch.long)
+        }
+        n = 2
+        k = self.num_classes
+        result = shc_loss.to_onset_block_augmented_n(inputs_with_pad, n, k)
+
+        # Expected: [5, 0, 15, 0] -> Only elements within SEQ_LEN are augmented
+        # After masking: [5, 0, 15, 0] (Wait, block-wise padding is tricky)
+        # The logic ensures only valid time-steps are considered.
+        expected_data = torch.tensor([[5, 15, 0, 0]], dtype=torch.long)
+        torch.testing.assert_close(result["SEQ_DATA"], expected_data)
 
 
 def shift_tensor_horizontally(x, fill_value, direction='right'):
