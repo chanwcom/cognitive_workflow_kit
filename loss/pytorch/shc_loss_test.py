@@ -41,6 +41,47 @@ class TestShiftOps(unittest.TestCase):
         self.assertTrue(torch.equal(result, expected))
 
 
+
+
+class TestTransTable(unittest.TestCase):
+    """Unit tests for create_trans_table with sub_label_factor."""
+
+    def setUp(self):
+        self.batch_size = 2
+        self.max_len = 12
+        self.labels = torch.zeros((self.batch_size, self.max_len))
+        self.labels_len = torch.tensor([self.max_len, self.max_len])
+
+    def test_factor_2(self):
+        """Tests if factor 2 allows skipping odd-indexed elements."""
+        factor = 2
+        table = shc_loss.create_trans_table(self.labels, self.labels_len, factor)[0]
+        # Skipped element (i+1) should be 1, 3, 5... (2n-1)
+        # So i should be 0, 2, 4...
+        self.assertEqual(table[0, 2], 0)  # 1 skipped
+        self.assertEqual(table[2, 4], 0)  # 3 skipped
+        self.assertEqual(table[1, 3], shc_loss.LOG_0)  # 2 is not (2n-1)
+
+    def test_factor_4(self):
+        """Tests if factor 4 allows skipping (4n-1) indexed elements."""
+        factor = 4
+        table = shc_loss.create_trans_table(self.labels, self.labels_len, factor)[0]
+        # Skipped element (i+1) should be 3, 7, 11... (4n-1)
+        # So i should be 2, 6, 10...
+        self.assertEqual(table[2, 4], 0)  # 3 skipped
+        self.assertEqual(table[6, 8], 0)  # 7 skipped
+        self.assertEqual(table[0, 2], shc_loss.LOG_0)  # 1 is not (4n-1)
+        self.assertEqual(table[4, 6], shc_loss.LOG_0)  # 5 is not (4n-1)
+
+    def test_self_loops(self):
+        """Tests if self-loops are only allowed on odd indices."""
+        table = shc_loss.create_trans_table(self.labels, self.labels_len, 2)[0]
+        self.assertEqual(table[1, 1], 0)
+        self.assertEqual(table[3, 3], 0)
+        self.assertEqual(table[0, 0], shc_loss.LOG_0)
+        self.assertEqual(table[2, 2], shc_loss.LOG_0)
+
+
 class TestBlockAugmentation(unittest.TestCase):
     def setUp(self):
         # 2 classes (0, 1), n=3 augmentation
