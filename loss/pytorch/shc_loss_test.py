@@ -55,7 +55,7 @@ class TestTransTable(unittest.TestCase):
     def test_factor_2(self):
         """Tests if factor 2 allows skipping odd-indexed elements."""
         factor = 2
-        table = shc_loss.create_trans_table(self.labels, self.labels_len, factor)[0]
+        table = shc_loss.create_trans_table(self.labels_len, factor)[0]
         # Skipped element (i+1) should be 1, 3, 5... (2n-1)
         # So i should be 0, 2, 4...
         self.assertEqual(table[0, 2], 0)  # 1 skipped
@@ -65,7 +65,7 @@ class TestTransTable(unittest.TestCase):
     def test_factor_4(self):
         """Tests if factor 4 allows skipping (4n-1) indexed elements."""
         factor = 4
-        table = shc_loss.create_trans_table(self.labels, self.labels_len, factor)[0]
+        table = shc_loss.create_trans_table(self.labels_len, factor)[0]
         # Skipped element (i+1) should be 3, 7, 11... (4n-1)
         # So i should be 2, 6, 10...
         self.assertEqual(table[2, 4], 0)  # 3 skipped
@@ -74,12 +74,12 @@ class TestTransTable(unittest.TestCase):
         self.assertEqual(table[4, 6], shc_loss.LOG_0)  # 5 is not (4n-1)
 
     def test_self_loops(self):
-        """Tests if self-loops are only allowed on odd indices."""
-        table = shc_loss.create_trans_table(self.labels, self.labels_len, 2)[0]
+        """Tests if self-loops are allowed."""
+        table = shc_loss.create_trans_table(self.labels_len, 2)[0]
+        self.assertEqual(table[0, 0], 0)
         self.assertEqual(table[1, 1], 0)
         self.assertEqual(table[3, 3], 0)
-        self.assertEqual(table[0, 0], shc_loss.LOG_0)
-        self.assertEqual(table[2, 2], shc_loss.LOG_0)
+        self.assertEqual(table[2, 2], 0)
 
 
 class TestBlockAugmentation(unittest.TestCase):
@@ -131,29 +131,29 @@ class TestAlphaBetaStability(unittest.TestCase):
 
     def setUp(self):
         """Sets up dimensions and tensors for testing."""
-        self.B, self.T, self.L = 3, 6, 5
+        self.B, self.T, self.L = 3, 10, 9
         self.device = torch.device('cpu')
-
 
         # Fixed random seed for reproducibility
         np.random.seed(42)
         torch.manual_seed(42)
 
-
         self.log_target_probs = torch.log_softmax(
             torch.randn(self.B, self.T, self.L), dim=-1)
-        self.log_delta_probs = torch.log(torch.rand(self.B, self.T))
 
-        self.logit_lens = torch.tensor([6, 5, 4])
-        self.target_lens = torch.tensor([5, 5, 3])
-
+        self.logit_lens = torch.tensor([10, 8, 6])
+        self.target_lens = torch.tensor([9, 6, 3])
+        self.sub_label_factor = 3
+        self.trans_table = shc_loss.create_trans_table(
+            self.target_lens, self.sub_label_factor)
 
     def test_forward_backward_consistency(self):
         """Checks if log_prob(total) is consistent across all time steps."""
+
         # 1. Run the forward-backward (Assuming your function is defined)
         log_alpha, log_beta, _ = shc_loss.calculate_alpha_beta(
-            self.log_target_probs, self.target_lens, self.logit_lens,
-            self.log_delta_probs, False)
+            self.log_target_probs, self.target_lens, self.logit_lens, False,
+            self.trans_table)
 
         for b in range(self.B):
             valid_t = self.logit_lens[b]
@@ -176,7 +176,7 @@ class TestAlphaBetaStability(unittest.TestCase):
         """Ensures that padded regions remain LOG_0 using tensor operations."""
         log_alpha, _, _ = shc_loss.calculate_alpha_beta(
             self.log_target_probs, self.target_lens, self.logit_lens,
-            self.log_delta_probs)
+            False, self.trans_table)
 
         # Create a mask for padded time steps (B, T)
         t_indices = torch.arange(self.T, device=self.device).expand(self.B, -1)
