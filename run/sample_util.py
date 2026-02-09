@@ -52,13 +52,6 @@ def preprocess_sample(
 
     # Handle text decoding from bytes or string
     text = sample["text"]
-    # Hack
-    # TODO(chanwcom)
-    # Need to make the following changes:
-    # 1. Prepends and appends <s> and </s> only when those are required as options.
-    # 2. Even if this option is enabled, check whether <s> and </s> are already
-    #     there, and in this case, do not pre-pend or append.
-    text = f"<s> {text} </s>"
     if isinstance(text, bytes):
         text = text.decode("utf-8").strip()
     else:
@@ -68,10 +61,18 @@ def preprocess_sample(
     # Tokenize text using the provided tokenizer or default processor
     if do_tokenization:
         if tokenizer_obj is None:
+            # Hack
+            # TODO(chanwcom)
+            # Need to make the following changes:
+            # 1. Prepends and appends <s> and </s> only when those are required as options.
+            # 2. Even if this option is enabled, check whether <s> and </s> are already
+            #     there, and in this case, do not pre-pend or append.
+            text = f"<s> {text} </s>"
             labels = processor.tokenizer(text).input_ids
         elif isinstance(tokenizer_obj, spm.SentencePieceProcessor):
             # SentencePiece encoding returns a list of integers
-            labels = tokenizer_obj.encode(text, out_type=int)
+            labels = tokenizer_obj.encode(
+                text, add_bos=True, add_eos=True, out_type=int)
         else:
             labels = tokenizer_obj(text).input_ids
     else:
