@@ -20,9 +20,7 @@ from cwk.loss.pytorch import seq_loss_util
 # TODO(chanwcom) Replace with this one. But unit tests need to be updated.
 #LOG_00 = torch.tensor(np.log(np.finfo(np.float64).tiny).astype(np.float32))
 
-#EPS = torch.finfo(torch.float32).tiny
-EPS = 0
-#LOG_0 = torch.log(torch.tensor(EPS))
+EPS = 1e-5
 
 # Approximate log(0) to prevent underflow 
 #
@@ -38,7 +36,7 @@ LOG_0 = -706.893623  # float(np.log(1e-307))
 def enforce_log_zero(
     tensor: torch.Tensor,
     log_zero: float = LOG_0,
-    tol: float = 1e-5,
+    tol: float = EPS,
 ) -> torch.Tensor:
     """Enforces exact numerical flooring for log-space zero values.
 
@@ -477,10 +475,20 @@ def calculate_alpha_beta(trans_mask, log_target_probs, target_lens,
     for t_f in range(1, max_logit_len_int):
         # Forward pass.
         # Trans table broadcast: [B, L, 1] + [B, L, L] -> [B, L, L]
+
+        # NOTE: Why scaling drift (e.g., 0.5 * LOG_0) does not distort logsumexp:
+        # Under logsumexp, tensor values act as exponents in domain e^x. Both LOG_0 (-706.89) 
+        # and drifted values like 0.5 * LOG_0 (-353.44) evaluate to ~0 in probability space 
+        # (1e-307 and 1e-154 respectively), resulting in zero numerical impact after reduction.
+        # Post-logsumexp values remain well within the tolerance of enforce_log_zero().
         log_alpha[:, t_f, :] = (
             torch.logsumexp(
             log_alpha[:, t_f - 1, :].unsqueeze(2) + trans_mask, dim=1) +
             log_target_probs[:, t_f, :])
+
+        # Enforce exact LOG_0 flooring to prevent floating-point drift 
+        # from accumulating across sequential recurrent updates.
+        log_alpha[:, t_f, :] = enforce_log_zero(log_alpha[:, t_f, :])
 
         # Backward Pass: Calculates log_beta recursively.
         # t_b is the time index from the last time step to the first one.
@@ -493,6 +501,9 @@ def calculate_alpha_beta(trans_mask, log_target_probs, target_lens,
         log_beta[:, t_b, :] = ((log_beta[:, t_b, :] * current_mask) +
                              (initial_log_beta * (1.0 - current_mask)))
 
+        # Enforce exact LOG_0 flooring for backward trellis states.
+        log_beta[:, t_b, :] = enforce_log_zero(log_beta[:, t_b, :])
+
     # Final Sequence Masking: Vectorized masking outside the loop.
     label_mask = seq_loss_util.sequence_mask(
         target_lens, int(max_target_len)).unsqueeze(1).to(dtype)
@@ -500,6 +511,11 @@ def calculate_alpha_beta(trans_mask, log_target_probs, target_lens,
     final_valid_mask = time_mask * label_mask  # Shape: [B, T, L]
     log_alpha = torch.where(final_valid_mask == 1.0, log_alpha, LOG_0)
     log_beta = torch.where(final_valid_mask == 1.0, log_beta, LOG_0)
+
+    # Enforce exact LOG_0 flooring to clean up padding regions and 
+    # eliminate any residual floating-point drift prior to returning.
+    log_alpha = enforce_log_zero(log_alpha)
+    log_beta = enforce_log_zero(log_beta)
 
     log_seq_prob_final = log_alpha[
         batch_indices, logit_lens -1,  target_lens - 1]
@@ -588,10 +604,6 @@ class ShcLoss(torch.autograd.Function):
         log_alpha, log_beta, log_seq_prob,  = calculate_alpha_beta(
             trans_table, log_target_probs, target_lens, logits_len)
 
-
-        log_alpha = torch.clamp(log_alpha, min=LOG_0)
-        log_beta = torch.clamp(log_beta, min=LOG_0)
-
         # "gamma" is the posterior probability of the alignment variable $q_t$.
         #
         # The "alignment variable" $q_t$ is a random variable representing
@@ -609,6 +621,10 @@ class ShcLoss(torch.autograd.Function):
         # blank-augmented label sequence index.
         # The shape of log_gamma is (batch_size, max_logits_len, max_target_len).
         log_gamma = log_alpha + log_beta
+
+        # Obtains the zero mask.
+        zero_prob_mask = (log_gamma <= LOG_0 + EPS) 
+
         log_gamma = log_gamma - torch.logsumexp(log_gamma, axis=2, keepdim=True)
 
 
@@ -632,8 +648,6 @@ class ShcLoss(torch.autograd.Function):
         # --- (여기서부터 교체 시작) ---
         # 1. log_gamma를 확률 도메인으로 변환 (B, T, L)
         gamma = torch.exp(log_gamma)
-
-        import pdb; pdb.set_trace()
 
         # 2. 결과 저장용 텐서 초기화 (B, T, C)
         # C가 작으므로(32~128) 메모리 부담이 거의 없음
