@@ -24,8 +24,53 @@ from cwk.loss.pytorch import seq_loss_util
 EPS = 0
 #LOG_0 = torch.log(torch.tensor(EPS))
 
+# Approximate log(0) to prevent underflow 
+#
+# This value corresponds to the lower limit of float precision (~1e-307).
+#
+# The other options may be follows:
+# LOG_0 = torch.log(torch.tensor(EPS))
+# LOG_0 = torch.tensor(np.log(np.finfo(np.float64).tiny).astype(np.float32))
+#
+# However, it is better to use a fixed value rather than a value depending on system or configurations.
 LOG_0 = -706.893623  # float(np.log(1e-307))
 
+def enforce_log_zero(
+    tensor: torch.Tensor,
+    log_zero: float = LOG_0,
+    tol: float = 1e-5,
+) -> torch.Tensor:
+    """Enforces exact numerical flooring for log-space zero values.
+
+    During log-domain arithmetic (e.g., log-space matrix multiplications,
+    additions, or recurrent forward-backward updates), floating-point rounding
+    errors can cause values that represent exact zeros (represented by
+    `LOG_0`) to drift slightly (e.g., `LOG_0 - 1e-6` or `LOG_0 + 1e-6`). 
+    This function detects values near or below `LOG_0` within a specified 
+    tolerance and forces them to the exact `LOG_0` constant to preserve 
+    numerical stability and ensure accurate conditional masking.
+
+    Use Cases:
+        - Post-processing sequence modeling variables (such as CTC alpha/beta 
+          trellis states) to prevent precision drift from accumulating across 
+          time-step iterations.
+        - Cleaning up tensors prior to logical comparisons or downstream 
+          log-sum-exp reductions where exact boundary matching is required.
+
+    Args:
+        tensor (torch.Tensor): The input tensor containing log-probabilities 
+            or log-domain accumulation values.
+        log_zero (float, optional): The constant value representing log(0). 
+            Defaults to `LOG_0`.
+        tol (float, optional): The tolerance threshold to account for 
+            floating-point drift around `log_zero`. Defaults to `1e-5`.
+
+    Returns:
+        torch.Tensor: The modified tensor with drifted log-zero values 
+            strictly floored and replaced by the exact `log_zero` constant.
+    """
+    is_log_zero = tensor <= (log_zero + tol)
+    return torch.where(is_log_zero, log_zero, tensor)
 
 def create_trans_allowance_table_shc(
     token_seq, boundary_token_id, blank_token_id, log_0=-1e10
@@ -543,6 +588,10 @@ class ShcLoss(torch.autograd.Function):
         log_alpha, log_beta, log_seq_prob,  = calculate_alpha_beta(
             trans_table, log_target_probs, target_lens, logits_len)
 
+
+        log_alpha = torch.clamp(log_alpha, min=LOG_0)
+        log_beta = torch.clamp(log_beta, min=LOG_0)
+
         # "gamma" is the posterior probability of the alignment variable $q_t$.
         #
         # The "alignment variable" $q_t$ is a random variable representing
@@ -562,6 +611,7 @@ class ShcLoss(torch.autograd.Function):
         log_gamma = log_alpha + log_beta
         log_gamma = log_gamma - torch.logsumexp(log_gamma, axis=2, keepdim=True)
 
+
         # To ignore an invalid loss case.
         #
         # If target_lens < logits_len, then the loss is not valid.
@@ -578,31 +628,12 @@ class ShcLoss(torch.autograd.Function):
 
         max_target_len = torch.max(target_lens)
         num_classes = logits.shape[2]
-        log_ground_truth_prob = torch.full_like(logits, fill_value=LOG_0)
-        # Calculates an estimated time-aligned ground-truth sequence.
-        #
-        # log_ground_truth_prob is \tilde{\mathbbm{y}_t}.
-        #
-        # Update is done for each label to reduce memory requirement.
-        # TODO(chanwcom)Is it really true?
-        # Check with real codes.
-        if 0:
-            for l in range(max_target_len):# 1. one_hot 생성 후 즉시 타입 변환 및 메모리 정렬
-                onehot = (1.0 - (torch.nn.functional.one_hot(
-                    clamped_labels[:, l], num_classes).to(dtype=dtype))) * LOG_0
-                # For specific "l", multiply gamma_{t, l} with one_hot(c_l).
-                #
-                # For each example in a batch, it becomes a vector where the
-                # c_l element has the value of gamma{t, l}.
-                # Note that c_l is "j", which is the class index.
-                # Since logarithm is used, multiplictaion is changed with addition.
-                updates = (torch.unsqueeze(log_gamma[:, :, l], axis=2) +
-                           torch.unsqueeze(onehot, axis=1))
-                log_ground_truth_prob = torch.logaddexp(log_ground_truth_prob,
-                                                        updates)
+
         # --- (여기서부터 교체 시작) ---
         # 1. log_gamma를 확률 도메인으로 변환 (B, T, L)
         gamma = torch.exp(log_gamma)
+
+        import pdb; pdb.set_trace()
 
         # 2. 결과 저장용 텐서 초기화 (B, T, C)
         # C가 작으므로(32~128) 메모리 부담이 거의 없음
