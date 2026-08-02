@@ -17,13 +17,14 @@ import evaluate
 import numpy as np
 
 # Custom imports
-import sample_util
+from run import sample_util
+from loss.pytorch import seq_loss_util
 
 db_top_dir = "/mnt/data/database"
-train_top_dir = os.path.join(db_top_dir, "stop_music/music_train")
-test_top_dir = os.path.join(db_top_dir, "stop_music/music_test0")
+train_top_dir = os.path.join(db_top_dir, "libri_light/1h")
+test_top_dir = os.path.join(
+    db_top_dir, "libri_speech_webdataset_new_oct_2025/test-clean")
 processor = AutoProcessor.from_pretrained("facebook/wav2vec2-base")
-output_dir = "/mnt/data/home/chanwcom/experiment/wav2vec2_stop_model_final"
 
 train_dataset = sample_util.make_dataset(train_top_dir)
 test_dataset = sample_util.make_dataset(test_top_dir)
@@ -93,26 +94,25 @@ class DataCollatorCTCWithPadding:
             - "input_values": Padded input audio feature tensor.
             - "labels": Padded label tensor with padding tokens replaced by -100.
         """
-        # Separates the input audio features and label sequences from the batch.
+        # Separate the input audio features and label sequences from the batch.
         input_features = [{"input_values": feature["input_values"]} for feature in features]
-
         label_features = [{"input_ids": feature["labels"]} for feature in features]
 
-        # Uses the processor's pad method to pad input audio features to the same length.
+        # Use the processor's pad method to pad input audio features to the same length.
         batch = self.processor.pad(
             input_features,
             padding=self.padding,
             return_tensors="pt"
         )
 
-        # Pads the label sequences separately using the processor's pad method.
+        # Pad the label sequences separately using the processor's pad method.
         labels_batch = self.processor.pad(
             labels=label_features,
             padding=self.padding,
             return_tensors="pt"
         )
 
-        # Replaces padding tokens in labels with -100 so that the loss function ignores them.
+        # Replace padding tokens in labels with -100 so that the loss function ignores them.
         labels = labels_batch["input_ids"].masked_fill(
             labels_batch.attention_mask.ne(1), -100
         )
@@ -144,10 +144,11 @@ model = AutoModelForCTC.from_pretrained(
 # These control training hyperparameters and runtime behavior:
 training_args = TrainingArguments(
     # Directory to save model checkpoints and outputs.
-    output_dir=output_dir,
+    output_dir="/home/chanwcom/local_repositories/cognitive_workflow_kit/tool/"
+               "models/asr_stop_model_final",
 
     # Batch size per device (GPU/CPU) for training.
-    per_device_train_batch_size=40,
+    per_device_train_batch_size=16,
 
     # Number of batches to accumulate gradients over before updating model weights.
     gradient_accumulation_steps=2,
@@ -156,7 +157,7 @@ training_args = TrainingArguments(
     learning_rate=1e-4,
 
     # Number of warmup steps to gradually increase learning rate at start.
-    warmup_steps=1000,
+    warmup_steps=500,
 
     # Total number of training steps.
     max_steps=2000,
@@ -167,11 +168,11 @@ training_args = TrainingArguments(
     # Use mixed precision training (float16) to speed up training and reduce memory.
     fp16=True,
 
-    # Perform evaluation every N steps (eval_strategy="steps").
+    # Performs evaluation every N steps (eval_strategy="steps").
     eval_strategy="steps",
 
     # Batch size per device during evaluation.
-    per_device_eval_batch_size=40,
+    per_device_eval_batch_size=24,
 
     # Save model checkpoints every N steps.
     save_steps=2000,
@@ -195,9 +196,45 @@ training_args = TrainingArguments(
     push_to_hub=False,
 )
 
-# Create the Trainer instance to handle training and evaluation.
-# This ties together the model, datasets, tokenizer, data collator, and metrics.
-trainer = Trainer(
+
+class MyCtcTrainer(Trainer):
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        with torch.device(inputs["input_values"].device.type):
+            target = inputs.pop("labels")
+            outputs = model(**inputs)
+            logits = outputs["logits"]
+            logits_lengths = torch.full(size=(logits.shape[0], ),
+                                        fill_value=logits.shape[1]).to(
+                                            logits.device)
+
+            target_lengths =  torch.sum(
+                 (target >= 0).type(torch.int32), axis=1)
+
+            ctc_loss = seq_loss_util.CtcLoss()
+
+            # Default CTC
+            loss = ctc_loss.apply(target, target_lengths,
+                                  logits.log_softmax(2),
+                                  logits_lengths,
+                                  seq_loss_util.LabelType.CTC,
+                                  False,  # Update non-blank sequence
+                                  #seq_loss_util_exp.ThresholdType.NO_THRESHOLD,
+                                  #seq_loss_util_exp.ThresholdType.MAX_PROB,
+                                  #seq_loss_util_exp.ThresholdType.ELS,
+                                  #smoothing_coeff, # threshold,
+                                  #seq_loss_util_exp.ProcessingType.UNCHANGED,
+                                  #seq_loss_util_exp.ProcessingType.ZERO,
+                                  #seq_loss_util_exp.ProcessingType.UNIFORM,
+                                  ).mean()
+
+        if return_outputs:
+            return loss, outputs
+        else:
+            return loss
+
+
+trainer = MyCtcTrainer(
     model=model,
     args=training_args,
     train_dataset=train_dataset,

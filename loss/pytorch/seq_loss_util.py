@@ -16,23 +16,30 @@ import torch
 # TODO(chanwcom) Replace with this one. But unit tests need to be updated.
 #LOG_00 = torch.tensor(np.log(np.finfo(np.float64).tiny).astype(np.float32))
 
-LOG_0 = torch.tensor(np.log(1e-307)).type(torch.float32)
+LOG_0 = -706.893623  # float(np.log(1e-307))
 
-
-def sequence_mask(lengths, maxlen=None, dtype=torch.bool):
-    """Applies sequence masking.
-
-    This implementation is based on the following website.
-    https://discuss.pytorch.org/t/pytorch-equivalent-for-tf-sequence-mask/39036/3
-
+@torch.jit.script
+def sequence_mask(lengths: torch.Tensor, maxlen: int):
+    """Applies sequence masking with TorchScript compatibility.
+    
+    Args:
+        lengths: A tensor of shape (batch_size,) containing sequence lengths.
+        maxlen: The maximum length of the sequences (must be an int for JIT).
+        
+    Returns:
+        A boolean mask tensor of shape (batch_size, maxlen).
     """
-    if maxlen is None:
-        maxlen = lengths.max()
-    row_vector = torch.arange(0, maxlen, 1).to(lengths.device)
-    matrix = torch.unsqueeze(lengths, dim=-1)
+    # Create a row vector: [0, 1, 2, ..., maxlen-1]
+    row_vector = torch.arange(0, maxlen, step=1, device=lengths.device)
+    
+    # Expand lengths to (batch_size, 1) for broadcasting
+    matrix = lengths.unsqueeze(1)
+    
+    # Compare to create the mask
     mask = row_vector < matrix
+    
+    return mask 
 
-    return mask.type(dtype)
 
 def to_blank_augmented_labels(
         inputs: dict, blank_index: int=0, boundary_blanks: bool=True,
@@ -99,8 +106,7 @@ def to_blank_augmented_labels(
         output["SEQ_LEN"] = 2 * inputs["SEQ_LEN"] - 1
 
     mask = sequence_mask(output["SEQ_LEN"],
-                         maxlen=data.shape[1],
-                         dtype=data.dtype)
+                         maxlen=data.shape[1])
     output["SEQ_DATA"] = data * mask
 
     return output
@@ -118,8 +124,7 @@ def to_onset_augmented_labels(inputs: dict, num_classes: int) -> dict:
     data = torch.stack((in_data, in_data + 1), axis=2)
     data = torch.reshape(data, (inputs["SEQ_DATA"].shape[0], -1))
     mask = sequence_mask(output["SEQ_LEN"],
-                         maxlen=data.shape[1],
-                         dtype=data.dtype)
+                         maxlen=data.shape[1])
     output["SEQ_DATA"] = data * mask
 
     return output
@@ -129,23 +134,23 @@ def to_onset_augmented_labels(inputs: dict, num_classes: int) -> dict:
 # * https://github.com/amaas/stanford-ctc/blob/master/ctc/ctc.py
 # * https://github.com/HawkAaron/warp-transducer/blob/master/tensorflow_binding/src/warprnnt_op.cc
 def calculate_log_label_prob(labels, softmax_output):
-    """Calculates log({\hat{y}_t}_{c_l}).
+    """Calculates the log probability $\log(\hat{y}_{t, c_l})$.
 
-    This calculates the log probability of each label in the label sequence
-    c_l 0 <= l <= L-1 predicted by the model at time t. The returned value is
-    a three-dimensional tensor, where value is stored in (b, t, l) where b is
-    the batch index, t is the time index, and l ls the label sequence index.
+    Computes the log probability of each label in the sequence $c_l$
+    ($0 \le l < L$) predicted by the model at each time step $t$.
+    The result is a 3D tensor where the value at $(b, t, l)$ corresponds
+    to the batch index $b$, time index $t$, and label sequence index $l$.
 
     Args:
-        labels: A tensor containing a batch of ground-truth label sequences.
-            Note that this label sequence should already include blank labels.
-            The shape is given by (batch_size, max_labels_len).
-        softmax_output: The output of the model.
-            The shape is given by:
+        labels: A tensor of shape (batch_size, max_labels_len) containing
+            ground-truth label sequences. These sequences should already
+            include blank labels.
+        softmax_output: The model output tensor of shape
             (batch_size, max_seq_len, num_classes).
 
     Returns:
-        The shape is (batch, max_logit_len, max_labels_len).
+        A tensor of shape (batch_size, max_seq_len, max_labels_len)
+        containing the calculated log probabilities.
     """
     max_logit_len = softmax_output.shape[1]
     labels = torch.tile(torch.unsqueeze(labels, dim=1), (1, max_logit_len, 1))
@@ -180,8 +185,9 @@ def _calculate_unnormalized_log_seq_prob(log_alpha, accum_log_seq_prob_sum,
 
 class LabelType(enum.Enum):
     CTC = 0
-    SHC_TYPE_0 = 1
-    SHC_TYPE_1 = 2
+    SHC = 1
+    SHC_TYPE_0 = 2
+    SHC_TYPE_1 = 3
 
 
 class ThresholdType(enum.Enum):
@@ -253,7 +259,7 @@ def label_trans_allowance_table_ctc(labels, labels_len):
     #
     # These cases can be detected by checking whether y[l] == y[l + 2].
     indices = torch.where(labels[:, :-2] == labels[:, 2:])
-    indices = [indices[0], indices[1], indices[1] + 2]
+    indices = (indices[0], indices[1], indices[1] + 2)
     trans_table[indices] = LOG_0
 
     return trans_table
@@ -309,6 +315,54 @@ def label_trans_table_shc_type0(labels, labels_len):
 
     return trans_table
 
+def label_trans_table_shc(labels, labels_len):
+    """Constructs a table containing the label transition allowance flags.
+
+    We assume that label_seq should contain "blank labels" described in the
+    original CTC paper.
+    The shape of the returned tensor is (batch_size, max_seq_len, max_seq_len).
+    The transition rule is as follows:
+
+    Depending on whether the transition from the i-th label to the j-th label
+    in the label sequence is allowed,
+      a[b, i, j] = 0,         if this transition is allowed.
+      a[b, i, j] = LOG_0:     if this transition is not allowed.
+
+    Args:
+        label_seq: A dictionary containing a batch of label sequences.
+            * "DATA": A tensor containing label sequences.
+                The shape is (batch_size, max_seq_length). Note that the data
+                should follow the blank label rule, which states that "blank"
+                labels should be interleaved with real labels. In addition to
+                this, blank symbols are prepended and appended to the sequence.
+            * "SEQ_LEN": A tensor containing the length of each label sequence.
+                The shape is (batch_size).
+    Returns:
+        A tensor containing flags whether transitions are allowed.
+            The shape is (batch_size, max_label_seq_len, max_seq_len)
+    """
+
+    max_seq_len = torch.max(labels_len)
+    l = torch.arange(max_seq_len, dtype=torch.int32)
+
+    # Indices corresponding to i -> i.
+    indices0 = torch.stack([l, l], axis=1)
+
+    # Indices corresponding to i -> i + 1.
+    indices1 = torch.stack([l[:-1], l[:-1] + 1], axis=1)
+
+    # Constructs the transition table.
+    indices = torch.concat([indices0, indices1], axis=0)
+    values = torch.zeros([indices.shape[0]])
+
+    trans_table = torch.full(size=(max_seq_len, max_seq_len), fill_value=LOG_0)
+    trans_table[torch.unbind(indices, axis=1)] = 0
+
+    batch_size = labels.shape[0]
+    trans_table = torch.tile(torch.unsqueeze(trans_table, axis=0),
+                             [batch_size, 1, 1])
+
+    return trans_table
 
 def label_trans_table_shc_type1(labels, labels_len):
     """Constructs a table containing the label transition allowance flags.
@@ -365,6 +419,8 @@ def label_trans_table_shc_type1(labels, labels_len):
 def label_trans_allowance_table(labels, label_len, label_type: LabelType):
     if label_type == LabelType.CTC:
         table = label_trans_allowance_table_ctc(labels, label_len)
+    elif label_type == LabelType.SHC:
+        table = label_trans_table_shc(labels, label_len)
     elif label_type == LabelType.SHC_TYPE_0:
         table = label_trans_table_shc_type0(labels, label_len)
     elif label_type == LabelType.SHC_TYPE_1:
@@ -534,8 +590,7 @@ class CtcLoss(torch.autograd.Function):
 
         # Seqeunce mask
         seq_mask = sequence_mask(logits_len,
-                                 maxlen=torch.max(logits_len),
-                                 dtype=log_gamma.dtype)
+                                 maxlen=torch.max(logits_len))
 
         # The dimension of "gradient" is (batch_size, logit_len, num_classes)
         gradient = torch.multiply(gradient, torch.unsqueeze(seq_mask, axis=2))
@@ -551,124 +606,103 @@ class CtcLoss(torch.autograd.Function):
 
         return None, None, gradient, None, None, None, None, None, None
 
+@torch.jit.script
+def calculate_alpha_beta(label_trans_table: torch.Tensor, 
+                         log_label_prob: torch.Tensor, 
+                         label_len: torch.Tensor,
+                         logit_len: torch.Tensor):
+    """Calculates alpha and beta variables for CTC computation.
 
-def calculate_alpha_beta(label_trans_table, log_label_prob, label_len,
-                         logit_len):
-    """Calculates the alpha best and beta best variables.
-
-    This calculates the alpha and beta variables required for CTC computation.
-    Note that the definition of beta variable is somewhat different from the
-    original CTC paper. This equation will be explained in my future paper.
-    TODO(chanwcom) Adds the paper link.
+    This function implements the forward-backward algorithm to compute 
+    log_alpha and log_beta. It uses normalization at each step to ensure 
+    numerical stability.
 
     Args:
-        label_trans_table: A tensor containing the transition tables.
-            The shape is (batch_size, max_label_seq_len, max_label_seq_len).
-        log_label_prob: A tensor of posterior probabilities of each label.
-            The shape is (batch_size, max_logit_len, max_label_len).
-            Mathematically, it is given by the following equation:
-                log (p_{[m]}(y_l | x)).
-        label_len: A tensor containing the label lengths.
-            The shape is (batch_size).
-        logit_len: A tensor containing the logit lengths.
-            The shape is (batch_size).
+        label_trans_table: Transition probabilities of shape (B, L, L).
+        log_label_prob: Log probabilities of labels of shape (B, T, L).
+        label_len: Actual lengths of label sequences of shape (B).
+        logit_len: Actual lengths of logit sequences of shape (B).
+        LOG_0: A constant representing log(0), typically a large negative number.
+
+    Returns:
+        log_alpha: Computed forward variables.
+        log_beta: Computed backward variables.
+        log_seq_prob_final: The final unnormalized sequence log probabilities.
     """
+    LOG_0 = -706.893623  # float(np.log(1e-307))
+
     batch_size = log_label_prob.shape[0]
-    max_label_len = torch.max(label_len)
-    max_logit_len = torch.max(logit_len)
+    max_label_len = int(torch.max(label_len))
+    max_logit_len = int(torch.max(logit_len))
+    device = log_label_prob.device
 
-    # Initalization of log_alpha and log_beta
+    # Initialize log_alpha and log_beta.
     log_alpha = torch.full((batch_size, max_logit_len, max_label_len),
-                           fill_value=LOG_0)
+                           fill_value=LOG_0, device=device)
     log_beta = torch.full((batch_size, max_logit_len, max_label_len),
-                          fill_value=LOG_0)
+                          fill_value=LOG_0, device=device)
 
-    # Mask is used for calculating log_beta for proper backward initialization.
-    mask = sequence_mask(logit_len, maxlen=max_logit_len)
-
-    prev_log_alpha = ((1.0 - (torch.nn.functional.one_hot(
-        torch.zeros(size=(batch_size, ), dtype=torch.int64), max_label_len))) *
-                      LOG_0)
-    accum_log_alpha_max = torch.zeros((batch_size, max_logit_len),
-                                      dtype=torch.float32)
-    prev_log_alpha_max = torch.zeros((batch_size), dtype=torch.float32)
+    # 1. Forward Pass (log_alpha)
+    prev_log_alpha = torch.full((batch_size, max_label_len), 
+                                fill_value=LOG_0, device=device)
+    prev_log_alpha[:, 0] = 0.0
+    alpha_max_list = []
 
     for t in range(max_logit_len):
-        # Calculates log_alpha recursively from the previous time step.
-        log_alpha[:, t, :] = (
-            torch.logsumexp(
-                torch.add(torch.unsqueeze(prev_log_alpha, axis=2),
-                          label_trans_table),
-                dim=1) + log_label_prob[:, t, :]) # yapf: disable
+        transitions = prev_log_alpha.unsqueeze(2) + label_trans_table
+        log_alpha_t = torch.logsumexp(transitions, dim=1) + log_label_prob[:, t, :]
 
-        # Normalizes the log sequence prob.
-        log_alpha_max = torch.max(log_alpha[:, t, :], axis=1,
-                                  keepdims=True).values
-        log_alpha[:, t, :] -= log_alpha_max
+        log_alpha_max = torch.max(log_alpha_t, dim=1, keepdim=True).values
+        log_alpha_t -= log_alpha_max
 
-        # Accumulates the maximum.
-        accum_log_alpha_max[:, t] = (prev_log_alpha_max +
-                                     torch.squeeze(log_alpha_max, axis=-1))
-        prev_log_alpha_max = accum_log_alpha_max[:, t]
-        prev_log_alpha = log_alpha[:, t, :]
+        log_alpha[:, t, :] = log_alpha_t
+        prev_log_alpha = log_alpha_t
+        alpha_max_list.append(log_alpha_max.squeeze(-1))
 
-    initial_log_beta = (
-        (1.0 - torch.nn.functional.one_hot(label_len - 1, max_label_len)) *
-        LOG_0)
+    accum_log_alpha_max = torch.cumsum(torch.stack(alpha_max_list, dim=1), dim=1)
+
+    # 2. Backward Pass (log_beta)
+    # Optimized initial_log_beta creation.
+    initial_log_beta = torch.full((batch_size, max_label_len), 
+                                  fill_value=LOG_0, device=device)
+    for i in range(batch_size):
+        initial_log_beta[i, label_len[i] - 1] = 0.0
+
     prev_log_beta = initial_log_beta
 
-    time_mask = torch.unsqueeze(
-        sequence_mask(logit_len, maxlen=max_logit_len, dtype=torch.float32),
-        axis=2) # yapf: disable
+    time_mask = sequence_mask(logit_len, max_logit_len).unsqueeze(2).to(torch.bool)
 
-    next_log_label_prob = torch.zeros(size=(batch_size, max_label_len))
+    next_log_label_prob = torch.zeros((batch_size, max_label_len), device=device)
+
     for t in range(max_logit_len - 1, -1, -1):
-        # Calculates log_beta recursively from the next time step.
-        log_beta[:, t, :] = (
-            torch.logsumexp(
-                torch.add(torch.unsqueeze(
-                    prev_log_beta + next_log_label_prob, 1),
-                    label_trans_table),
-                dim=2)) # yapf: disable
-
+        messages = (prev_log_beta + next_log_label_prob).unsqueeze(1)
+        log_beta_t = torch.logsumexp(messages + label_trans_table, dim=2)
+        
+        # Current label probs will be 'next' for the step t-1.
         next_log_label_prob = log_label_prob[:, t, :]
 
-        # Normalizes the log beta prob. using the maximum value at time t.
-        log_beta_max = torch.max(log_beta[:, t, :], axis=1,
-                                 keepdims=True).values
-        log_beta[:, t, :] -= log_beta_max
+        # Masking and normalization.
+        log_beta_t = torch.where(time_mask[:, t, :], log_beta_t, initial_log_beta)
+        log_beta_max = torch.max(log_beta_t, dim=1, keepdim=True).values
+        log_beta_t -= log_beta_max
 
-        # Correctly initializes log_beta from the length info.
-        #
-        # If mask is zero, then makes the current log_beta zero
-        # first multiplying with the mask. After that, re-initializes the
-        # log_beta to be "initial_log_beta".
+        log_beta[:, t, :] = log_beta_t
+        prev_log_beta = log_beta_t
 
-        log_beta[:, t, :] = torch.multiply(log_beta[:, t, :],
-                                           time_mask[:, t, :]) # yapf: disable
-        log_beta[:, t, :] += torch.multiply(initial_log_beta,
-                                            (1.0 - time_mask[:, t, :]))
+    # 3. Post-processing and Final Sequence Probability
+    # Apply time mask and label mask for clean output.
+    log_alpha.masked_fill_(~time_mask, LOG_0)
+    log_beta.masked_fill_(~time_mask, LOG_0)
 
-        prev_log_beta = log_beta[:, t, :]
-
-    log_alpha += torch.multiply(LOG_0, (1.0 - time_mask))
-    log_beta += torch.multiply(LOG_0, (1.0 - time_mask))
-
-    label_mask = torch.unsqueeze(sequence_mask(label_len,
-                                               maxlen=max_label_len,
-                                               dtype=torch.float32),
-                                 axis=1)
-    log_alpha += torch.multiply(LOG_0, (1.0 - label_mask))
-    log_beta += torch.multiply(LOG_0, (1.0 - label_mask))
-
-    # We utilize the "tf.stop_gradient" API with the "tf.nest.map_structure"
-    # API based on the recommendation in the following page:
-    # https://www.tensorflow.org/api_docs/python/tf/scan
+    label_mask = sequence_mask(label_len, max_label_len).unsqueeze(1).to(torch.bool)
+    log_alpha.masked_fill_(~label_mask, LOG_0)
+    log_beta.masked_fill_(~label_mask, LOG_0)
 
     log_seq_prob_final = _calculate_unnormalized_log_seq_prob(
         log_alpha, accum_log_alpha_max, logit_len, label_len)
 
     return log_alpha, log_beta, log_seq_prob_final
+
 
 
 def apply_postprocessing(ground_truth_prob: torch.Tensor,
@@ -703,8 +737,7 @@ def apply_postprocessing(ground_truth_prob: torch.Tensor,
 
     mask = torch.unsqueeze(
         sequence_mask(logits_len,
-                      ground_truth_prob.shape[1],
-                      dtype=ground_truth_prob.dtype), axis=2) # yapf: disable
+                      ground_truth_prob.shape[1]), axis=2) # yapf: disable
 
     return ((one_hot * flag + (1 - flag) * others) * mask, flag)
 

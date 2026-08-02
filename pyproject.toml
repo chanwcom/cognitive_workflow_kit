@@ -1,0 +1,19 @@
+[build-system]
+# Modern builds require setuptools to be installed.
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cognitive_workflow_kit"
+version = "0.1.0"
+description = "Project with custom import name mapping."
+authors = [{name = "chanwcom"}]
+requires-python = ">=3.7"
+dependencies = []
+
+[tool.setuptools]
+# Map the 'kit' import name to the actual long directory name.
+# Format: {"import_name" = "actual_folder_path"}
+package-dir = {"cwk" = "."}
+packages = ["cwk"]
+
