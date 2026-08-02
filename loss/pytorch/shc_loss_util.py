@@ -17,38 +17,16 @@ import torch
 
 LOG_0 = -706.893623  # float(np.log(1e-307))
 
-def apply_post_processing(est_probs, logits_len, alpha, beta, eps):
+def apply_post_processing(est_probs, logits_len, alpha, beta, eps=1e-10):
     """Applies masked-uniform label smoothing to a batch of probs.
 
-    Vectorized "masked-uniform" label smoothing post-processing.
-
-    Implements:
-        y_ls(b, t) = (1 - alpha) * y(b, t)
-                     + alpha * (beta * u + gamma * u_p(b, t))
-        gamma       = (1 - beta) / p_p(b, t)
-
-    The (beta * u + gamma * u_p) term is itself a valid probability
-    distribution (sums to 1 over classes): sum(u) = 1 and
-    sum(u_p) = p_p, so gamma must divide by p_p (not multiply) for
-    beta + gamma * p_p to equal 1.
-
-    where, for each (b, t):
-        - y(b, t)   : the C-dim probability vector est_probs[b, t, :].
-        - p_p(b, t) : fraction of classes with prob >= eps
-                      (N_p / C).
-        - u_p(b, t) : masked uniform dist. 1/C on classes with
-                      prob >= eps, 0 elsewhere.
-        - u         : plain uniform dist, 1/C everywhere.
-
-    Positions t >= logits_len[b] are padding and are zeroed out in
-    the output (don't-care region).
     Args:
         est_probs: Float tensor of shape (B, T, C). Probability
             distributions over C classes, per batch/time step.
         logits_len: Long tensor of shape (B,). Valid (unpadded)
             length of each sequence in the batch.
         alpha: Python float in [0, 1]. Overall smoothing weight
-            mixed in with (beta * u + gamma * u_p). Fixed scalar.
+            mixed in with ((1.0 - beta) * u + gamma * u_p). Fixed scalar.
         beta: Python float in [0, 1]. Weight of the plain uniform
             component vs. the masked-uniform component. Fixed
             scalar.
@@ -60,6 +38,29 @@ def apply_post_processing(est_probs, logits_len, alpha, beta, eps):
         Float tensor of shape (B, T, C), same shape/dtype as
         est_probs, with smoothing applied. Time steps beyond
         logits_len are set to 0.
+
+    Vectorized "masked-uniform" label smoothing post-processing.
+
+    Implements:
+        y_ls(b, t) = (1 - alpha) * y(b, t)
+                     + alpha * ((1.0 - beta) * u + gamma * u_p(b, t))
+        gamma       = beta / p_p(b, t)
+
+    The ((1.0 - beta) * u + gamma * u_p) term is itself a valid probability
+    distribution (sums to 1 over classes): sum(u) = 1 and
+    sum(u_p) = p_p, so gamma must divide by p_p (not multiply) for
+    (1.0 - beta) + gamma * p_p to equal 1.
+
+    where, for each (b, t):
+        - y(b, t)   : the C-dim probability vector est_probs[b, t, :].
+        - p_p(b, t) : fraction of classes with prob >= eps
+                      (N_p / C).
+        - u_p(b, t) : masked uniform dist. 1/C on classes with
+                      prob >= eps, 0 elsewhere.
+        - u         : plain uniform dist, 1/C everywhere.
+
+    Positions t >= logits_len[b] are padding and are zeroed out in
+    the output (don't-care region).
     """
     b, t, c = est_probs.shape
 
@@ -78,20 +79,20 @@ def apply_post_processing(est_probs, logits_len, alpha, beta, eps):
     # constant (1/C on every class).
     u = 1.0 / c
 
-    # gamma(b, t) = (1 - beta) / p_p(b, t), shape (B, T, 1).
+    # gamma(b, t) = beta / p_p(b, t), shape (B, T, 1).
     # Division (not multiplication) is required so that
-    # mix = beta * u + gamma * u_p sums to 1 over the class axis:
+    # mix = (1.0 - beta) * u + gamma * u_p sums to 1 over the class axis:
     # sum(u) = 1 and sum(u_p) = p_p, so sum(mix) =
-    # beta + gamma * p_p, which only equals 1 when
-    # gamma = (1 - beta) / p_p. p_p is guaranteed to be > 0
+    # (1.0 - beta) + gamma * p_p, which only equals 1 when
+    # gamma =beta / p_p. p_p is guaranteed to be > 0
     # since every valid (b, t) row sums to 1, so at least one
     # class must be >= eps; a tiny clamp is kept only as a
     # numerical safety net.
-    gamma = (1.0 - beta) / p_p.clamp(min=1e-12)
+    gamma = beta / p_p.clamp(min=1e-12)
 
     # Mix the plain uniform and masked-uniform components, then
     # blend with the original distribution y(b, t).
-    smoothed = beta * u + gamma * u_p
+    smoothed = (1.0 - beta) * u + gamma * u_p
     y_ls = (1.0 - alpha) * est_probs + alpha * smoothed
 
     # Build a (B, T) validity mask from logits_len and zero out
