@@ -9,6 +9,13 @@ py_library(
     ],
 )
 
+py_library(
+    name = "seq_loss_util_exp",
+    srcs = [
+        "seq_loss_util_exp.py",
+    ],
+)
+
 py_test(
     name = "seq_loss_util_test",
     srcs = [
@@ -17,4 +24,5 @@ py_test(
     deps = [
         ":seq_loss_util",
     ],
+    legacy_create_init=True,
 )

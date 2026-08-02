@@ -17,13 +17,14 @@ import evaluate
 import numpy as np
 
 # Custom imports
-import sample_util
+from run import sample_util
+from loss.pytorch import seq_loss_util
 
 db_top_dir = "/mnt/data/database"
 train_top_dir = os.path.join(db_top_dir, "stop_music/music_train")
 test_top_dir = os.path.join(db_top_dir, "stop_music/music_test0")
 processor = AutoProcessor.from_pretrained("facebook/wav2vec2-base")
-output_dir = "/mnt/data/home/chanwcom/experiment/wav2vec2_stop_model_final"
+output_dir = "/mnt/data/home/chanwcom/experiment/wav2vec2_stop_model_final_3"
 
 train_dataset = sample_util.make_dataset(train_top_dir)
 test_dataset = sample_util.make_dataset(test_top_dir)
@@ -206,5 +207,47 @@ trainer = Trainer(
     data_collator=data_collator,
     compute_metrics=compute_metrics,
 )
+
+trainer.train()
+
+if 0:
+    class MyCtcTrainer(Trainer):
+
+        def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+            with torch.device(inputs["input_values"].device.type):
+                target = inputs.pop("labels")
+                outputs = model(**inputs)
+                logits = outputs["logits"]
+                logits_lengths = torch.full(size=(logits.shape[0], ),
+                                            fill_value=logits.shape[1]).to(
+                                                logits.device)
+
+                target_lengths =  torch.sum(
+                     (target >= 0).type(torch.int32), axis=1)
+
+                ctc_loss = seq_loss_util.CtcLoss()
+
+                # Default CTC
+                loss = ctc_loss.apply(target, target_lengths,
+                                      logits.log_softmax(2),
+                                      logits_lengths,
+                                      seq_loss_util.LabelType.CTC,
+                                      False,  # Update non-blank sequence
+                                      ).mean()
+
+            if return_outputs:
+                return loss, outputs
+            else:
+                return loss
+
+    trainer = MyCtcTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=test_dataset,
+        tokenizer=processor,
+        data_collator=data_collator,
+        compute_metrics=compute_metrics,
+    )
 
 trainer.train()

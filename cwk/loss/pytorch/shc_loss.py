@@ -16,6 +16,7 @@ import torch
 
 # Custom imports
 from cwk.loss.pytorch import seq_loss_util
+from cwk.loss.pytorch import shc_loss_util
 
 # TODO(chanwcom) Replace with this one. But unit tests need to be updated.
 #LOG_00 = torch.tensor(np.log(np.finfo(np.float64).tiny).astype(np.float32))
@@ -157,11 +158,9 @@ def to_shc_token_seq(
     new_sequences = []
     new_lengths = []
 
-
     for i in range(batch_size):
         original_seq = data[i, :lengths[i]].tolist()
         augmented_seq = []
-        
 
         for token in original_seq:
             if token in special_set:
@@ -488,7 +487,7 @@ def calculate_alpha_beta(trans_mask, log_target_probs, target_lens,
 
         # Enforce exact LOG_0 flooring to prevent floating-point drift 
         # from accumulating across sequential recurrent updates.
-        log_alpha[:, t_f, :] = enforce_log_zero(log_alpha[:, t_f, :])
+#        log_alpha[:, t_f, :] = enforce_log_zero(log_alpha[:, t_f, :])
 
         # Backward Pass: Calculates log_beta recursively.
         # t_b is the time index from the last time step to the first one.
@@ -502,7 +501,7 @@ def calculate_alpha_beta(trans_mask, log_target_probs, target_lens,
                              (initial_log_beta * (1.0 - current_mask)))
 
         # Enforce exact LOG_0 flooring for backward trellis states.
-        log_beta[:, t_b, :] = enforce_log_zero(log_beta[:, t_b, :])
+#        log_beta[:, t_b, :] = enforce_log_zero(log_beta[:, t_b, :])
 
     # Final Sequence Masking: Vectorized masking outside the loop.
     label_mask = seq_loss_util.sequence_mask(
@@ -514,8 +513,8 @@ def calculate_alpha_beta(trans_mask, log_target_probs, target_lens,
 
     # Enforce exact LOG_0 flooring to clean up padding regions and 
     # eliminate any residual floating-point drift prior to returning.
-    log_alpha = enforce_log_zero(log_alpha)
-    log_beta = enforce_log_zero(log_beta)
+#    log_alpha = enforce_log_zero(log_alpha)
+#    log_beta = enforce_log_zero(log_beta)
 
     log_seq_prob_final = log_alpha[
         batch_indices, logit_lens -1,  target_lens - 1]
@@ -532,7 +531,7 @@ class ShcLoss(torch.autograd.Function):
                 target_lens,
                 logits,
                 logits_len,
-                vocab_size=None):
+                vocab_size=None, alpha=0.0, beta=0.0):
         """Calculates the Sequential Hypothesis Classifier (SHC) loss.
 
         Args:
@@ -589,7 +588,8 @@ class ShcLoss(torch.autograd.Function):
                 labels, logits.shape[2] - 1, 0, LOG_0,
             )
         else:
-            trans_table = seq_loss_util.label_trans_allowance_table_ctc(labels, target_lens)
+            trans_table = seq_loss_util.label_trans_allowance_table_ctc(
+                labels, target_lens)
 
 #        log_probs = torch.log_softmax(logits, dim=-1)
 
@@ -621,10 +621,6 @@ class ShcLoss(torch.autograd.Function):
         # blank-augmented label sequence index.
         # The shape of log_gamma is (batch_size, max_logits_len, max_target_len).
         log_gamma = log_alpha + log_beta
-
-        # Obtains the zero mask.
-        zero_prob_mask = (log_gamma <= LOG_0 + EPS) 
-
         log_gamma = log_gamma - torch.logsumexp(log_gamma, axis=2, keepdim=True)
 
 
@@ -648,6 +644,9 @@ class ShcLoss(torch.autograd.Function):
         # --- (여기서부터 교체 시작) ---
         # 1. log_gamma를 확률 도메인으로 변환 (B, T, L)
         gamma = torch.exp(log_gamma)
+
+        if alpha > 0.0:
+            gamma = shc_loss_util.apply_post_processing(gamma, logits_len, alpha, beta)
 
         # 2. 결과 저장용 텐서 초기화 (B, T, C)
         # C가 작으므로(32~128) 메모리 부담이 거의 없음
@@ -687,4 +686,4 @@ class ShcLoss(torch.autograd.Function):
 
         gradient = torch.multiply(gradient, torch.reshape(grad, (-1, 1, 1)))
 
-        return None, None, gradient, None, None
+        return None, None, gradient, None, None, None, None

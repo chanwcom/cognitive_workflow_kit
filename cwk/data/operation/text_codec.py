@@ -12,6 +12,7 @@ __author__ = "Chanwoo Kim(chanwcom@gmail.com)"
 
 # Standard imports
 import os
+import torch
 
 # Third-party imports
 try:

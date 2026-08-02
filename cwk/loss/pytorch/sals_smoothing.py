@@ -1,11 +1,79 @@
 import torch
 import unittest
 
+
+def adaptive_label_smoothing(
+    estimated_targets: torch.Tensor,
+    model_outputs: torch.Tensor,
+    logits_len: torch.Tensor,
+    beta: float,
+    eps: float = 1e-10,
+) -> torch.Tensor:
+    """Performs adaptive label smoothing matching entropy and KL divergence.
+
+    Args:
+        estimated_targets: Target tensor of shape [B, T, C].
+        model_outputs: Softmax output from the model of shape [B, T, C].
+        logits_len: Tensor of shape [B] containing valid sequence lengths.
+        beta: Scaling factor for the KL divergence term.
+        eps: Small value to avoid numerical instability.
+
+    Returns:
+        Smoothed target tensor of shape [B, T, C].
+    """
+    batch_size, max_len, num_classes = estimated_targets.shape
+    device = estimated_targets.device
+
+    # 1. Create a mask based on logits_len [B, T, 1]
+    # Positions < length are True (1.0), others are False (0.0)
+    range_tensor = torch.arange(max_len, device=device).unsqueeze(0)
+    mask = (range_tensor < logits_len.unsqueeze(1)).unsqueeze(-1).float()
+
+    # 2. Calculate element-wise Entropy and KL divergence
+    # H(p) = -sum(p * log(p))
+    entropy_elementwise = -estimated_targets * torch.log(
+        estimated_targets + eps
+    )
+
+    # KL(P||Q) = sum(p * log(p/q))
+    kl_elementwise = estimated_targets * (
+        torch.log(estimated_targets + eps) - torch.log(model_outputs + eps)
+    )
+
+    # 3. Sum over time (T) and classes (C) within masked regions
+    sum_entropy = torch.sum(entropy_elementwise * mask, dim=(1, 2))
+    sum_kl = torch.sum(kl_elementwise * mask, dim=(1, 2))
+
+    # 4. Compute average per-timestep values to align with max_h (log C)
+    valid_lens = logits_len.float().clamp(min=1.0)
+    avg_entropy_p = (sum_entropy / valid_lens).view(batch_size, 1, 1)
+    avg_kl_div = (sum_kl / valid_lens).view(batch_size, 1, 1)
+
+    # 5. Calculate alpha via linear interpolation
+    target_h = avg_entropy_p + beta * avg_kl_div
+    max_h = torch.log(
+        torch.tensor(float(num_classes), device=device)
+    )
+
+    # alpha = (H_target - H_p) / (H_max - H_p)
+    denom = (max_h - avg_entropy_p).clamp(min=eps)
+    alpha = (target_h - avg_entropy_p) / denom
+    alpha = torch.clamp(alpha, 0.0, 1.0)
+
+    # 6. Final blend and re-mask padding
+    uniform_dist = torch.ones_like(estimated_targets) / num_classes
+    smoothed = (1.0 - alpha) * estimated_targets + alpha * uniform_dist
+
+    return smoothed * mask
+
+
+
+
 # alpha가 0.2 일때 optimal 성능 보임.
 # 0.97인 LS보다 살짝 더 좋음.: 20.243 %
-# 20.426%
-# 
-def adaptive_label_smoothing(
+# 20.426% However, we could not observe such improvement when the model is trained upto 5,000 steps. 
+# The algorithm is not that stable.
+def adaptive_label_smoothing_old(
     estimated_targets: torch.Tensor,
     model_outputs: torch.Tensor,
     alpha: float,
@@ -58,7 +126,7 @@ def adaptive_label_smoothing(
     return smoothed_targets
 
 
-def label_smoothing(
+def label_smoothing_active(
     estimated_targets: torch.Tensor,
     alpha: float,
     eps: float = 1e-10,
@@ -86,7 +154,7 @@ def label_smoothing(
     # Blend original targets with restricted uniform distribution
     return (alpha * estimated_targets) + ((1.0 - alpha) * uniform_restricted)
 
-def label_smoothing_old(
+def label_smoothing(
     estimated_targets: torch.Tensor,
     alpha: float
 ) -> torch.Tensor:

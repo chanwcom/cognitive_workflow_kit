@@ -7,6 +7,8 @@ __author__ = "Chanwoo Kim(chanwcom@gmail.com)"
 # Standard imports
 import argparse
 import os
+import itertools
+import shutil
 
 # Third-party imports
 import torch
@@ -15,7 +17,7 @@ import numpy as np
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 from transformers import AutoModelForCTC, TrainingArguments, Trainer
-from transformers import AutoProcessor
+from transformers import AutoProcessor, PreTrainedTokenizer
 
 # Custom imports
 from run import sample_util
@@ -31,6 +33,85 @@ spm_top_dir = ("/mnt/data/home/chanwcom/local_repository/"
                "cognitive_workflow_kit_work/run/resources")
 
 processor = AutoProcessor.from_pretrained("facebook/wav2vec2-base")
+
+class Wav2Vec2SPMTokenizer(PreTrainedTokenizer):
+    """Custom Tokenizer for Wav2Vec2 using SentencePiece.
+
+    Inherits from PreTrainedTokenizer to avoid the mandatory vocab.json 
+    requirement of Wav2Vec2CTCTokenizer.
+    """
+
+    def __init__(self, spm_model_path: str, **kwargs: Any):
+        """Initializes the tokenizer and loads the SentencePiece model."""
+        import sentencepiece as spm
+        self.spm_model_path = spm_model_path
+        self.sp = spm.SentencePieceProcessor(model_file=spm_model_path)
+        
+        # Standard CTC special tokens are passed to the base class.
+        super().__init__(
+            pad_token="<pad>",
+            unk_token="<unk>",
+            bos_token="<s>",
+            eos_token="</s>",
+            **kwargs
+        )
+
+    @property
+    def vocab_size(self) -> int:
+        """Returns the size of the SentencePiece vocabulary."""
+        return self.sp.get_piece_size()
+
+    def get_vocab(self) -> Dict[str, int]:
+        """Returns the vocabulary as a dictionary for compatibility."""
+        return {
+            self.sp.id_to_piece(i): i for i in range(self.vocab_size)
+        }
+
+    def _tokenize(self, text: str) -> List[str]:
+        """Tokenizes text using the SentencePiece engine."""
+        return self.sp.encode_as_pieces(text)
+
+    def _convert_token_to_id(self, token: str) -> int:
+        """Converts a subword piece to its integer ID."""
+        return self.sp.piece_to_id(token)
+
+    def _convert_id_to_token(self, index: int) -> str:
+        """Converts an integer ID to its subword piece."""
+        return self.sp.id_to_piece(index)
+
+    def _decode(self, 
+                token_ids: List[int], 
+                group_tokens: bool = True, 
+                **kwargs: Any) -> str:
+        """Decodes IDs with CTC collapse and SentencePiece."""
+        if group_tokens:
+            token_ids = [k for k, _ in itertools.groupby(token_ids)]
+        
+        # Remove padding and ignore index (-100).
+        filtered_ids = [
+            int(i) for i in token_ids 
+            if i != self.pad_token_id and i != -100
+        ]
+        return self.sp.decode(filtered_ids) if filtered_ids else ""
+
+    def save_vocabulary(self, 
+                        save_directory: str, 
+                        filename_prefix: Optional[str] = None) -> tuple:
+        """Saves the SPM model file. Fixes the NotImplementedError."""
+        if not os.path.isdir(save_directory):
+            os.makedirs(save_directory)
+
+        file_name = "tokenizer.model"
+        if filename_prefix:
+            file_name = f"{filename_prefix}-{file_name}"
+            
+        vocab_file = os.path.join(save_directory, file_name)
+        
+        # Copy the original .model file to the checkpoint directory.
+        if os.path.abspath(self.spm_model_path) != os.path.abspath(vocab_file):
+            shutil.copyfile(self.spm_model_path, vocab_file)
+            
+        return (vocab_file,)
 
 
 def compute_metrics(pred) -> Dict[str, float]:
@@ -153,7 +234,8 @@ class MyCtcTrainer(Trainer):
                 seq_loss_util.LabelType.CTC,
                 False,
                 seq_loss_util.ThresholdType.LS,
-                0.97,
+                #seq_loss_util.ThresholdType.NO_THRESHOLD,
+                0.98,
             ).mean()
 
         if return_outputs:
@@ -174,16 +256,22 @@ def parse_args():
 def main():
     args = parse_args()
 
+    global processor
+
     # Dynamic configuration based on vocab_size
     if args.vocab_size is not None:
         spm_name = f"librispeech_unigram_{args.vocab_size}.model"
         spm_model_path = os.path.join(spm_top_dir, spm_name)
         current_vocab_size = args.vocab_size
-        out_name = f"ls_0p97_2000_steps_unigram_{args.vocab_size}_03"
+        out_name = f"ls_0p97_2000_steps_unigram_{args.vocab_size}_00"
+
+        # Inject the SPM wrapper into the existing processor structure
+        processor.tokenizer = Wav2Vec2SPMTokenizer(spm_model_path)
+
     else:
         spm_model_path = None
         current_vocab_size = 32
-        out_name = "ls_0p97_2000_steps_default_vocab_03"
+        out_name = "ls_0p97_2000_steps_default_vocab_00"
 
     # Dataset preparation
     train_dataset = sample_util.make_dataset(
@@ -210,14 +298,15 @@ def main():
         per_device_train_batch_size=16,
         gradient_accumulation_steps=2,
         learning_rate=1e-4,
-        warmup_steps=500,
+        warmup_steps=1000,
         max_steps=2000,
         gradient_checkpointing=True,
         fp16=True,
         eval_strategy="steps",
         per_device_eval_batch_size=24,
-        save_steps=2000,
-        eval_steps=200,
+        eval_accumulation_steps=1,
+        save_steps=1000,
+        eval_steps=500,
         logging_steps=25,
         load_best_model_at_end=True,
         metric_for_best_model="wer",

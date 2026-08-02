@@ -7,16 +7,21 @@ from __future__ import (absolute_import, division, print_function,
 
 __author__ = "Chanwoo Kim(chanwcom@gmail.com)"
 # Standard imports
+
 import enum
 
 # Third-party imports
 import numpy as np
 import torch
 
+from cwk.loss.pytorch import sals_smoothing
+
 # TODO(chanwcom) Replace with this one. But unit tests need to be updated.
 #LOG_00 = torch.tensor(np.log(np.finfo(np.float64).tiny).astype(np.float32))
 
 LOG_0 = -706.893623  # float(np.log(1e-307))
+#LOG_0 = -100.00  
+
 
 @torch.jit.script
 def sequence_mask(lengths: torch.Tensor, maxlen: int):
@@ -129,32 +134,43 @@ def to_onset_augmented_labels(inputs: dict, num_classes: int) -> dict:
 
     return output
 
-
-# Third-party imports
-# * https://github.com/amaas/stanford-ctc/blob/master/ctc/ctc.py
-# * https://github.com/HawkAaron/warp-transducer/blob/master/tensorflow_binding/src/warprnnt_op.cc
-def calculate_log_label_prob(labels, softmax_output):
-    """Calculates the log probability $\log(\hat{y}_{t, c_l})$.
-
-    Computes the log probability of each label in the sequence $c_l$
-    ($0 \le l < L$) predicted by the model at each time step $t$.
-    The result is a 3D tensor where the value at $(b, t, l)$ corresponds
-    to the batch index $b$, time index $t$, and label sequence index $l$.
-
-    Args:
-        labels: A tensor of shape (batch_size, max_labels_len) containing
-            ground-truth label sequences. These sequences should already
-            include blank labels.
-        softmax_output: The model output tensor of shape
-            (batch_size, max_seq_len, num_classes).
-
-    Returns:
-        A tensor of shape (batch_size, max_seq_len, max_labels_len)
-        containing the calculated log probabilities.
+def calculate_log_label_prob(labels, log_softmax_output):
     """
-    max_logit_len = softmax_output.shape[1]
-    labels = torch.tile(torch.unsqueeze(labels, dim=1), (1, max_logit_len, 1))
-    return torch.log(torch.gather(input=softmax_output, dim=2, index=labels))
+    softmax_output 대신 log_softmax 결과를 직접 받습니다.
+    torch.log() 연산을 제거하여 -inf 발생을 방지합니다.
+    """
+    max_logit_len = log_softmax_output.shape[1]
+    # labels: (B, L) -> (B, T, L)
+    labels = labels.unsqueeze(1).expand(-1, max_logit_len, -1)
+    
+    # 이미 로그값이므로 바로 gather만 하면 됩니다.
+    # torch.log()를 호출하지 않으므로 0으로 인한 -inf 문제가 사라집니다.
+    return torch.gather(input=log_softmax_output, dim=2, index=labels)
+## Third-party imports
+## * https://github.com/amaas/stanford-ctc/blob/master/ctc/ctc.py
+## * https://github.com/HawkAaron/warp-transducer/blob/master/tensorflow_binding/src/warprnnt_op.cc
+#def calculate_log_label_prob(labels, softmax_output):
+#    """Calculates the log probability $\log(\hat{y}_{t, c_l})$.
+#
+#    Computes the log probability of each label in the sequence $c_l$
+#    ($0 \le l < L$) predicted by the model at each time step $t$.
+#    The result is a 3D tensor where the value at $(b, t, l)$ corresponds
+#    to the batch index $b$, time index $t$, and label sequence index $l$.
+#
+#    Args:
+#        labels: A tensor of shape (batch_size, max_labels_len) containing
+#            ground-truth label sequences. These sequences should already
+#            include blank labels.
+#        softmax_output: The model output tensor of shape
+#            (batch_size, max_seq_len, num_classes).
+#
+#    Returns:
+#        A tensor of shape (batch_size, max_seq_len, max_labels_len)
+#        containing the calculated log probabilities.
+#    """
+#    max_logit_len = softmax_output.shape[1]
+#    labels = torch.tile(torch.unsqueeze(labels, dim=1), (1, max_logit_len, 1))
+#    return torch.log(torch.gather(input=softmax_output, dim=2, index=labels))
 
 
 def _calculate_unnormalized_log_seq_prob(log_alpha, accum_log_seq_prob_sum,
@@ -195,6 +211,8 @@ class ThresholdType(enum.Enum):
     ENTROPY = 1
     MAX_PROB = 2
     ELS = 3
+    SALS = 4
+    LS = 5
 
 
 class ProcessingType(enum.Enum):
@@ -472,6 +490,7 @@ class CtcLoss(torch.autograd.Function):
         # Checks the consistency of the batch size.
         assert labels.shape[0] == logits.shape[0]
 
+
         # Converting the sequences.
         # Note that the following is only for HuggingFace case.
         # In case of HuggingFace, the boundary blanks should be added and non
@@ -480,6 +499,7 @@ class CtcLoss(torch.autograd.Function):
         inputs = {}
         inputs["SEQ_DATA"] = labels
         inputs["SEQ_LEN"] = labels_len
+
         if label_type == LabelType.CTC:
             inputs = to_blank_augmented_labels(inputs, 0, True,
                                                update_non_blank_token_index)
@@ -496,8 +516,11 @@ class CtcLoss(torch.autograd.Function):
         labels = inputs["SEQ_DATA"]
         labels_len = inputs["SEQ_LEN"]
 
+
+#        log_probs = torch.log_softmax(logits, dim=-1)
+
         log_label_prob = calculate_log_label_prob(
-            labels, torch.softmax(logits, dim=-1))
+            labels, torch.log_softmax(logits, dim=-1))
 
         trans_table = label_trans_allowance_table(labels, labels_len,
                                                   label_type)
@@ -536,12 +559,12 @@ class CtcLoss(torch.autograd.Function):
 
         max_label_len = torch.max(labels_len)
         num_classes = logits.shape[2]
-        log_ground_truth_prob = torch.ones_like(logits,
+        log_est_target_prob = torch.ones_like(logits,
                                                 dtype=torch.float32) * LOG_0
 
         # Calculates an estimated time-aligned ground-truth sequence.
         #
-        # log_ground_truth_prob is \tilde{\mathbbm{y}_t}.
+        # log_est_target_prob is \tilde{\mathbbm{y}_t}.
         #
         # Update is done for each label to reduce memory requirement.
         # TODO(chanwcom)Is it really true?
@@ -558,10 +581,10 @@ class CtcLoss(torch.autograd.Function):
             # Since logarithm is used, multiplictaion is changed with addition.
             updates = (torch.unsqueeze(log_gamma[:, :, l], axis=2) +
                        torch.unsqueeze(onehot, axis=1))
-            log_ground_truth_prob = torch.logaddexp(log_ground_truth_prob,
+            log_est_target_prob = torch.logaddexp(log_est_target_prob,
                                                     updates)
 
-        ground_truth_prob = torch.exp(log_ground_truth_prob)
+        est_target_prob = torch.exp(log_est_target_prob)
 
         if threshold_type != ThresholdType.NO_THRESHOLD:
             if processing_type == ProcessingType.UNIFORM:
@@ -569,16 +592,16 @@ class CtcLoss(torch.autograd.Function):
             else:
                 uniform_flag = False
 
-            ground_truth_prob, flag = apply_postprocessing(
-                ground_truth_prob, logits_len, threshold_type, threshold,
-                uniform_flag)
+            est_target_prob = apply_postprocessing(
+                est_target_prob, logits_len, threshold_type, threshold,
+                uniform_flag, logits)
 
-        gradient = -(ground_truth_prob - torch.softmax(logits, dim=2))
+        gradient = -(est_target_prob - torch.softmax(logits, dim=2))
 
-        if (threshold_type != ThresholdType.NO_THRESHOLD
-                and processing_type == ProcessingType.ZERO):
+        #if (threshold_type != ThresholdType.NO_THRESHOLD
+        #        and processing_type == ProcessingType.ZERO):
 
-            gradient = torch.multiply(gradient, flag)
+        # gradient = torch.multiply(gradient, flag)
 
         # To ignore an invalid loss case.
         #
@@ -606,7 +629,7 @@ class CtcLoss(torch.autograd.Function):
 
         return None, None, gradient, None, None, None, None, None, None
 
-@torch.jit.script
+#@torch.jit.script
 def calculate_alpha_beta(label_trans_table: torch.Tensor, 
                          log_label_prob: torch.Tensor, 
                          label_len: torch.Tensor,
@@ -675,19 +698,22 @@ def calculate_alpha_beta(label_trans_table: torch.Tensor,
     next_log_label_prob = torch.zeros((batch_size, max_label_len), device=device)
 
     for t in range(max_logit_len - 1, -1, -1):
+
+        if t < max_logit_len - 1:
+            prev_log_beta = log_beta[ :, t + 1, :]
+            next_log_label_prob = log_label_prob[:, t + 1, :]
+
+
         messages = (prev_log_beta + next_log_label_prob).unsqueeze(1)
-        log_beta_t = torch.logsumexp(messages + label_trans_table, dim=2)
+        log_beta[:, t, :] = torch.logsumexp(messages + label_trans_table, dim=2)
         
-        # Current label probs will be 'next' for the step t-1.
-        next_log_label_prob = log_label_prob[:, t, :]
-
         # Masking and normalization.
-        log_beta_t = torch.where(time_mask[:, t, :], log_beta_t, initial_log_beta)
-        log_beta_max = torch.max(log_beta_t, dim=1, keepdim=True).values
-        log_beta_t -= log_beta_max
+        log_beta[:, t, :] = torch.where(time_mask[:, t, :], log_beta[:, t, :], initial_log_beta)
+        log_beta_max = torch.max(log_beta[:, t, :], dim=1, keepdim=True).values
+        log_beta[:, t, :] -= log_beta_max
 
-        log_beta[:, t, :] = log_beta_t
-        prev_log_beta = log_beta_t
+#        log_beta[:, t, :] = log_beta_t
+#        prev_log_beta = log_beta_t
 
     # 3. Post-processing and Final Sequence Probability
     # Apply time mask and label mask for clean output.
@@ -709,10 +735,16 @@ def apply_postprocessing(ground_truth_prob: torch.Tensor,
                          logits_len: torch.Tensor,
                          threshold_type: ThresholdType,
                          threshold: float,
-                         uniform: bool = True):
+                         uniform: bool = True, logits: torch.Tensor = None):
 
     if threshold_type == ThresholdType.NO_THRESHOLD:
         return ground_truth_prob
+    elif threshold_type == ThresholdType.SALS:
+        return sals_smoothing.adaptive_label_smoothing(
+            ground_truth_prob, logits.softmax(dim=-1), logits_len, threshold)
+    elif threshold_type == ThresholdType.LS:
+        return sals_smoothing.label_smoothing(
+            ground_truth_prob, threshold)
     elif threshold_type == ThresholdType.ELS:
         return _apply_smoothing(ground_truth_prob, threshold)
     elif threshold_type == ThresholdType.ENTROPY:
