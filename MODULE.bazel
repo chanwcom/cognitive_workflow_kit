@@ -1,21 +1,91 @@
 ###############################################################################
 # Bazel now uses Bzlmod by default to manage external dependencies.
-# Please consider migrating your external dependencies from WORKSPACE to MODULE.bazel.
+# Migrated from WORKSPACE to MODULE.bazel.
 #
 # For more details, please check https://github.com/bazelbuild/bazel/issues/18958
 ###############################################################################
-
 module(
     name = "cognitive_workflow_kit",
     version = "0.1",
 )
 
+# --- Already present, unchanged ---
 bazel_dep(name = "rules_cc", version = "0.1.1")
 bazel_dep(name = "rules_proto", version = "7.1.0")
-#bazel_dep(name = "rules_proto_grpc", version = "5.0.1")
 bazel_dep(name = "rules_python", version = "1.3.0")
-bazel_dep(name = "protobuf", version = "29.0-rc2") #, repo_name = "com_google_protobuf")
+bazel_dep(name = "protobuf", version = "29.0-rc2")
 
+# rules_proto_grpc was commented out — uncomment ONLY if it's actually
+# referenced from BUILD files. Check the version on registry.bazel.build,
+# 5.0.1 may no longer be current.
+# bazel_dep(name = "rules_proto_grpc", version = "5.0.1")
+
+# --- New: C++ deps that used to be local_repository / http_archive / bind() ---
+
+# absl — was local_repository pointing at ./third_party/abseil/abseil-cpp/.
+# If you need to keep using the vendored copy instead of the BCR version,
+# use local_path_override below instead of relying on the registry version.
+bazel_dep(name = "abseil-cpp", version = "20250127.1")
+# local_path_override(
+#     module_name = "abseil-cpp",
+#     path = "third_party/abseil/abseil-cpp",
+# )
+
+# re2 — was local_repository pointing at ./third_party/re2.
+bazel_dep(name = "re2", version = "2024-07-02")
+# local_path_override(
+#     module_name = "re2",
+#     path = "third_party/re2",
+# )
+
+# googletest — was bind() + http_archive.
+bazel_dep(name = "googletest", version = "1.15.2")
+
+# glog — was bind() + git_repository. Confirm the current version on
+# registry.bazel.build/modules/glog before committing.
+bazel_dep(name = "glog", version = "0.7.1")
+
+# gflags — was http_archive (glog itself also needs this).
+bazel_dep(name = "gflags", version = "2.2.2")
+
+# pybind11 — was http_archive + pybind11_bazel + python_configure().
+bazel_dep(name = "pybind11_bazel", version = "2.12.0")
+bazel_dep(name = "pybind11", version = "2.13.6")
+
+###############################################################################
+# Non-BCR / custom repos: swig and pcre had custom BUILD files and are
+# unlikely to exist as BCR modules. Use use_repo_rule to call the same
+# repo rules you used in WORKSPACE, directly from MODULE.bazel.
+###############################################################################
+
+http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+new_local_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:local.bzl", "new_local_repository")
+
+new_local_repository(
+    name = "net_sourceforge_swig",
+    path = "third_party/swig-3.0.8",
+    build_file = "//bazel:swig.BUILD",
+)
+
+http_archive(
+    name = "pcre",
+    build_file = "//bazel:pcre.BUILD",
+    sha256 = "69acbc2fbdefb955d42a4c606dfde800c2885711d2979e356c0636efde9ec3b5",
+    strip_prefix = "pcre-8.42",
+    urls = [
+        "https://mirror.bazel.build/ftp.exim.org/pub/pcre/pcre-8.42.tar.gz",
+        "http://ftp.exim.org/pub/pcre/pcre-8.42.tar.gz",
+    ],
+)
+
+###############################################################################
+# librosa / soundfile: these are Python packages that were pulled in via
+# new_git_repository + custom BUILD files. Under Bzlmod they almost always
+# belong in requirements.txt and get resolved through pip.parse below —
+# NOT as separate bazel_dep/use_repo_rule entries. Only keep them as repo
+# rules if you specifically need the git source (e.g. patched fork) rather
+# than the PyPI wheel.
+###############################################################################
 
 python = use_extension("@rules_python//python/extensions:python.bzl", "python", dev_dependency = True)
 python.toolchain(python_version = "3.11")
@@ -25,9 +95,6 @@ pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
 pip.parse(
     hub_name = "my_deps",
     python_version = "3.11",
-    requirements_lock = "//:requirements.txt",
+    requirements_lock = "//:requirements.txt",  # make sure librosa, soundfile are listed here
 )
-
 use_repo(pip, "my_deps")
-
-
