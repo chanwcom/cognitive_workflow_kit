@@ -5,13 +5,13 @@ DATA_ROOT="$DB_ROOT/012.상담_음성_데이터_decomprssed"
 AUDIO_ROOT="$DATA_ROOT/01.데이터/1.Training/원천데이터_1129_add"
 LABEL_ROOT="$DATA_ROOT/01.데이터/1.Training/라벨링데이터_1129_add"
 RESOURCE_DIR="$DB_ROOT/resource"
-#  --filter-list "$RESOURCE_DIR/debug.txt" \
 #  --filter-list "$RESOURCE_DIR/aihub_consulting_filtered_id.txt" \
+  #--filter-list "$RESOURCE_DIR/aihub_consulting_filtered_id.txt" \
 
 python ./create_aihub_webdataset.py \
-  --filter-list "$RESOURCE_DIR/aihub_consulting_filtered_id.txt" \
+  --filter-list "$RESOURCE_DIR/debug.txt" \
   --audio-root $AUDIO_ROOT  \
   --label-root $LABEL_ROOT  \
-  --output-dir "$DB_ROOT/webdataset" \
+  --output-dir "$DB_ROOT/webdataset_debug" \
   --shard-size-gb 5.0 \
   --min-shard-count 5

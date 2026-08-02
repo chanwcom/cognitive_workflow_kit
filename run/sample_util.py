@@ -41,7 +41,6 @@ def preprocess_sample(
         Dict with 'input_values' (audio features) and 'labels' (token IDs).            
             - 'input_values': processed audio feature tensor.
             - 'labels': list of token IDs corresponding to the transcript.
- 
     """
     # Load waveform from raw bytes using torchaudio
     waveform, sample_rate = torchaudio.load(io.BytesIO(sample["audio"]))
@@ -49,14 +48,12 @@ def preprocess_sample(
         waveform[0], sampling_rate=sample_rate
     ).input_values[0]
 
-
     # Handle text decoding from bytes or string
     text = sample["text"]
     if isinstance(text, bytes):
         text = text.decode("utf-8").strip()
     else:
         text = text.strip()
-
 
     # Tokenize text using the provided tokenizer or default processor
     if do_tokenization:
@@ -87,10 +84,10 @@ def make_dataset(
     spm_model_path: Optional[str] = None
 ) -> wds.WebDataset:
     """Create a WebDataset pipeline with optional SentencePiece support.
+
     It reads all shards named 'shard-*.tar' in the given directory,
     extracts 'wav' and 'txt' entries as tuples, converts them into dictionaries,
     and applies the preprocessing function.
-
 
     Args:
         data_dir: Path to directory containing 'shard-*.tar'.
@@ -102,7 +99,6 @@ def make_dataset(
     """
     # Initialize SentencePiece processor if a model path is provided
     tokenizer_obj = None
-
     if spm_model_path:
         tokenizer_obj = spm.SentencePieceProcessor()
         tokenizer_obj.load(spm_model_path)

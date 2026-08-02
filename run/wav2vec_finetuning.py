@@ -1,245 +1,207 @@
 # pylint: disable=import-error, no-member
 from __future__ import (absolute_import, division, print_function,
-                        unicode_literals)
+                         unicode_literals)
 
 __author__ = "Chanwoo Kim(chanwcom@gmail.com)"
 
 # Standard imports
-import glob
 import os
 
 # Third-party imports
 from transformers import AutoModelForCTC, TrainingArguments, Trainer
-from datasets import load_dataset, Audio
 from transformers import AutoProcessor
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
-from torch.utils import data
-import tensorflow as tf
 import torch
 import evaluate
 import numpy as np
 
 # Custom imports
-from data.format import speech_data_helper
-from typing import Any, Dict, List, Optional, Union
-from loss.pytorch import seq_loss_util
+import sample_util
 
-# Prevents Tensorflow from using the entire GPU memory.
-#
-# Since we use Tensorflow and Pytorch simultaneously, Tensorflow should not
-# occupy the entire memory. Instead of allocating the entire GPU memory, GPU
-# memory allocated to Tensorflow grows based on its need. Refer to the
-# following website for more information:
-# https://www.tensorflow.org/guide/gpu
-gpus = tf.config.list_physical_devices("GPU")
-if gpus:
-    try:
-        # Currently, memory growth needs to be the same across GPUs.
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-        logical_gpus = tf.config.list_logical_devices("GPU")
-        print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs")
-
-    except RuntimeError as e:
-        # Memory growth must be set before GPUs have been initialized.
-        print(e)
-
-db_top_dir = "/mnt/data/database/libri_speech/tfrecord"
-train_top_dir = db_top_dir
-test_top_dir = db_top_dir
-
-# yapf: disable
-op = speech_data_helper.SpeechDataToWave()
-train_dataset = tf.data.TFRecordDataset(
-    #glob.glob(os.path.join(train_top_dir, "libri_light_10min.tfrecord-*")),
-    glob.glob(os.path.join(train_top_dir, "libri_light_1h.tfrecord-*")),
-              compression_type="GZIP")
-train_dataset = train_dataset.batch(1)
-train_dataset = train_dataset.prefetch(tf.data.experimental.AUTOTUNE)
-train_dataset = train_dataset.map(
-    op.process, num_parallel_calls=tf.data.AUTOTUNE)
-# yapf: enable
-
-# yapf: disable
-test_dataset = tf.data.TFRecordDataset(
-    glob.glob(os.path.join(test_top_dir, "test-clean.tfrecord-*")),
-              compression_type="GZIP")
-test_dataset = test_dataset.batch(1)
-test_dataset = test_dataset.prefetch(tf.data.experimental.AUTOTUNE)
-test_dataset = test_dataset.map(op.process)
-# yapf: enable
-
+db_top_dir = "/mnt/data/database"
+train_top_dir = os.path.join(db_top_dir, "stop_music/music_train")
+test_top_dir = os.path.join(db_top_dir, "stop_music/music_test0")
 processor = AutoProcessor.from_pretrained("facebook/wav2vec2-base")
+output_dir = "/mnt/data/home/chanwcom/experiment/wav2vec2_stop_model_final"
+
+train_dataset = sample_util.make_dataset(train_top_dir)
+test_dataset = sample_util.make_dataset(test_top_dir)
 
 
-class IterDataset(data.IterableDataset):
+def compute_metrics(pred) -> Dict[str, float]:
+    """Compute word error rate (WER) between predictions and labels.
 
-    def __init__(self, tf_dataset):
-        self._dataset = tf_dataset
+    This function decodes the model's predicted token IDs and ground truth
+    label IDs into strings, replacing ignored label tokens with the padding
+    token ID. Then it computes WER using the `evaluate` library.
 
-    def __iter__(self):
-        for data in self._dataset:
-            output = {}
-            output["input_values"] = [tf.squeeze(data[0]["SEQ_DATA"]).numpy()]
-            output["input_length"] = tf.squeeze(data[0]["SEQ_LEN"]).numpy()
-            with processor.as_target_processor():
-                output["labels"] = processor(
-                    data[1]["SEQ_DATA"][0].numpy().decode(
-                        "unicode_escape")).input_ids
+    Args:
+        pred: A prediction object with attributes:
+            - predictions: logits or probabilities of shape
+                (batch_size, seq_len, vocab_size).
+            - label_ids: ground truth token IDs with padding replaced by -100.
 
-            yield (output)
-
-
-pytorch_train_dataset = IterDataset(train_dataset)
-pytorch_test_dataset = IterDataset(test_dataset)
-
-
-def compute_metrics(pred):
+    Returns:
+        Dict[str, float]: Dictionary with WER under the key 'wer'.
+    """
     pred_logits = pred.predictions
     pred_ids = np.argmax(pred_logits, axis=-1)
 
+    # Replace -100 in labels with tokenizer pad token ID to enable decoding
     pred.label_ids[pred.label_ids == -100] = processor.tokenizer.pad_token_id
 
     pred_str = processor.batch_decode(pred_ids)
     label_str = processor.batch_decode(pred.label_ids, group_tokens=False)
 
-    wer = evaluate.load("wer")
-    wer = wer.compute(predictions=pred_str, references=label_str)
+    wer_metric = evaluate.load("wer")
+    wer_score = wer_metric.compute(predictions=pred_str, references=label_str)
 
-    return {"wer": wer}
+    return {"wer": wer_score}
 
 
 @dataclass
 class DataCollatorCTCWithPadding:
+    """Data collator that dynamically pads input values and labels for CTC training.
+
+    This class pads the input audio features and the corresponding label sequences
+    (token IDs) to the length of the longest element in the batch. It also replaces
+    padding tokens in the labels with -100 to ensure they are ignored during the loss
+    computation, as required by PyTorch's CTC loss implementation.
+
+    Attributes:
+        processor (AutoProcessor): The processor used for feature extraction and tokenization.
+        padding (Union[bool, str]): Padding strategy. Defaults to "longest" to pad to the
+            longest sequence in the batch.
+    """
+
     processor: AutoProcessor
     padding: Union[bool, str] = "longest"
 
     def __call__(
         self, features: List[Dict[str, Union[List[int], torch.Tensor]]]
     ) -> Dict[str, torch.Tensor]:
-        # split inputs and labels since they have to be of different lengths and need
-        # different padding methods
-        input_features = [{
-            "input_values": feature["input_values"][0]
-        } for feature in features]
-        label_features = [{
-            "input_ids": feature["labels"]
-        } for feature in features]
+        """Pad inputs and labels in a batch for model training.
 
-        batch = self.processor.pad(input_features,
-                                   padding=self.padding,
-                                   return_tensors="pt")
+        Args:
+            features: A list of feature dictionaries, each containing:
+                - "input_values": the audio features (list or tensor).
+                - "labels": the tokenized label sequence.
 
-        labels_batch = self.processor.pad(labels=label_features,
-                                          padding=self.padding,
-                                          return_tensors="pt")
+        Returns:
+            A dictionary with padded input tensors and labels ready for the model:
+            - "input_values": Padded input audio feature tensor.
+            - "labels": Padded label tensor with padding tokens replaced by -100.
+        """
+        # Separates the input audio features and label sequences from the batch.
+        input_features = [{"input_values": feature["input_values"]} for feature in features]
 
-        # replace padding with -100 to ignore loss correctly
+        label_features = [{"input_ids": feature["labels"]} for feature in features]
+
+        # Uses the processor's pad method to pad input audio features to the same length.
+        batch = self.processor.pad(
+            input_features,
+            padding=self.padding,
+            return_tensors="pt"
+        )
+
+        # Pads the label sequences separately using the processor's pad method.
+        labels_batch = self.processor.pad(
+            labels=label_features,
+            padding=self.padding,
+            return_tensors="pt"
+        )
+
+        # Replaces padding tokens in labels with -100 so that the loss function ignores them.
         labels = labels_batch["input_ids"].masked_fill(
-            labels_batch.attention_mask.ne(1), -100)
+            labels_batch.attention_mask.ne(1), -100
+        )
 
+        # Add the processed labels to the batch dictionary.
         batch["labels"] = labels
 
         return batch
 
+# Instantiate the data collator for CTC loss with padding support.
+# It dynamically pads the inputs and labels in each batch to the longest
+# sequence, enabling efficient batch processing without manual padding.
+data_collator = DataCollatorCTCWithPadding(
+    processor=processor,
+    padding="longest"
+)
 
-data_collator = DataCollatorCTCWithPadding(processor=processor,
-                                           padding="longest")
-
+# Load the pretrained Wav2Vec2 model with CTC (Connectionist Temporal Classification)
+# head for speech recognition.
+# - ctc_loss_reduction="mean" averages the CTC loss over the batch.
+# - pad_token_id is set to the tokenizer's pad token to ensure correct masking.
 model = AutoModelForCTC.from_pretrained(
     "facebook/wav2vec2-base",
     ctc_loss_reduction="mean",
-    pad_token_id=processor.tokenizer.pad_token_id)
+    pad_token_id=processor.tokenizer.pad_token_id
+)
 
+# Define the training arguments for the Hugging Face Trainer.
+# These control training hyperparameters and runtime behavior:
 training_args = TrainingArguments(
-    output_dir=
-    "/mnt/data/home/chanwcom/experiment/asr_libri_light_1hr_model_01",
-    # In case of STOP
-    #per_device_train_batch_size=40,
-    #warmup_steps=1000,
-    #max_steps=10000,
-    #learning_rate=1e-4,
-    per_device_train_batch_size=24,
-    warmup_steps=1000,
-    max_steps=2000, # Roughly 63 % WER Maybe masking, layer dropout etc # Wav2Vec Config page
+    # Directory to save model checkpoints and outputs.
+    output_dir=output_dir,
+
+    # Batch size per device (GPU/CPU) for training.
+    per_device_train_batch_size=40,
+
+    # Number of batches to accumulate gradients over before updating model weights.
     gradient_accumulation_steps=2,
-    learning_rate=5e-5,
+
+    # Initial learning rate for the optimizer.
+    learning_rate=1e-4,
+
+    # Number of warmup steps to gradually increase learning rate at start.
+    warmup_steps=1000,
+
+    # Total number of training steps.
+    max_steps=2000,
+
+    # Enable gradient checkpointing to reduce memory usage at the cost of extra compute.
     gradient_checkpointing=True,
+
+    # Use mixed precision training (float16) to speed up training and reduce memory.
     fp16=True,
+
+    # Perform evaluation every N steps (eval_strategy="steps").
     eval_strategy="steps",
-    per_device_eval_batch_size=24,
+
+    # Batch size per device during evaluation.
+    per_device_eval_batch_size=40,
+
+    # Save model checkpoints every N steps.
     save_steps=2000,
-    eval_steps=200,
+
+    # Run evaluation every N steps during training.
+    eval_steps=100,
+
+    # Log training progress every N steps.
     logging_steps=25,
+
+    # Load the best model (lowest WER) at the end of training automatically.
     load_best_model_at_end=True,
+
+    # Metric to use for selecting the best model checkpoint.
     metric_for_best_model="wer",
+
+    # Indicates that a lower metric score (WER) is better.
     greater_is_better=False,
+
+    # Disable pushing model to the Hugging Face hub.
     push_to_hub=False,
 )
 
-
-class MyCtcTrainer(Trainer):
-    def compute_loss(self, model, inputs, return_outputs=False):
-        target = inputs.pop("labels")
-        outputs = model(**inputs)
-
-        # In torch.nn.CTCLoss(), the logit should have the shape of (T, B, C).
-        logits = torch.permute(outputs["logits"], (1, 0, 2))
-        logits_lengths = torch.full(size=(logits.shape[1], ),
-                                    fill_value=logits.shape[0])
-        target_lengths = torch.sum((target >= 0).type(torch.int32), axis=1)
-
-        ctc_loss = torch.nn.CTCLoss()
-
-        loss = ctc_loss(logits.log_softmax(2), target, logits_lengths,
-                        target_lengths)
-
-        if return_outputs:
-            return loss, outputs
-        else:
-            return loss
-
-
-class MyCtcTrainer(Trainer):
-    # TODO(chanwcom)
-    # Is inputs the right name? Target might be more natural.
-    def compute_loss(self, model, inputs, return_outputs=False):
-        with torch.device(inputs["input_values"].device.type):
-            target = inputs.pop("labels")
-            outputs = model(**inputs)
-            logits = outputs["logits"]
-            logits_lengths = torch.full(size=(logits.shape[0], ),
-                                        fill_value=logits.shape[1]).to(
-                                            logits.device)
-
-            target_lengths =  torch.sum(
-                 (target >= 0).type(torch.int32), axis=1)
-
-            ctc_loss = seq_loss_util.CtcLoss()
-
-            # Default CTC
-            loss = ctc_loss.apply(target, target_lengths,
-                                  logits.log_softmax(2),
-                                  logits_lengths,
-                                  seq_loss_util.LabelType.CTC,
-                                  False,  # Update non-blank sequence
-                                  seq_loss_util.ThresholdType.NO_THRESHOLD,
-                                  0.1, # threshold,
-                                  seq_loss_util.ProcessingType.UNCHANGED,
-                                  ).mean()
-
-        if return_outputs:
-            return loss, outputs
-        else:
-            return loss
-
-
-trainer = MyCtcTrainer(
+# Create the Trainer instance to handle training and evaluation.
+# This ties together the model, datasets, tokenizer, data collator, and metrics.
+trainer = Trainer(
     model=model,
     args=training_args,
-    train_dataset=pytorch_train_dataset,
-    eval_dataset=pytorch_test_dataset,
+    train_dataset=train_dataset,
+    eval_dataset=test_dataset,
     tokenizer=processor,
     data_collator=data_collator,
     compute_metrics=compute_metrics,

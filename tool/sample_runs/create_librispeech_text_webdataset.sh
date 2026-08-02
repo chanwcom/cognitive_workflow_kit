@@ -1,6 +1,6 @@
 #!/bin/bash
 LIBRI_SPEECH_TEXT="/mnt/nas2dual/database/libri_speech_text"
-LIBRI_SPEECH_TEXT_OUT="/mnt/nas2dual/database/libri_speech_text_webdataset"
+LIBRI_SPEECH_TEXT_OUT="/mnt/nas2dual/database/libri_speech_text_webdataset_new"
 
 python ../create_librispeech_text_webdataset.py \
     --input_file "$LIBRI_SPEECH_TEXT/out.txt" \
