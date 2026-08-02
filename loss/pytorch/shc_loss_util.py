@@ -9,70 +9,95 @@ from __future__ import (absolute_import, division, print_function,
 __author__ = "Chanwoo Kim(chanwcom@gmail.com)"
 # Standard imports
 
-import enum
-
 # Third-party imports
-import numpy as np
 import torch
-
-from cwk.loss.pytorch import sals_smoothing
 
 # TODO(chanwcom) Replace with this one. But unit tests need to be updated.
 #LOG_00 = torch.tensor(np.log(np.finfo(np.float64).tiny).astype(np.float32))
 
 LOG_0 = -706.893623  # float(np.log(1e-307))
-#LOG_0 = -100.00  
 
+def apply_post_processing(est_probs, logits_len, alpha, beta, eps):
+    """Applies masked-uniform label smoothing to a batch of probs.
 
-#@torch.jit.script
-def apply_post_processing(ground_truth_prob, logits_len, alpha, beta):
-    """Applies a specialized label smoothing to the ground truth probabilities.
+    Vectorized "masked-uniform" label smoothing post-processing.
 
-    The smoothing formula is:
-        P' = (1 - alpha - beta) * P + alpha * u1 + beta * u2
-    where:
-        u1: Uniform distribution over non-masked classes at time t.
-        u2: Uniform distribution over masked classes at time t.
+    Implements:
+        y_ls(b, t) = (1 - alpha) * y(b, t)
+                     + alpha * (beta * u + gamma * u_p(b, t))
+        gamma       = (1 - beta) / p_p(b, t)
 
+    The (beta * u + gamma * u_p) term is itself a valid probability
+    distribution (sums to 1 over classes): sum(u) = 1 and
+    sum(u_p) = p_p, so gamma must divide by p_p (not multiply) for
+    beta + gamma * p_p to equal 1.
+
+    where, for each (b, t):
+        - y(b, t)   : the C-dim probability vector est_probs[b, t, :].
+        - p_p(b, t) : fraction of classes with prob >= eps
+                      (N_p / C).
+        - u_p(b, t) : masked uniform dist. 1/C on classes with
+                      prob >= eps, 0 elsewhere.
+        - u         : plain uniform dist, 1/C everywhere.
+
+    Positions t >= logits_len[b] are padding and are zeroed out in
+    the output (don't-care region).
     Args:
-        ground_truth_prob (torch.Tensor): GT probabilities of shape (B, T, C).
-        logits_len (torch.Tensor): Actual lengths of each sequence (B).
-        alpha (float): Smoothing coefficient for non-masked classes.
-        beta (float): Smoothing coefficient for masked classes.
+        est_probs: Float tensor of shape (B, T, C). Probability
+            distributions over C classes, per batch/time step.
+        logits_len: Long tensor of shape (B,). Valid (unpadded)
+            length of each sequence in the batch.
+        alpha: Python float in [0, 1]. Overall smoothing weight
+            mixed in with (beta * u + gamma * u_p). Fixed scalar.
+        beta: Python float in [0, 1]. Weight of the plain uniform
+            component vs. the masked-uniform component. Fixed
+            scalar.
+        eps: Small positive float threshold (e.g. 1e-10) used to
+            decide whether a class probability counts as
+            "active" (prob >= eps) for both p_p and u_p.
 
     Returns:
-        torch.Tensor: The smoothed probability tensor.
+        Float tensor of shape (B, T, C), same shape/dtype as
+        est_probs, with smoothing applied. Time steps beyond
+        logits_len are set to 0.
     """
-    device = ground_truth_prob.device
-    dtype = ground_truth_prob.dtype
-    batch_size, max_t, num_classes = ground_truth_prob.shape
+    b, t, c = est_probs.shape
 
-    # 1. Define masks for valid (non-LOG_0) and masked entries.
-    # We assume ground_truth_prob is in probability domain [0, 1].
-    is_valid = (ground_truth_prob > 0.0).to(dtype)
-    is_masked = (1.0 - is_valid)
+    # Single boolean mask (non-strict ">=") shared by both p_p and
+    # u_p, as they now use the same activity threshold.
+    ge_mask = est_probs >= eps  # (B, T, C).
 
-    # 2. Calculate counts for uniform distribution denominators.
-    eps = 1e-8
-    n_valid = torch.sum(is_valid, dim=-1, keepdim=True)
-    n_masked = torch.sum(is_masked, dim=-1, keepdim=True)
+    # p_p(b, t) = N_p / C, kept as (B, T, 1) for broadcasting.
+    n_p = ge_mask.sum(dim=-1, keepdim=True).to(est_probs.dtype)
+    p_p = n_p / c
 
-    # 3. Construct uniform distributions u1 and u2.
-    # u1: 1/n_valid for valid indices, 0 otherwise.
-    u1 = is_valid / (n_valid + eps)
-    # u2: 1/n_masked for masked indices, 0 otherwise.
-    u2 = is_masked / (n_masked + eps)
+    # u_p(b, t, c) = 1/C where prob >= eps, else 0.
+    u_p = ge_mask.to(est_probs.dtype) / c
 
-    # 4. Apply the specialized smoothing formula.
-    smoothed_prob = (
-        (1.0 - alpha - beta) * ground_truth_prob + 
-        alpha * u1 + 
-        beta * u2
-    )
+    # u is the plain uniform distribution, a scalar broadcastable
+    # constant (1/C on every class).
+    u = 1.0 / c
 
-    # 5. Zero out padded time steps using a sequence mask.
-    range_t = torch.arange(max_t, device=device).unsqueeze(0)
-    time_mask = (range_t < logits_len.unsqueeze(1)).to(dtype).unsqueeze(2)
-    smoothed_prob = smoothed_prob * time_mask
+    # gamma(b, t) = (1 - beta) / p_p(b, t), shape (B, T, 1).
+    # Division (not multiplication) is required so that
+    # mix = beta * u + gamma * u_p sums to 1 over the class axis:
+    # sum(u) = 1 and sum(u_p) = p_p, so sum(mix) =
+    # beta + gamma * p_p, which only equals 1 when
+    # gamma = (1 - beta) / p_p. p_p is guaranteed to be > 0
+    # since every valid (b, t) row sums to 1, so at least one
+    # class must be >= eps; a tiny clamp is kept only as a
+    # numerical safety net.
+    gamma = (1.0 - beta) / p_p.clamp(min=1e-12)
 
-    return smoothed_prob
+    # Mix the plain uniform and masked-uniform components, then
+    # blend with the original distribution y(b, t).
+    smoothed = beta * u + gamma * u_p
+    y_ls = (1.0 - alpha) * est_probs + alpha * smoothed
+
+    # Build a (B, T) validity mask from logits_len and zero out
+    # any padded time steps (t >= logits_len[b]).
+    time_idx = torch.arange(t, device=est_probs.device)
+    valid = time_idx.unsqueeze(0) < logits_len.unsqueeze(1)  # (B, T)
+    y_ls = y_ls * valid.unsqueeze(-1).to(est_probs.dtype)
+
+    return y_ls
