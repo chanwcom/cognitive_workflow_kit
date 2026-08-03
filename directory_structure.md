@@ -64,30 +64,43 @@ cognitive_workflow_kit/
 │   │
 │   ├── registry/                    # Config-driven factory for model/layer/loss assembly
 │   │
-│   └── train/
-│       ├── trainer.py               # Training loop
-│       ├── evaluator.py             # Evaluation logic (metric computation)
-│       ├── checkpoint/              # Checkpoint save/restore
-│       └── callback/
-│           ├── checkpoint_callback.py
-│           ├── logging_callback.py
-│           ├── eval_callback.py
-│           └── early_stopping_callback.py
-│
-├── scripts/                         # Production entry points
 │   ├── train/
-│   │   ├── bert_finetuning.py
-│   │   └── wav2vec_finetuning.py
-│   ├── inference/
-│   │   ├── bert_inference.py
-│   │   └── wav2vec_inference.py
-│   └── data_prep/
-│       ├── convert_to_tfrecord.py
-│       ├── convert_to_tfrecord_libri_light.py
-│       ├── convert_to_tfrecord_librispeech.py
-│       ├── create_librispeech_webdataset.py
-│       ├── select_test_subset.py
-│       └── process.py
+│   │   ├── trainer.py               # Training loop
+│   │   ├── checkpoint/              # Checkpoint save/restore
+│   │   └── callback/
+│   │       ├── checkpoint_callback.py
+│   │       ├── logging_callback.py
+│   │       └── early_stopping_callback.py
+│   │
+│   └── evaluate/
+│       ├── evaluator.py             # Evaluation logic (metric computation)
+│       └── callback/
+│           └── eval_callback.py
+│
+├── scripts/
+│   ├── bert/
+│   │   ├── finetuning.py
+│   │   ├── inference.py
+│   │   └── BUILD
+│   ├── wav2vec/
+│   │   ├── finetuning.py
+│   │   ├── finetuning_new.py
+│   │   ├── finetuning_libri_light.py
+│   │   ├── finetuning_shc.py
+│   │   ├── inference.py
+│   │   └── BUILD
+│   ├── data_prep/
+│   │   ├── convert_to_tfrecord.py
+│   │   ├── convert_to_tfrecord_libri_light.py
+│   │   ├── convert_to_tfrecord_librispeech.py
+│   │   ├── create_librispeech_webdataset.py
+│   │   ├── select_test_subset.py
+│   │   ├── process.py
+│   │   └── BUILD
+│   ├── common/
+│   │   ├── sample_util.py
+│   │   └── setup.sh
+│   └── BUILD
 │
 ├── configs/                         # Experiment configuration files
 │
