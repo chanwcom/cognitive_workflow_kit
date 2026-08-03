@@ -1,19 +1,76 @@
+# ==============================================================================
+# pyproject.toml
+#
+# Build system configuration and project metadata for the
+# `cognitive_workflow_kit` project, following PEP 517/518/621.
+#
+# This file defines:
+#   1. Which build backend is used to build the distribution (setuptools).
+#   2. Project metadata (name, version, description, dependencies).
+#   3. How setuptools should discover the `cwk` package and its subpackages.
+# ==============================================================================
+
 [build-system]
-# Modern builds require setuptools to be installed.
+# Specifies the minimum requirements needed to build this project.
+# `setuptools>=61.0` is required because it is the first version with
+# native support for the PEP 621 `[project]` table.
 requires = ["setuptools>=61.0", "wheel"]
+
+# Declares the build backend entry point that build frontends (e.g. `pip`,
+# `build`) should invoke to build sdists and wheels.
 build-backend = "setuptools.build_meta"
 
+
 [project]
+# --------------------------------------------------------------------------
+# Core project metadata (PEP 621).
+# --------------------------------------------------------------------------
+
+# The distribution name as it will appear on PyPI (if published) and in
+# `pip list`/`pip show`. Note that this is the *distribution* name, not
+# necessarily the *import* name (see `cwk` package below).
 name = "cognitive_workflow_kit"
+
+# Semantic version of the project. Should be bumped according to semver
+# rules (MAJOR.MINOR.PATCH) whenever a new release is cut.
 version = "0.1.0"
-description = "Project with custom import name mapping."
+
+# One-line summary shown on PyPI and in package managers.
+description = "Cognitive workflow toolkit."
+
+# List of project authors. Additional fields (e.g. `email`) may be added
+# per author as needed.
 authors = [{name = "chanwcom"}]
+
+# Minimum Python version this project supports. Enforced by pip at
+# install time.
 requires-python = ">=3.7"
+
+# Runtime dependencies required to use this package. Currently empty;
+# add entries like "numpy>=1.24" as the project grows.
 dependencies = []
 
-[tool.setuptools]
-# Map the 'kit' import name to the actual long directory name.
-# Format: {"import_name" = "actual_folder_path"}
-package-dir = {"cwk" = "."}
-packages = ["cwk"]
 
+[tool.setuptools.packages.find]
+# --------------------------------------------------------------------------
+# Automatic package discovery configuration.
+#
+# Rather than hardcoding the list of packages (which breaks silently as
+# new subpackages are added), we let setuptools walk the source tree and
+# discover all packages automatically.
+# --------------------------------------------------------------------------
+
+# Directory (relative to this file) that setuptools should search in.
+# "." means the discovery starts at the repository root, where the `cwk/`
+# package directory lives alongside this pyproject.toml.
+where = ["."]
+
+# Only include packages whose name starts with "cwk". This prevents
+# setuptools from accidentally packaging unrelated top-level directories
+# such as `scripts/`, `docs/`, `tests/`, or `third_party/`.
+#
+# NOTE: For each subdirectory under `cwk/` to be recognized as a package
+# by this discovery mechanism, it must contain an `__init__.py` file
+# (e.g. `cwk/core/__init__.py`, `cwk/data/source/__init__.py`, etc.),
+# unless implicit namespace packages are explicitly intended.
+include = ["cwk*"]
