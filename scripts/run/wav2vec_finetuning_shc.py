@@ -26,18 +26,25 @@ from cwk.run import sample_util
 from cwk.loss.pytorch import seq_loss_util
 from cwk.loss.pytorch import shc_loss
 
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+#torch.backends.cuda.matmul.allow_tf32 = False
+#torch.backends.cudnn.allow_tf32 = False
+#torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+
+#os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+
+#os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
 
 # Global directory settings
-db_top_dir = "/scratch/x3397a01/chanwcom/database"
+#db_top_dir = "/scratch/x3397a01/chanwcom/database"
+#model_top_dir = "/scratch/x3397a01/chanwcom/experiments/models"
+#spm_top_dir = ("/scratch/x3397a01/chanwcom/local_repository/cognitive_workflow_kit/run/resources")
+db_top_dir = "/mnt/data/database"
 train_top_dir = os.path.join(db_top_dir, "libri_light/1h")
 test_top_dir = os.path.join(
     db_top_dir, "libri_speech_webdataset_new_oct_2025/test-clean")
-model_top_dir = "/scratch/x3397a01/chanwcom/experiments/models"
-spm_top_dir = ("/scratch/x3397a01/chanwcom/local_repository/cognitive_workflow_kit/run/resources")
-
+model_top_dir = "/mnt/data/home/chanwcom/models"
+spm_top_dir = ("/mnt/data/home/chanwcom/local_repository/cognitive_workflow_kit_emnlp_2026/run/resources")
 processor = AutoProcessor.from_pretrained("facebook/wav2vec2-base")
 
 class Wav2Vec2SPMTokenizer(PreTrainedTokenizer):
@@ -75,7 +82,6 @@ class Wav2Vec2SPMTokenizer(PreTrainedTokenizer):
 
     def _tokenize(self, text: str) -> List[str]:
         """Tokenizes text using the SentencePiece engine."""
-        import pdb; pdb.set_trace()
         return self.sp.encode_as_pieces(text)
 
     def _convert_token_to_id(self, token: str) -> int:
@@ -84,7 +90,6 @@ class Wav2Vec2SPMTokenizer(PreTrainedTokenizer):
 
     def _convert_id_to_token(self, index: int) -> str:
         """Converts an integer ID to its subword piece."""
-        import pdb; pdb.set_trace()
         return self.sp.id_to_piece(index)
 
     def _decode(self, 
@@ -139,19 +144,19 @@ def compute_metrics(pred) -> Dict[str, float]:
     pred_ids = np.argmax(pred_logits, axis=-1)
 
     # Use the original SPM vocab size for the modulo operation.
-    actual_vocab_size = processor.tokenizer.vocab_size + 1
-    boundary_id = actual_vocab_size - 1
+    #actual_vocab_size = processor.tokenizer.vocab_size + 1
+    #boundary_id = actual_vocab_size - 1
 
     # Map extended sub-label IDs back to the original vocabulary range.
-    pred_ids = pred_ids % actual_vocab_size
-    pred_ids[pred_ids == boundary_id] = processor.tokenizer.pad_token_id
+#    pred_ids = pred_ids % actual_vocab_size
+#    pred_ids[pred_ids == boundary_id] = processor.tokenizer.pad_token_id
 
     # Prepare labels: map back to original range and handle ignore index.
     label_ids = pred.label_ids.copy()
     valid_label_mask = (label_ids != -100)
-    label_ids[valid_label_mask] = label_ids[valid_label_mask] % actual_vocab_size
+    label_ids[valid_label_mask] = label_ids[valid_label_mask] 
     label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
-    label_ids[label_ids == boundary_id] = processor.tokenizer.pad_token_id
+#    label_ids[label_ids == boundary_id] = processor.tokenizer.pad_token_id
 
     def clean_special_tokens(text: str) -> str:
         """Removes start/end-of-sentence markers and extra whitespace."""
@@ -248,10 +253,12 @@ class DataCollatorCTCWithPadding:
 
 class MyCtcTrainer(Trainer):
     """Custom Trainer to override loss computation with custom Shc loss."""
-    def __init__(self, vocab_size=None,  *args, **kwargs):
+    def __init__(self, vocab_size=None, alpha=0.0, beta=0.0, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # To include the boundary token at the end.
         self.custom_vocab_size = vocab_size
+        self.alpha = alpha
+        self.beta = beta
 
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
@@ -277,6 +284,8 @@ class MyCtcTrainer(Trainer):
                 logits.log_softmax(2),
                 logits_lengths,
                 self.custom_vocab_size,
+                self.alpha,
+                self.beta,
             ).mean()
 
         if return_outputs:
@@ -291,6 +300,10 @@ def parse_args():
         description="Wav2Vec2 Training with Dynamic Vocab Size")
     parser.add_argument("--vocab_size", type=int, default=None,
                         help="Vocabulary size (e.g., 32, 128).")
+    parser.add_argument("--alpha", type=float, default=0.0,
+                        help="(e.g., NZ smoothing coeff.).")
+    parser.add_argument("--beta", type=float, default=0.0,
+                        help="(e.g., NZ smoothing coeff.).")
     return parser.parse_args()
 
 
@@ -304,7 +317,7 @@ def main():
         spm_name = f"librispeech_unigram_{args.vocab_size}.model"
         spm_model_path = os.path.join(spm_top_dir, spm_name)
         current_vocab_size = args.vocab_size
-        out_name = f"shc_2000_steps_unigram_{args.vocab_size}_00"
+        out_name = f"model_2000_steps_alpha_0p02_beta_0p0_unigram_{args.vocab_size}_00"
 
         # Inject the SPM wrapper into the existing processor structure
         processor.tokenizer = Wav2Vec2SPMTokenizer(spm_model_path)
@@ -313,8 +326,6 @@ def main():
         spm_model_path = None
         current_vocab_size = 32
         out_name = "ctc_2000_steps_default_vocab_01"
-
-    current_vocab_size += 1
 
     # Dataset preparation
     train_dataset = sample_util.make_dataset(
@@ -326,42 +337,91 @@ def main():
     data_collator = DataCollatorCTCWithPadding(
         processor=processor, padding="longest")
 
+    actual_vocab_size = len(processor.tokenizer)
+
     # Load model with dynamic vocab size
     model = AutoModelForCTC.from_pretrained(
         "facebook/wav2vec2-base",
         ctc_loss_reduction="mean",
         pad_token_id=processor.tokenizer.pad_token_id,
-        vocab_size=current_vocab_size,
-        ignore_mismatched_sizes=True
+        vocab_size=actual_vocab_size,
+        ignore_mismatched_sizes=True,
     )
 
-    # Setup training arguments
-    training_args = TrainingArguments(
-        output_dir=os.path.join(model_top_dir, out_name),
-#       For 4090
-#        per_device_train_batch_size=24,
-#        learning_rate=1e-4,
-        per_device_train_batch_size=48,
-        learning_rate=2e-4,
-        gradient_accumulation_steps=2,
-        #learning_rate=3e-5,
-        warmup_steps=1000,
-        max_steps=2000,
-        gradient_checkpointing=False,
-        fp16=False,
-        bf16=False,
-        eval_strategy="steps",
-        per_device_eval_batch_size=24,
-        eval_accumulation_steps=1,
-        save_steps=1000,
-        eval_steps=250,
-        logging_steps=25,
-        #load_best_model_at_end=True,
-        load_best_model_at_end=False,
-        metric_for_best_model="wer",
-        greater_is_better=False,
-        push_to_hub=False,
-    )
+    # Setup training arguments (96 batch)
+#    training_args = TrainingArguments(
+#        output_dir=os.path.join(model_top_dir, out_name),
+##       For 4090
+#        #per_device_train_batch_size=48,
+#        per_device_train_batch_size=96,
+#        learning_rate=4e-4,
+#        gradient_accumulation_steps=2,
+#        warmup_steps=250,
+#        max_steps=500,
+#        gradient_checkpointing=True,
+#        bf16=True,
+#        eval_strategy="steps",
+#        per_device_eval_batch_size=96,
+#        eval_accumulation_steps=1,
+#        save_steps=250,
+#        eval_steps=100,
+#        logging_steps=25,
+#        #load_best_model_at_end=True,
+#        load_best_model_at_end=False,
+#        metric_for_best_model="wer",
+#        greater_is_better=False,
+#        push_to_hub=False,
+#    )
+#
+
+    if 0:
+        # For A100
+        training_args = TrainingArguments(
+            output_dir=os.path.join(model_top_dir, out_name),
+            per_device_train_batch_size=96,
+            learning_rate=4e-4,
+            gradient_accumulation_steps=2,
+            warmup_steps=500,
+            max_steps=1000,
+            gradient_checkpointing=True,
+            bf16=True,
+            eval_strategy="steps",
+            per_device_eval_batch_size=96,
+            eval_accumulation_steps=1,
+            save_steps=500,
+            eval_steps=250,
+            logging_steps=25,
+            #load_best_model_at_end=True,
+            load_best_model_at_end=False,
+            metric_for_best_model="wer",
+            greater_is_better=False,
+            push_to_hub=False,
+        )
+
+    if 1:
+        # For 4090
+        training_args = TrainingArguments(
+            output_dir=os.path.join(model_top_dir, out_name),
+        #       For 4090
+            per_device_train_batch_size=24,
+            learning_rate=1e-4,
+            gradient_accumulation_steps=2,
+            warmup_steps=500,
+            max_steps=2000,
+            gradient_checkpointing=True,
+            bf16=True,
+            eval_strategy="steps",
+            per_device_eval_batch_size=24,
+            eval_accumulation_steps=1,
+            save_steps=2000,
+            eval_steps=250,
+            logging_steps=25,
+            #load_best_model_at_end=True,
+            load_best_model_at_end=True,
+            metric_for_best_model="wer",
+            greater_is_better=False,
+            push_to_hub=False,
+        )
 
     # Initialize trainer and start training
     trainer = MyCtcTrainer(
@@ -373,6 +433,8 @@ def main():
         data_collator=data_collator,
         compute_metrics=compute_metrics,
         vocab_size=args.vocab_size,
+        alpha=args.alpha,
+        beta=args.beta
     )
 
     trainer.train()

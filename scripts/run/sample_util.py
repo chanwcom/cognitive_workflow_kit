@@ -11,8 +11,11 @@ import os
 from typing import Dict, Any, Optional, Union
 
 # Third-party imports
+import numpy as np
 import sentencepiece as spm
 import torchaudio
+import torch
+import soundfile as sf
 import webdataset as wds
 from transformers import AutoProcessor
 
