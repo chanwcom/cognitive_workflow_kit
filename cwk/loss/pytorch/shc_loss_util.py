@@ -17,7 +17,7 @@ import torch
 
 LOG_0 = -706.893623  # float(np.log(1e-307))
 
-def apply_post_processing(est_probs, logits_len, alpha, beta, eps=1e-10):
+def apply_post_processing(est_probs, logits_len, alpha, beta, eps=1e-6):
     """Applies masked-uniform label smoothing to a batch of probs.
 
     Args:
