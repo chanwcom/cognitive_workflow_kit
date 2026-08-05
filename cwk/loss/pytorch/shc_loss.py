@@ -399,7 +399,6 @@ def _validate_alpha_beta_inputs(
         f"log_target_probs({max_target_len_3})"
     )
 
-
 def calculate_alpha_beta(trans_mask, log_target_probs, target_lens,
                          logit_lens):
     """Calculates the alpha and beta variables required for CTC computation.
@@ -474,20 +473,10 @@ def calculate_alpha_beta(trans_mask, log_target_probs, target_lens,
     for t_f in range(1, max_logit_len_int):
         # Forward pass.
         # Trans table broadcast: [B, L, 1] + [B, L, L] -> [B, L, L]
-
-        # NOTE: Why scaling drift (e.g., 0.5 * LOG_0) does not distort logsumexp:
-        # Under logsumexp, tensor values act as exponents in domain e^x. Both LOG_0 (-706.89) 
-        # and drifted values like 0.5 * LOG_0 (-353.44) evaluate to ~0 in probability space 
-        # (1e-307 and 1e-154 respectively), resulting in zero numerical impact after reduction.
-        # Post-logsumexp values remain well within the tolerance of enforce_log_zero().
         log_alpha[:, t_f, :] = (
             torch.logsumexp(
             log_alpha[:, t_f - 1, :].unsqueeze(2) + trans_mask, dim=1) +
             log_target_probs[:, t_f, :])
-
-        # Enforce exact LOG_0 flooring to prevent floating-point drift 
-        # from accumulating across sequential recurrent updates.
-#        log_alpha[:, t_f, :] = enforce_log_zero(log_alpha[:, t_f, :])
 
         # Backward Pass: Calculates log_beta recursively.
         # t_b is the time index from the last time step to the first one.
@@ -496,12 +485,17 @@ def calculate_alpha_beta(trans_mask, log_target_probs, target_lens,
             (log_beta[:, t_b + 1, :] + log_target_probs[:, t_b + 1, :]).unsqueeze(1) +
             trans_mask, dim=2)
 
-        current_mask = time_mask[:, t_b, :]
+        # NOTE: Uses `t_b + 1`, not `t_b`, to also exclude the sample's TRUE
+        # last valid frame (t_b == logit_lens[b] - 1) from the recursion result.
+        # That frame's computation reads log_beta/log_target_probs at t_b + 1,
+        # which is a padded "virtual" frame for shorter sequences in the batch.
+        # Since trans_mask still permits free self-loop/step transitions across
+        # it, using t_b (the original code) lets beta "borrow" nonexistent time
+        # and inflates values near a sequence's true end. Pinning that frame to
+        # initial_log_beta keeps beta invariant to batch padding
+        current_mask = time_mask[:, t_b + 1, :]
         log_beta[:, t_b, :] = ((log_beta[:, t_b, :] * current_mask) +
                              (initial_log_beta * (1.0 - current_mask)))
-
-        # Enforce exact LOG_0 flooring for backward trellis states.
-#        log_beta[:, t_b, :] = enforce_log_zero(log_beta[:, t_b, :])
 
     # Final Sequence Masking: Vectorized masking outside the loop.
     label_mask = seq_loss_util.sequence_mask(
@@ -510,11 +504,6 @@ def calculate_alpha_beta(trans_mask, log_target_probs, target_lens,
     final_valid_mask = time_mask * label_mask  # Shape: [B, T, L]
     log_alpha = torch.where(final_valid_mask == 1.0, log_alpha, LOG_0)
     log_beta = torch.where(final_valid_mask == 1.0, log_beta, LOG_0)
-
-    # Enforce exact LOG_0 flooring to clean up padding regions and 
-    # eliminate any residual floating-point drift prior to returning.
-#    log_alpha = enforce_log_zero(log_alpha)
-#    log_beta = enforce_log_zero(log_beta)
 
     log_seq_prob_final = log_alpha[
         batch_indices, logit_lens -1,  target_lens - 1]
@@ -525,6 +514,7 @@ def calculate_alpha_beta(trans_mask, log_target_probs, target_lens,
 class ShcLoss(torch.autograd.Function):
     """A class for calculating the SHC loss."""
 
+    # NOTE: vocab_size is not used. Consider removing this.
     @staticmethod
     def forward(ctx,
                 labels,
@@ -559,8 +549,6 @@ class ShcLoss(torch.autograd.Function):
         # Checks the consistency of the batch size.
         assert labels.shape[0] == logits.shape[0]
 
-        assert vocab_size
-
         device = logits.device
         dtype = logits.dtype
 
@@ -572,9 +560,6 @@ class ShcLoss(torch.autograd.Function):
 #        inputs = to_onset_block_augmented_n(inputs, sub_label_factor, vocab_size)
         inputs = seq_loss_util.to_blank_augmented_labels(inputs, 0, False, False)
         # inputs, boundary, blank, special
-
-        # TODO(chanwcom) Fix this!! Hard-coding
-        #inputs = to_shc_token_seq(inputs, logits.shape[2] - 1, 0, [-100, 1, 2])
 
         labels = inputs["SEQ_DATA"]
         target_lens = inputs["SEQ_LEN"]
@@ -591,14 +576,13 @@ class ShcLoss(torch.autograd.Function):
             trans_table = seq_loss_util.label_trans_allowance_table_ctc(
                 labels, target_lens)
 
-#        log_probs = torch.log_softmax(logits, dim=-1)
-
         # Converting the sequences.
         # Note that the following is only for HuggingFace case.
         # In case of HuggingFace, the boundary blanks should be added and non
         # -blank token indices should NOT be updated.
+        log_probs = torch.log_softmax(logits, dim=-1)
         log_target_probs = seq_loss_util.calculate_log_label_prob(
-            clamped_labels, logits)
+            clamped_labels, log_probs)
 
         # Alpha and beta should be calculated.
         log_alpha, log_beta, log_seq_prob,  = calculate_alpha_beta(
@@ -622,7 +606,6 @@ class ShcLoss(torch.autograd.Function):
         # The shape of log_gamma is (batch_size, max_logits_len, max_target_len).
         log_gamma = log_alpha + log_beta
         log_gamma = log_gamma - torch.logsumexp(log_gamma, axis=2, keepdim=True)
-
 
         # To ignore an invalid loss case.
         #
@@ -661,7 +644,7 @@ class ShcLoss(torch.autograd.Function):
         ground_truth_prob.scatter_add_(2, expanded_indices, gamma)
 
         # 5. 최종 그라디언트 계산
-        gradient = -(ground_truth_prob - torch.softmax(logits, dim=2))
+        gradient = -(ground_truth_prob - log_probs.exp())
         # --- (여기까지 교체 완료) ---
 
         # To ignore an invalid loss case.
@@ -675,6 +658,8 @@ class ShcLoss(torch.autograd.Function):
 
         # The dimension of "gradient" is (batch_size, logit_len, num_classes)
         gradient = torch.multiply(gradient, torch.unsqueeze(seq_mask, axis=2))
+
+        log_seq_prob,
 
         ctx.save_for_backward(gradient)
 
