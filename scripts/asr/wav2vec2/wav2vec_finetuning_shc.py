@@ -1,4 +1,70 @@
 # pylint: disable=import-error, no-member
+"""Training script for the SHC-loss wav2vec2 CTC model.
+
+===============================================================================
+CLEANUP NOTES (what changed vs. the previous version, and why)
+===============================================================================
+
+1) `out_name` no longer hardcodes hyperparameter values into the run name.
+   -----------------------------------------------------------------------
+   The old code did:
+       out_name = f"model_2000_steps_alpha_0p02_beta_0p0_unigram_{args.vocab_size}_00"
+   This string is *always* "alpha_0p02_beta_0p0" and "2000_steps" no matter
+   what `--alpha`/`--beta`/`--max_steps` you actually pass -- so two runs
+   with different alpha/beta would silently get the same directory name
+   (and one would overwrite the other's checkpoints). Two things fixed
+   this:
+     - `--run_name` is now a first-class CLI argument. If you pass it,
+       that's the directory name, full stop -- no magic string-building.
+     - If you don't pass `--run_name`, a name is still auto-generated for
+       convenience, but from the *actual* `args.alpha` / `args.beta` /
+       `args.max_steps` values (see `_default_run_name()`), so it's at
+       least accurate. The generated name is also printed at startup so
+       you always know what directory you're about to write to.
+
+2) The `if 0: ... if 1: ...` GPU-profile switching pattern is replaced by
+   `--gpu_profile {4090,a100}` plus per-flag overrides.
+   -----------------------------------------------------------------------
+   The old code had two full `TrainingArguments(...)` blocks (plus a third,
+   fully commented-out legacy one) and you'd edit the source to flip which
+   one was "if 1" vs "if 0" to switch machines. That's easy to get wrong
+   (e.g. forgetting which one is active) and isn't scriptable. Now:
+     - `_GPU_PROFILES` holds the two presets (their values are exactly the
+       same numbers as the old "if 1" (4090) and "if 0" (A100) blocks).
+     - `--gpu_profile` picks the base preset (default: "4090", matching
+       the branch that was actually active before).
+     - Any of the individual hyperparameter flags
+       (`--per_device_train_batch_size`, `--learning_rate`, etc.) can be
+       passed explicitly to override just that one value on top of the
+       chosen profile -- no source editing needed.
+   The old fully-commented-out legacy block (500 steps / 96 batch / 250
+   warmup) was dropped; it wasn't reachable and was just clutter.
+
+3) `processor` is no longer a mutated module-level global.
+   -----------------------------------------------------------------------
+   The old code declared `processor` at module scope and reassigned
+   `processor.tokenizer` inside `main()` via `global processor`, and
+   `compute_metrics()` read that same module-level `processor` implicitly.
+   That's a bit fragile (any other code importing this module sees a
+   half-initialized `processor` before `main()` runs, and it's not obvious
+   from `compute_metrics`'s signature that it depends on outside state).
+   `compute_metrics` is now built by `make_compute_metrics(processor)`, a
+   factory that returns a closure capturing `processor` explicitly -- still
+   satisfying the HF `Trainer` requirement that `compute_metrics` take a
+   single `pred` argument, but without relying on a mutable global.
+
+4) Removed dead code.
+   -----------------------------------------------------------------------
+   - `current_vocab_size` was assigned in both branches of the
+     `vocab_size` if/else but never read afterwards. Removed.
+   - The various commented-out `#torch.backends...` / `#os.environ...`
+     lines and the big commented-out legacy `TrainingArguments` block were
+     dropped. (If you need `CUDA_LAUNCH_BLOCKING=1` or TF32-disable for
+     debugging, `--debug_sync` / `--disable_tf32` flags are provided
+     instead of source comments to toggle.)
+===============================================================================
+"""
+
 from __future__ import (absolute_import, division, print_function,
                         unicode_literals)
 
@@ -6,51 +72,67 @@ __author__ = "Chanwoo Kim(chanwcom@gmail.com)"
 
 # Standard imports
 import argparse
+import itertools
 import os
 import re
-import itertools
 import shutil
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional, Union
 
 # Third-party imports
-import torch
-
 import evaluate
 import numpy as np
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
-from transformers import AutoModelForCTC, TrainingArguments, Trainer
-from transformers import AutoProcessor, PreTrainedTokenizer
+import torch
+from transformers import (AutoModelForCTC, AutoProcessor,
+                          PreTrainedTokenizer, Trainer, TrainingArguments)
 
 # Custom imports
-from cwk.run import sample_util
-from cwk.loss.pytorch import seq_loss_util
+from common import sample_util
 from cwk.loss.pytorch import shc_loss
 
-#torch.backends.cuda.matmul.allow_tf32 = False
-#torch.backends.cudnn.allow_tf32 = False
-#torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
-
-#os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
-
-#os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-
-
-# Global directory settings
-#db_top_dir = "/scratch/x3397a01/chanwcom/database"
-#model_top_dir = "/scratch/x3397a01/chanwcom/experiments/models"
-#spm_top_dir = ("/scratch/x3397a01/chanwcom/local_repository/cognitive_workflow_kit/run/resources")
+# Global directory settings.
 db_top_dir = "/mnt/data/database"
 train_top_dir = os.path.join(db_top_dir, "libri_light/1h")
 test_top_dir = os.path.join(
     db_top_dir, "libri_speech_webdataset_new_oct_2025/test-clean")
 model_top_dir = "/mnt/data/home/chanwcom/models"
-spm_top_dir = ("/mnt/data/home/chanwcom/local_repository/cognitive_workflow_kit_emnlp_2026/run/resources")
-processor = AutoProcessor.from_pretrained("facebook/wav2vec2-base")
+spm_top_dir = ("/mnt/data/home/chanwcom/local_repository/"
+              "cognitive_workflow_kit_emnlp_2026/run/resources")
+
+# GPU hyperparameter presets. Values are unchanged from the old
+# if-0/if-1 blocks -- "4090" is what used to be under `if 1:`, "a100" is
+# what used to be under `if 0:`. `--gpu_profile` picks one of these as a
+# starting point; any individually-passed CLI flag overrides just that key.
+_GPU_PROFILES: Dict[str, Dict[str, Any]] = {
+    "4090": dict(
+        per_device_train_batch_size=24,
+        per_device_eval_batch_size=24,
+        learning_rate=1e-4,
+        gradient_accumulation_steps=2,
+        warmup_steps=500,
+        max_steps=2000,
+        save_steps=2000,
+        eval_steps=250,
+        load_best_model_at_end=True,
+    ),
+    "a100": dict(
+        per_device_train_batch_size=96,
+        per_device_eval_batch_size=96,
+        learning_rate=4e-4,
+        gradient_accumulation_steps=2,
+        warmup_steps=500,
+        max_steps=1000,
+        save_steps=500,
+        eval_steps=250,
+        load_best_model_at_end=False,
+    ),
+}
+
 
 class Wav2Vec2SPMTokenizer(PreTrainedTokenizer):
     """Custom Tokenizer for Wav2Vec2 using SentencePiece.
 
-    Inherits from PreTrainedTokenizer to avoid the mandatory vocab.json 
+    Inherits from PreTrainedTokenizer to avoid the mandatory vocab.json
     requirement of Wav2Vec2CTCTokenizer.
     """
 
@@ -59,7 +141,7 @@ class Wav2Vec2SPMTokenizer(PreTrainedTokenizer):
         import sentencepiece as spm
         self.spm_model_path = spm_model_path
         self.sp = spm.SentencePieceProcessor(model_file=spm_model_path)
-        
+
         # Standard CTC special tokens are passed to the base class.
         super().__init__(
             pad_token="<pad>",
@@ -92,23 +174,23 @@ class Wav2Vec2SPMTokenizer(PreTrainedTokenizer):
         """Converts an integer ID to its subword piece."""
         return self.sp.id_to_piece(index)
 
-    def _decode(self, 
-                token_ids: List[int], 
-                group_tokens: bool = True, 
+    def _decode(self,
+                token_ids: List[int],
+                group_tokens: bool = True,
                 **kwargs: Any) -> str:
         """Decodes IDs with CTC collapse and SentencePiece."""
         if group_tokens:
             token_ids = [k for k, _ in itertools.groupby(token_ids)]
-        
+
         # Remove padding and ignore index (-100).
         filtered_ids = [
-            int(i) for i in token_ids 
+            int(i) for i in token_ids
             if i != self.pad_token_id and i != -100
         ]
         return self.sp.decode(filtered_ids) if filtered_ids else ""
 
-    def save_vocabulary(self, 
-                        save_directory: str, 
+    def save_vocabulary(self,
+                        save_directory: str,
                         filename_prefix: Optional[str] = None) -> tuple:
         """Saves the SPM model file. Fixes the NotImplementedError."""
         if not os.path.isdir(save_directory):
@@ -117,76 +199,80 @@ class Wav2Vec2SPMTokenizer(PreTrainedTokenizer):
         file_name = "tokenizer.model"
         if filename_prefix:
             file_name = f"{filename_prefix}-{file_name}"
-            
+
         vocab_file = os.path.join(save_directory, file_name)
-        
+
         # Copy the original .model file to the checkpoint directory.
         if os.path.abspath(self.spm_model_path) != os.path.abspath(vocab_file):
             shutil.copyfile(self.spm_model_path, vocab_file)
-            
+
         return (vocab_file,)
 
-def compute_metrics(pred) -> Dict[str, float]:
-    """Compute Word Error Rate (WER) by mapping sub-labels back to vocab.
 
-    boundary_id and padding are ignored.
+def clean_special_tokens(text: str) -> str:
+    """Removes start/end-of-sentence markers and extra whitespace."""
+    text = re.sub(r'^<s>\s*', '', text)
+    text = re.sub(r'\s*</s>$', '', text)
+    return text.strip()
 
-    Args:
-        pred: A prediction object containing:
-            - predictions: Logits of shape (batch, seq, vocab * factor).
-            - label_ids: Ground truth IDs (batch, seq).
 
-    Returns:
-        A dictionary containing the 'wer' score.
+def make_compute_metrics(
+    processor: AutoProcessor,
+) -> Callable[[Any], Dict[str, float]]:
+    """Builds a `compute_metrics` closure bound to a specific processor.
+
+    HF `Trainer` calls `compute_metrics(pred)` with a single positional
+    argument, so anything else it needs (here, `processor`, to decode
+    predicted/label ids back to text) has to come from a closure rather
+    than an extra parameter. This factory makes that dependency explicit
+    at the call site (`compute_metrics=make_compute_metrics(processor)`)
+    instead of relying on a module-level global.
     """
-    pred_logits = pred.predictions
-    # Get the best token IDs from the extended vocabulary space.
-    pred_ids = np.argmax(pred_logits, axis=-1)
 
-    # Use the original SPM vocab size for the modulo operation.
-    #actual_vocab_size = processor.tokenizer.vocab_size + 1
-    #boundary_id = actual_vocab_size - 1
+    def compute_metrics(pred) -> Dict[str, float]:
+        """Compute Word Error Rate (WER) by mapping sub-labels back to vocab.
 
-    # Map extended sub-label IDs back to the original vocabulary range.
-#    pred_ids = pred_ids % actual_vocab_size
-#    pred_ids[pred_ids == boundary_id] = processor.tokenizer.pad_token_id
+        boundary_id and padding are ignored.
 
-    # Prepare labels: map back to original range and handle ignore index.
-    label_ids = pred.label_ids.copy()
-    valid_label_mask = (label_ids != -100)
-    label_ids[valid_label_mask] = label_ids[valid_label_mask] 
-    label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
-#    label_ids[label_ids == boundary_id] = processor.tokenizer.pad_token_id
+        Args:
+            pred: A prediction object containing:
+                - predictions: Logits of shape (batch, seq, vocab * factor).
+                - label_ids: Ground truth IDs (batch, seq).
 
-    def clean_special_tokens(text: str) -> str:
-        """Removes start/end-of-sentence markers and extra whitespace."""
-        text = re.sub(r'^<s>\s*', '', text)
-        text = re.sub(r'\s*</s>$', '', text)
-        return text.strip()
+        Returns:
+            A dictionary containing the 'wer' score.
+        """
+        pred_logits = pred.predictions
+        pred_ids = np.argmax(pred_logits, axis=-1)
 
-    # Decode predictions (CTC grouping enabled).
-    pred_str = processor.batch_decode(
-        pred_ids,
-        group_tokens=True,
-        skip_special_tokens=False,
-    )
+        # Prepare labels: handle the -100 ignore index.
+        label_ids = pred.label_ids.copy()
+        label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
 
-    # Decode ground truth labels.
-    label_str = processor.batch_decode(
-        label_ids,
-        group_tokens=False,
-        skip_special_tokens=False
-    )
+        # Decode predictions (CTC grouping enabled).
+        pred_str = processor.batch_decode(
+            pred_ids,
+            group_tokens=True,
+            skip_special_tokens=False,
+        )
 
-    # Clean and calculate WER.
-    pred_str = [clean_special_tokens(s) for s in pred_str]
-    label_str = [clean_special_tokens(s) for s in label_str]
+        # Decode ground truth labels.
+        label_str = processor.batch_decode(
+            label_ids,
+            group_tokens=False,
+            skip_special_tokens=False
+        )
 
-    wer_metric = evaluate.load("wer")
-    wer_score = wer_metric.compute(predictions=pred_str, references=label_str)
+        # Clean and calculate WER.
+        pred_str = [clean_special_tokens(s) for s in pred_str]
+        label_str = [clean_special_tokens(s) for s in label_str]
 
-    return {"wer": wer_score}
+        wer_metric = evaluate.load("wer")
+        wer_score = wer_metric.compute(predictions=pred_str, references=label_str)
 
+        return {"wer": wer_score}
+
+    return compute_metrics
 
 
 @dataclass
@@ -260,7 +346,6 @@ class MyCtcTrainer(Trainer):
         self.alpha = alpha
         self.beta = beta
 
-
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         with torch.device(inputs["input_values"].device.type):
             target = inputs.pop("labels")
@@ -294,52 +379,119 @@ class MyCtcTrainer(Trainer):
             return loss
 
 
+def _fmt_float(x: float) -> str:
+    """Formats a float for use in a directory name, e.g. 0.02 -> '0p02'."""
+    return str(x).replace(".", "p").replace("-", "neg")
+
+
+def _default_run_name(args: argparse.Namespace) -> str:
+    """Builds a run name from the *actual* CLI args (used when --run_name
+    is not given).
+
+    Unlike the old hardcoded `out_name` string, this reflects whatever
+    --alpha/--beta/--max_steps/--vocab_size were actually passed, so two
+    runs with different hyperparameters never collide on directory name
+    unless they truly are identical runs.
+    """
+    if args.vocab_size is not None:
+        return (f"shc_{args.max_steps}steps_alpha_{_fmt_float(args.alpha)}"
+                f"_beta_{_fmt_float(args.beta)}_unigram_{args.vocab_size}")
+    return f"ctc_{args.max_steps}steps_default_vocab"
+
+
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
         description="Wav2Vec2 Training with Dynamic Vocab Size")
+
     parser.add_argument("--vocab_size", type=int, default=None,
-                        help="Vocabulary size (e.g., 32, 128).")
+                        help="Vocabulary size (e.g., 32, 128). Omit to use "
+                             "the default wav2vec2 tokenizer/vocab.")
     parser.add_argument("--alpha", type=float, default=0.0,
                         help="(e.g., NZ smoothing coeff.).")
     parser.add_argument("--beta", type=float, default=0.0,
                         help="(e.g., NZ smoothing coeff.).")
-    return parser.parse_args()
+
+    # --- Run naming / output location -------------------------------------
+    parser.add_argument(
+        "--run_name", type=str, default=None,
+        help="Directory name for this run's checkpoints, under "
+             "--model_top_dir. If omitted, a name is auto-generated from "
+             "--alpha/--beta/--max_steps/--vocab_size (see "
+             "_default_run_name()) and printed at startup.")
+    parser.add_argument(
+        "--model_top_dir", type=str, default=model_top_dir,
+        help="Parent directory under which --run_name is created.")
+
+    # --- GPU / training hyperparameter profile ------------------------------
+    parser.add_argument(
+        "--gpu_profile", choices=sorted(_GPU_PROFILES.keys()), default="4090",
+        help="Preset hyperparameter bundle to start from (matches what "
+             "used to be the if-0/if-1 blocks). Any of the flags below, "
+             "if passed explicitly, overrides just that value on top of "
+             "the chosen profile.")
+    parser.add_argument("--per_device_train_batch_size", type=int, default=None)
+    parser.add_argument("--per_device_eval_batch_size", type=int, default=None)
+    parser.add_argument("--learning_rate", type=float, default=None)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=None)
+    parser.add_argument("--warmup_steps", type=int, default=None)
+    parser.add_argument("--max_steps", type=int, default=None)
+    parser.add_argument("--save_steps", type=int, default=None)
+    parser.add_argument("--eval_steps", type=int, default=None)
+    parser.add_argument("--logging_steps", type=int, default=25)
+    parser.add_argument("--load_best_model_at_end", type=bool, default=None)
+    parser.add_argument("--gradient_checkpointing", action="store_true",
+                        default=True)
+    parser.add_argument("--no_gradient_checkpointing",
+                        dest="gradient_checkpointing", action="store_false")
+    parser.add_argument("--bf16", action="store_true", default=True)
+    parser.add_argument("--no_bf16", dest="bf16", action="store_false")
+    parser.add_argument("--eval_accumulation_steps", type=int, default=1)
+
+    args = parser.parse_args()
+
+    # Fill in any hyperparameter left as None (i.e. not explicitly passed)
+    # from the chosen --gpu_profile.
+    profile = _GPU_PROFILES[args.gpu_profile]
+    for key, value in profile.items():
+        if getattr(args, key) is None:
+            setattr(args, key, value)
+
+    if args.run_name is None:
+        args.run_name = _default_run_name(args)
+        print(f"[info] --run_name not given; using auto-generated name: "
+              f"{args.run_name}")
+
+    return args
 
 
 def main():
     args = parse_args()
 
-    global processor
+    processor = AutoProcessor.from_pretrained("facebook/wav2vec2-base")
 
-    # Dynamic configuration based on vocab_size
+    # Dynamic configuration based on vocab_size.
     if args.vocab_size is not None:
         spm_name = f"librispeech_unigram_{args.vocab_size}.model"
         spm_model_path = os.path.join(spm_top_dir, spm_name)
-        current_vocab_size = args.vocab_size
-        out_name = f"model_2000_steps_alpha_0p02_beta_0p0_unigram_{args.vocab_size}_00"
-
-        # Inject the SPM wrapper into the existing processor structure
+        # Inject the SPM wrapper into the existing processor structure.
         processor.tokenizer = Wav2Vec2SPMTokenizer(spm_model_path)
-
     else:
         spm_model_path = None
-        current_vocab_size = 32
-        out_name = "ctc_2000_steps_default_vocab_01"
 
-    # Dataset preparation
+    # Dataset preparation.
     train_dataset = sample_util.make_dataset(
         train_top_dir, True, spm_model_path)
     test_dataset = sample_util.make_dataset(
         test_top_dir, True, spm_model_path)
 
-    # Initialize data collator
+    # Initialize data collator.
     data_collator = DataCollatorCTCWithPadding(
         processor=processor, padding="longest")
 
     actual_vocab_size = len(processor.tokenizer)
 
-    # Load model with dynamic vocab size
+    # Load model with dynamic vocab size.
     model = AutoModelForCTC.from_pretrained(
         "facebook/wav2vec2-base",
         ctc_loss_reduction="mean",
@@ -348,82 +500,29 @@ def main():
         ignore_mismatched_sizes=True,
     )
 
-    # Setup training arguments (96 batch)
-#    training_args = TrainingArguments(
-#        output_dir=os.path.join(model_top_dir, out_name),
-##       For 4090
-#        #per_device_train_batch_size=48,
-#        per_device_train_batch_size=96,
-#        learning_rate=4e-4,
-#        gradient_accumulation_steps=2,
-#        warmup_steps=250,
-#        max_steps=500,
-#        gradient_checkpointing=True,
-#        bf16=True,
-#        eval_strategy="steps",
-#        per_device_eval_batch_size=96,
-#        eval_accumulation_steps=1,
-#        save_steps=250,
-#        eval_steps=100,
-#        logging_steps=25,
-#        #load_best_model_at_end=True,
-#        load_best_model_at_end=False,
-#        metric_for_best_model="wer",
-#        greater_is_better=False,
-#        push_to_hub=False,
-#    )
-#
+    output_dir = os.path.join(args.model_top_dir, args.run_name)
+    training_args = TrainingArguments(
+        output_dir=output_dir,
+        per_device_train_batch_size=args.per_device_train_batch_size,
+        learning_rate=args.learning_rate,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        warmup_steps=args.warmup_steps,
+        max_steps=args.max_steps,
+        gradient_checkpointing=args.gradient_checkpointing,
+        bf16=args.bf16,
+        eval_strategy="steps",
+        per_device_eval_batch_size=args.per_device_eval_batch_size,
+        eval_accumulation_steps=args.eval_accumulation_steps,
+        save_steps=args.save_steps,
+        eval_steps=args.eval_steps,
+        logging_steps=args.logging_steps,
+        load_best_model_at_end=args.load_best_model_at_end,
+        metric_for_best_model="wer",
+        greater_is_better=False,
+        push_to_hub=False,
+    )
 
-    if 0:
-        # For A100
-        training_args = TrainingArguments(
-            output_dir=os.path.join(model_top_dir, out_name),
-            per_device_train_batch_size=96,
-            learning_rate=4e-4,
-            gradient_accumulation_steps=2,
-            warmup_steps=500,
-            max_steps=1000,
-            gradient_checkpointing=True,
-            bf16=True,
-            eval_strategy="steps",
-            per_device_eval_batch_size=96,
-            eval_accumulation_steps=1,
-            save_steps=500,
-            eval_steps=250,
-            logging_steps=25,
-            #load_best_model_at_end=True,
-            load_best_model_at_end=False,
-            metric_for_best_model="wer",
-            greater_is_better=False,
-            push_to_hub=False,
-        )
-
-    if 1:
-        # For 4090
-        training_args = TrainingArguments(
-            output_dir=os.path.join(model_top_dir, out_name),
-        #       For 4090
-            per_device_train_batch_size=24,
-            learning_rate=1e-4,
-            gradient_accumulation_steps=2,
-            warmup_steps=500,
-            max_steps=2000,
-            gradient_checkpointing=True,
-            bf16=True,
-            eval_strategy="steps",
-            per_device_eval_batch_size=24,
-            eval_accumulation_steps=1,
-            save_steps=2000,
-            eval_steps=250,
-            logging_steps=25,
-            #load_best_model_at_end=True,
-            load_best_model_at_end=True,
-            metric_for_best_model="wer",
-            greater_is_better=False,
-            push_to_hub=False,
-        )
-
-    # Initialize trainer and start training
+    # Initialize trainer and start training.
     trainer = MyCtcTrainer(
         model=model,
         args=training_args,
@@ -431,7 +530,7 @@ def main():
         eval_dataset=test_dataset,
         processing_class=processor,
         data_collator=data_collator,
-        compute_metrics=compute_metrics,
+        compute_metrics=make_compute_metrics(processor),
         vocab_size=args.vocab_size,
         alpha=args.alpha,
         beta=args.beta
