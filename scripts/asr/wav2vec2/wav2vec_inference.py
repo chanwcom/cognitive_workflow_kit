@@ -261,19 +261,59 @@ def build_processor(vocab_size: Optional[int]) -> AutoProcessor:
     return processor, spm_model_path
 
 
-def build_beam_search_decoder(processor):
-    """Builds a torchaudio CTC beam search decoder for the given tokenizer."""
+def build_beam_search_decoder(processor, beam_size: int = 50):
+    """Builds a torchaudio CTC beam search decoder for the given tokenizer.
+
+    Returns:
+        (beam_decoder, synthetic_sil_token_id). `synthetic_sil_token_id` is
+        None when the real "|" word-boundary token is available (the
+        default wav2vec2 vocab case -- its tokenizer's own `decode()`
+        already knows how to turn "|" into a space, so nothing needs to be
+        stripped). It's the id of our unk-token stand-in otherwise (the
+        SentencePiece vocab case), so the caller knows which id to filter
+        out of the hypothesis before decoding to text.
+    """
     vocab = processor.tokenizer.get_vocab()
     tokens = sorted(vocab, key=lambda token: vocab[token])
+
+    # torchaudio's ctc_decoder requires `sil_token` to be an entry that
+    # literally exists in `tokens` (it does tokens_dict.get_index(sil_token)
+    # internally). The default "|" only exists in the *original* wav2vec2
+    # vocab, where "|" is the literal word-boundary token. The
+    # SentencePiece vocab uses "_" (U+2581) *embedded inside* word-initial
+    # pieces (e.g. "_hello") instead of a standalone delimiter token, so
+    # "|" isn't present there and ctc_decoder(...) raises
+    # `ValueError: Unknown entry in dictionary: '|'`.
+    #
+    # We're decoding lexicon-free (lexicon=None) with the default
+    # sil_score=0, so the exact choice of sil_token has no real effect on
+    # scoring here -- it just needs to be *some* token that's guaranteed
+    # to exist in the vocab. Fall back to unk_token (always present as a
+    # special token) when "|" isn't in the vocab.
+    #
+    # NOTE: the lexicon-free decoder inserts this sil_token at utterance
+    # boundaries. For the real "|" case that's fine and expected (the
+    # tokenizer's decode() converts "|" -> " "). For our unk-token
+    # stand-in, SentencePiece's decode() has no such special-casing and
+    # will render it as the literal unk piece (typically "⁇"), leaking
+    # into the output text -- so the caller must strip
+    # `synthetic_sil_token_id` from the hypothesis before decoding.
+    using_real_sil_token = "|" in vocab
+    sil_token = "|" if using_real_sil_token else processor.tokenizer.unk_token
+    synthetic_sil_token_id = (
+        None if using_real_sil_token
+        else processor.tokenizer.convert_tokens_to_ids(sil_token))
+
     beam_decoder = torchaudio_decoder.ctc_decoder(
         lexicon=None,
         tokens=tokens,
         lm=None,
         nbest=1,
-        beam_size=50,
+        beam_size=beam_size,
         blank_token=processor.tokenizer.pad_token,
+        sil_token=sil_token,
     )
-    return beam_decoder
+    return beam_decoder, synthetic_sil_token_id
 
 
 def decode_batch_pipeline(asr_pipeline, input_values, attention_mask):
@@ -293,7 +333,8 @@ def decode_batch_pipeline(asr_pipeline, input_values, attention_mask):
     return [clean_special_tokens(o["text"]) for o in outputs]
 
 
-def decode_batch_beam_search(model, processor, beam_decoder, input_values,
+def decode_batch_beam_search(model, processor, beam_decoder,
+                             synthetic_sil_token_id, input_values,
                              attention_mask):
     """Decodes a padded batch with the torchaudio CTC beam search decoder."""
     with torch.no_grad():
@@ -311,9 +352,108 @@ def decode_batch_beam_search(model, processor, beam_decoder, input_values,
     hyp_list = []
     for utterance_hyps in beam_outputs:
         token_ids = utterance_hyps[0].tokens.tolist()
+        if synthetic_sil_token_id is not None:
+            # Strip the unk-token stand-in the decoder inserted as a
+            # boundary marker (see build_beam_search_decoder) -- otherwise
+            # it leaks into the text as a literal "⁇".
+            token_ids = [t for t in token_ids if t != synthetic_sil_token_id]
         # Reuse the tokenizer's own decode logic (handles both the default
         # wav2vec2 vocab and the SentencePiece vocab correctly, unlike the
         # old "|" -> " " string-replace hack).
+        text = processor.tokenizer.decode(token_ids, group_tokens=False)
+        hyp_list.append(clean_special_tokens(text))
+    return hyp_list
+
+
+def configure_tensorflow_gpu_memory_growth():
+    """Prevents TensorFlow from grabbing the entire GPU up front.
+
+    We're running PyTorch (the model) and TensorFlow (just for
+    tf.nn.ctc_beam_search_decoder) side by side on the same GPU. Without
+    this, TF's default behavior is to pre-allocate ~all GPU memory for
+    itself the moment it touches the device, starving the PyTorch model.
+    Same fix as the original inference script used.
+    """
+    import tensorflow as tf  # local import: only needed for this decoder
+    gpus = tf.config.list_physical_devices("GPU")
+    if gpus:
+        try:
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+        except RuntimeError as e:
+            # Must be set before GPUs have been initialized; if we're too
+            # late, just report it and carry on.
+            print(f"[warn] could not set TF GPU memory growth: {e}")
+
+
+def decode_batch_tf_beam_search(model, processor, input_values,
+                                attention_mask, beam_width=50, top_paths=1):
+    """Decodes a padded batch with tf.nn.ctc_beam_search_decoder.
+
+    This is the same decoding backend as the (previously disabled, `if 0:`)
+    TensorFlow branch in the original inference script, now wired up as a
+    proper `--decoder tf_beam_search` option and generalized to work with
+    either the default wav2vec2 vocab or the custom SentencePiece vocab.
+
+    Inference-only, framework-mixing note: the model itself still runs
+    entirely in PyTorch. We only convert the resulting logits tensor to a
+    TF tensor for this one decode call (numpy round-trip), then convert
+    the decoded ids straight back to Python ints -- nothing about the
+    model, gradients, or training touches TensorFlow at any point, so
+    there's no cross-framework autograd concern here.
+
+    tf.nn.ctc_beam_search_decoder hardcodes blank_index = num_classes - 1
+    with no way to override this (a long-standing TensorFlow
+    inconsistency -- see tensorflow/tensorflow#42993, #40727, #32903).
+    Our blank is at `processor.tokenizer.pad_token_id`, which usually is
+    *not* the last class index. Rather than reordering the tokenizer's
+    whole vocabulary, we just swap those two class *columns* in the
+    logits before calling TF, and invert the swap on the decoded ids
+    afterward. (This is the same trick the original script applied
+    manually and unconditionally; here it's computed from the actual
+    tokenizer so it's correct for both vocab layouts, and is a no-op when
+    blank already happens to be the last index.)
+    """
+    import tensorflow as tf  # local import: only needed for this decoder
+
+    with torch.no_grad():
+        logits = model(input_values, attention_mask=attention_mask).logits  # (B, T, C)
+
+    num_classes = logits.shape[-1]
+    blank_id = processor.tokenizer.pad_token_id
+    last_id = num_classes - 1
+
+    if blank_id != last_id:
+        logits = logits.clone()
+        blank_col = logits[..., blank_id].clone()
+        logits[..., blank_id] = logits[..., last_id]
+        logits[..., last_id] = blank_col
+
+    # tf.nn.ctc_beam_search_decoder expects time-major [T, B, C] logits.
+    logits_time_major = logits.transpose(0, 1).to(torch.float32).cpu().numpy()
+    tf_logits = tf.convert_to_tensor(logits_time_major)
+
+    input_lengths = attention_mask.sum(dim=-1)
+    output_lengths = model._get_feat_extract_output_lengths(input_lengths)
+    tf_lengths = tf.convert_to_tensor(
+        output_lengths.cpu().numpy().astype("int32"))
+
+    decoded, _log_probs = tf.nn.ctc_beam_search_decoder(
+        tf_logits, tf_lengths, beam_width=beam_width, top_paths=top_paths)
+
+    # decoded[0]: SparseTensor holding the top hypothesis for every example
+    # in the batch. Densify with -1 padding so we can strip it back out.
+    dense = tf.sparse.to_dense(decoded[0], default_value=-1).numpy()
+
+    hyp_list = []
+    for row in dense:
+        token_ids = [int(t) for t in row if t != -1]
+        if blank_id != last_id:
+            # Invert the column swap: anything TF emits as `blank_id` is
+            # really the token that originally lived at `last_id` (TF
+            # never emits its own blank position -- CTC blanks are always
+            # stripped internally -- so no other case can occur here).
+            token_ids = [last_id if t == blank_id else t for t in token_ids]
         text = processor.tokenizer.decode(token_ids, group_tokens=False)
         hyp_list.append(clean_special_tokens(text))
     return hyp_list
@@ -333,9 +473,20 @@ def parse_args():
              "checkpoint; omit only for checkpoints trained without "
              "--vocab_size (default wav2vec2 vocab).")
     parser.add_argument(
-        "--decoder", choices=["pipeline", "beam_search"], default="pipeline",
-        help="Decoding strategy: HF pipeline() greedy CTC decoding, or "
-             "torchaudio CTC beam search.")
+        "--decoder", choices=["pipeline", "beam_search", "tf_beam_search"],
+        default="pipeline",
+        help="Decoding strategy: HF pipeline() greedy CTC decoding; "
+             "torchaudio (flashlight) CTC beam search; or "
+             "tf.nn.ctc_beam_search_decoder (requires tensorflow "
+             "installed). Note: --beam_size only applies to the two "
+             "beam-search options -- the HF pipeline() path always does "
+             "greedy (argmax) decoding and has no beam-search option "
+             "unless you attach a separate pyctcdecode decoder, which "
+             "this script doesn't do.")
+    parser.add_argument(
+        "--beam_size", type=int, default=50,
+        help="Beam width for --decoder beam_search / tf_beam_search. "
+             "Ignored for --decoder pipeline.")
     parser.add_argument(
         "--batch_size", type=int, default=8,
         help="Evaluation batch size.")
@@ -366,6 +517,7 @@ def main():
 
     asr_pipeline = None
     beam_decoder = None
+    synthetic_sil_token_id = None
     if args.decoder == "pipeline":
         asr_pipeline = pipeline(
             "automatic-speech-recognition",
@@ -373,9 +525,26 @@ def main():
             feature_extractor=processor.feature_extractor,
             tokenizer=processor.tokenizer,
             device=(0 if args.device == "cuda" else -1),
+            # Without this, passing a list of waveforms to asr_pipeline(...)
+            # still processes them one at a time internally -- batch_size
+            # here is what actually makes it group --batch_size waveforms
+            # into a single forward pass.
+            batch_size=args.batch_size,
         )
-    else:
-        beam_decoder = build_beam_search_decoder(processor)
+    elif args.decoder == "beam_search":
+        beam_decoder, synthetic_sil_token_id = build_beam_search_decoder(
+            processor, beam_size=args.beam_size)
+    else:  # tf_beam_search
+        # Fail fast (before loading the whole dataset/eval loop) if
+        # tensorflow isn't installed, rather than partway through.
+        try:
+            import tensorflow  # noqa: F401
+        except ImportError as e:
+            raise SystemExit(
+                "--decoder tf_beam_search requires tensorflow to be "
+                "installed (`pip install tensorflow`)."
+            ) from e
+        configure_tensorflow_gpu_memory_growth()
 
     ref_list: List[str] = []
     hyp_list: List[str] = []
@@ -400,9 +569,14 @@ def main():
         if args.decoder == "pipeline":
             batch_hyp = decode_batch_pipeline(
                 asr_pipeline, input_values, attention_mask)
-        else:
+        elif args.decoder == "beam_search":
             batch_hyp = decode_batch_beam_search(
-                model, processor, beam_decoder, input_values, attention_mask)
+                model, processor, beam_decoder, synthetic_sil_token_id,
+                input_values, attention_mask)
+        else:  # tf_beam_search
+            batch_hyp = decode_batch_tf_beam_search(
+                model, processor, input_values, attention_mask,
+                beam_width=args.beam_size)
 
         for ref, hyp in zip(batch_ref, batch_hyp):
             print(f"REF: {ref}")

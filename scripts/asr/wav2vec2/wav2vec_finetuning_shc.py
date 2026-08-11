@@ -90,14 +90,32 @@ from transformers import (AutoModelForCTC, AutoProcessor,
 from common import sample_util
 from cwk.loss.pytorch import shc_loss
 
-# Global directory settings.
-db_top_dir = "/mnt/data/database"
-train_top_dir = os.path.join(db_top_dir, "libri_light/1h")
-test_top_dir = os.path.join(
-    db_top_dir, "libri_speech_webdataset_new_oct_2025/test-clean")
-model_top_dir = "/mnt/data/home/chanwcom/models"
-spm_top_dir = ("/mnt/data/home/chanwcom/local_repository/"
-              "cognitive_workflow_kit_emnlp_2026/run/resources")
+# Default directory settings. These are now just the *defaults* for the
+# corresponding CLI flags (see parse_args()) rather than fixed module-level
+# globals, so every path here can be overridden per-invocation without
+# editing the source:
+#   --db_top_dir           (was: db_top_dir)
+#   --train_top_dir        (was: train_top_dir, derived from db_top_dir)
+#   --test_top_dir         (was: test_top_dir, derived from db_top_dir)
+#   --checkpoint_top_dir   (was: model_top_dir -- renamed, see note below)
+#   --resource_top_dir     (was: spm_top_dir -- renamed, see note below)
+#
+# Renames:
+#   - `model_top_dir` -> `checkpoint_top_dir`: this directory only ever
+#     holds `--run_name` subdirectories full of *training checkpoints*
+#     (it's passed straight into `TrainingArguments.output_dir`), not
+#     model definitions/configs, so "checkpoint" describes its contents
+#     more accurately than "model".
+#   - `spm_top_dir` -> `resource_top_dir`: the actual path
+#     (".../run/resources") was already a general resource directory, not
+#     SPM-specific, and the SPM model filename is still built the same way
+#     (`librispeech_unigram_{vocab_size}.model`) underneath it. Renaming
+#     acknowledges that other shared resources (LMs, lexicons, etc.) could
+#     reasonably live in the same directory later.
+_DEFAULT_DB_TOP_DIR = "/mnt/data/database"
+_DEFAULT_CHECKPOINT_TOP_DIR = "/mnt/data/home/chanwcom/models"
+_DEFAULT_RESOURCE_TOP_DIR = ("/mnt/data/home/chanwcom/local_repository/"
+                             "cognitive_workflow_kit_emnlp_2026/run/resources")
 
 # GPU hyperparameter presets. Values are unchanged from the old
 # if-0/if-1 blocks -- "4090" is what used to be under `if 1:`, "a100" is
@@ -128,6 +146,10 @@ _GPU_PROFILES: Dict[str, Dict[str, Any]] = {
     ),
 }
 
+# Automatically synchronize save_steps and eval_steps with max_steps for each profile.
+for profile in _GPU_PROFILES.values():
+    profile["save_steps"] = profile["max_steps"]
+    profile["eval_steps"] = profile["max_steps"]
 
 class Wav2Vec2SPMTokenizer(PreTrainedTokenizer):
     """Custom Tokenizer for Wav2Vec2 using SentencePiece.
@@ -416,12 +438,37 @@ def parse_args():
     parser.add_argument(
         "--run_name", type=str, default=None,
         help="Directory name for this run's checkpoints, under "
-             "--model_top_dir. If omitted, a name is auto-generated from "
-             "--alpha/--beta/--max_steps/--vocab_size (see "
+             "--checkpoint_top_dir. If omitted, a name is auto-generated "
+             "from --alpha/--beta/--max_steps/--vocab_size (see "
              "_default_run_name()) and printed at startup.")
     parser.add_argument(
-        "--model_top_dir", type=str, default=model_top_dir,
-        help="Parent directory under which --run_name is created.")
+        "--checkpoint_top_dir", type=str, default=_DEFAULT_CHECKPOINT_TOP_DIR,
+        help="Parent directory under which --run_name is created; this is "
+             "where TrainingArguments.output_dir points, i.e. where "
+             "training checkpoints actually get written. (Previously "
+             "called `model_top_dir`.)")
+
+    # --- Data directories ---------------------------------------------------
+    parser.add_argument(
+        "--db_top_dir", type=str, default=_DEFAULT_DB_TOP_DIR,
+        help="Top-level database directory. Used to derive the default "
+             "--train_top_dir / --test_top_dir if those aren't given "
+             "explicitly.")
+    parser.add_argument(
+        "--train_top_dir", type=str, default=None,
+        help="Training dataset directory. Defaults to "
+             "'<db_top_dir>/libri_light/1h'.")
+    parser.add_argument(
+        "--test_top_dir", type=str, default=None,
+        help="Evaluation dataset directory. Defaults to "
+             "'<db_top_dir>/libri_speech_webdataset_new_oct_2025/"
+             "test-clean'.")
+    parser.add_argument(
+        "--resource_top_dir", type=str, default=_DEFAULT_RESOURCE_TOP_DIR,
+        help="Directory containing shared resources referenced by name, "
+             "such as the SentencePiece models "
+             "('librispeech_unigram_{vocab_size}.model'). (Previously "
+             "called `spm_top_dir`.)")
 
     # --- GPU / training hyperparameter profile ------------------------------
     parser.add_argument(
@@ -468,12 +515,19 @@ def parse_args():
 def main():
     args = parse_args()
 
+    # Resolve data directories: an explicit --train_top_dir/--test_top_dir
+    # always wins; otherwise derive from --db_top_dir as before.
+    train_top_dir = args.train_top_dir or os.path.join(
+        args.db_top_dir, "libri_light/1h")
+    test_top_dir = args.test_top_dir or os.path.join(
+        args.db_top_dir, "libri_speech_webdataset_new_oct_2025/test-clean")
+
     processor = AutoProcessor.from_pretrained("facebook/wav2vec2-base")
 
     # Dynamic configuration based on vocab_size.
     if args.vocab_size is not None:
         spm_name = f"librispeech_unigram_{args.vocab_size}.model"
-        spm_model_path = os.path.join(spm_top_dir, spm_name)
+        spm_model_path = os.path.join(args.resource_top_dir, spm_name)
         # Inject the SPM wrapper into the existing processor structure.
         processor.tokenizer = Wav2Vec2SPMTokenizer(spm_model_path)
     else:
@@ -500,7 +554,7 @@ def main():
         ignore_mismatched_sizes=True,
     )
 
-    output_dir = os.path.join(args.model_top_dir, args.run_name)
+    output_dir = os.path.join(args.checkpoint_top_dir, args.run_name)
     training_args = TrainingArguments(
         output_dir=output_dir,
         per_device_train_batch_size=args.per_device_train_batch_size,
