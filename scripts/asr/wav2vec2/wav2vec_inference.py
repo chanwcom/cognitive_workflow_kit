@@ -413,6 +413,13 @@ def decode_batch_tf_beam_search(model, processor, input_values,
     manually and unconditionally; here it's computed from the actual
     tokenizer so it's correct for both vocab layouts, and is a no-op when
     blank already happens to be the last index.)
+
+    Also note: despite the API docstring saying "logits", TF's own
+    ctc_beam_search_decoder actually expects softmax probabilities
+    already applied (see tensorflow/tensorflow#42151 -- the docs are
+    wrong; tf.keras.backend.ctc_decode, which wraps this same op, expects
+    softmax output too). We apply torch.softmax (not log_softmax, not raw
+    logits) before handing anything to TF.
     """
     import tensorflow as tf  # local import: only needed for this decoder
 
@@ -429,9 +436,18 @@ def decode_batch_tf_beam_search(model, processor, input_values,
         logits[..., blank_id] = logits[..., last_id]
         logits[..., last_id] = blank_col
 
-    # tf.nn.ctc_beam_search_decoder expects time-major [T, B, C] logits.
-    logits_time_major = logits.transpose(0, 1).to(torch.float32).cpu().numpy()
-    tf_logits = tf.convert_to_tensor(logits_time_major)
+    # tf.nn.ctc_beam_search_decoder's docstring says it takes "logits", but
+    # that's a long-standing documentation bug (see
+    # tensorflow/tensorflow#42151): it actually expects softmax
+    # probabilities already applied (same as what tf.keras.backend.ctc_decode
+    # feeds it). Passing raw logits breaks the internal probability
+    # accumulation and produces garbled output -- feed softmax, not raw
+    # logits, and NOT log-softmax either.
+    probs = torch.softmax(logits, dim=-1)
+
+    # tf.nn.ctc_beam_search_decoder expects time-major [T, B, C].
+    probs_time_major = probs.transpose(0, 1).to(torch.float32).cpu().numpy()
+    tf_probs = tf.convert_to_tensor(probs_time_major)
 
     input_lengths = attention_mask.sum(dim=-1)
     output_lengths = model._get_feat_extract_output_lengths(input_lengths)
@@ -439,7 +455,7 @@ def decode_batch_tf_beam_search(model, processor, input_values,
         output_lengths.cpu().numpy().astype("int32"))
 
     decoded, _log_probs = tf.nn.ctc_beam_search_decoder(
-        tf_logits, tf_lengths, beam_width=beam_width, top_paths=top_paths)
+        tf_probs, tf_lengths, beam_width=beam_width, top_paths=top_paths)
 
     # decoded[0]: SparseTensor holding the top hypothesis for every example
     # in the batch. Densify with -1 padding so we can strip it back out.
