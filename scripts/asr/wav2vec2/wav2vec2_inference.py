@@ -312,6 +312,7 @@ def build_beam_search_decoder(processor, beam_size: int = 50):
         beam_size=beam_size,
         blank_token=processor.tokenizer.pad_token,
         sil_token=sil_token,
+        log_add=True,
     )
     return beam_decoder, synthetic_sil_token_id
 
@@ -339,17 +340,33 @@ def decode_batch_beam_search(model, processor, beam_decoder,
     """Decodes a padded batch with the torchaudio CTC beam search decoder."""
     with torch.no_grad():
         logits = model(input_values, attention_mask=attention_mask).logits
-
-    # torchaudio's ctc_decoder expects log-probabilities, not raw logits.
-    log_probs = logits.log_softmax(dim=-1).to(torch.float32).cpu()
+    # NOTE: torchaudio's ctc_decoder is built with log_add=True (see
+    # build_beam_search_decoder), which tells the underlying Flashlight
+    # decoder to merge equivalent hypotheses via logaddexp instead of the
+    # default Viterbi-style max (torchaudio's `log_add` docstring: "whether
+    # or not to use logadd when merging hypotheses (Default: False)" --
+    # https://docs.pytorch.org/audio/main/generated/torchaudio.models.decoder.ctc_decoder.html.
+    # That logaddexp merge is only mathematically correct -- i.e. it only
+    # actually sums probability mass, rather than summing nonsense -- if
+    # the values being merged are real log-probabilities. So the input here
+    # must be log_softmax(logits), not raw logits and not softmax(logits).
+    # (torchaudio's own `emissions` docs are silent on which of these is
+    # expected -- see CTCDecoder.__call__ at
+    # https://docs.pytorch.org/audio/2.7.0/generated/torchaudio.models.decoder.CTCDecoder.html#call
+    # so this is confirmed empirically, not from the docs: with
+    # log_add=True, using log_softmax here reproduces the WER improvement
+    # from a wider beam that tf.nn.ctc_beam_search_decoder shows; raw
+    # logits/softmax do not, regardless of log_add.)
+    probs = logits.log_softmax(dim=-1).to(torch.float32).cpu()
 
     input_lengths = attention_mask.sum(dim=-1)
     output_lengths = model._get_feat_extract_output_lengths(
         input_lengths).cpu()
 
-    beam_outputs = beam_decoder(log_probs, output_lengths)
+    beam_outputs = beam_decoder(probs, output_lengths)
 
     hyp_list = []
+
     for utterance_hyps in beam_outputs:
         token_ids = utterance_hyps[0].tokens.tolist()
         if synthetic_sil_token_id is not None:
@@ -441,9 +458,9 @@ def decode_batch_tf_beam_search(model, processor, input_values,
     # tensorflow/tensorflow#42151): it actually expects softmax
     # probabilities already applied (same as what tf.keras.backend.ctc_decode
     # feeds it). Passing raw logits breaks the internal probability
-    # accumulation and produces garbled output -- feed softmax, not raw
-    # logits, and NOT log-softmax either.
-    probs = torch.softmax(logits, dim=-1)
+    # accumulation and produces garbled output -- feed logit, not softmax,
+    # and NOT log-softmax either.
+    probs = logits
 
     # tf.nn.ctc_beam_search_decoder expects time-major [T, B, C].
     probs_time_major = probs.transpose(0, 1).to(torch.float32).cpu().numpy()
@@ -458,8 +475,13 @@ def decode_batch_tf_beam_search(model, processor, input_values,
         tf_probs, tf_lengths, beam_width=beam_width, top_paths=top_paths)
 
     # decoded[0]: SparseTensor holding the top hypothesis for every example
-    # in the batch. Densify with -1 padding so we can strip it back out.
-    dense = tf.sparse.to_dense(decoded[0], default_value=-1).numpy()
+    # in the batch. tf.sparse.to_dense() assumes canonically-ordered
+    # (row-major sorted) indices; ctc_beam_search_decoder's output isn't
+    # documented to guarantee this in every TF version/execution mode, so
+    # reorder defensively first -- this is a no-op if already sorted, and
+    # protects against to_dense() silently misplacing values otherwise.
+    decoded_sparse = tf.sparse.reorder(decoded[0])
+    dense = tf.sparse.to_dense(decoded_sparse, default_value=-1).numpy()
 
     hyp_list = []
     for row in dense:
