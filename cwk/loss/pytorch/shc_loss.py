@@ -132,7 +132,7 @@ from __future__ import (absolute_import, division, print_function,
 __author__ = "Chanwoo Kim(chanwcom@gmail.com)"
 # Standard imports
 import enum
-from typing import Literal
+from typing import Literal, Optional
 
 # Third-party imports
 import numpy as np
@@ -604,7 +604,7 @@ def _fused_alpha_beta_step(prev_alpha, next_beta_lp, trans_mask, log_target_prob
 
 @torch.no_grad()
 def calculate_alpha_beta(trans_mask, log_target_probs, target_lens,
-                         logit_lens):
+                         logit_lens, max_logit_len_int: Optional[int] = None):
     """Calculates the alpha and beta variables required for CTC computation.
 
     Note that the definition of beta variable is somewhat different from the
@@ -626,6 +626,11 @@ def calculate_alpha_beta(trans_mask, log_target_probs, target_lens,
           The shape is (batch_size).
         logit_lens: A tensor containing the logit lengths (time steps).
           The shape is (batch_size).
+        max_logit_len_int: Optional pre-synced `int(torch.max(logit_lens))`.
+          Pass this in if the caller already needs that value (e.g. to build
+          a `seq_mask` outside this function) -- it avoids a second
+          redundant GPU->CPU sync of the same quantity. If omitted, it is
+          computed internally as before.
 
     Returns:
         log_alpha: The calculated forward variable tensor.
@@ -635,8 +640,13 @@ def calculate_alpha_beta(trans_mask, log_target_probs, target_lens,
     batch_size = log_target_probs.shape[0]
     device = log_target_probs.device
     dtype = log_target_probs.dtype
-    max_target_len = torch.max(target_lens)
-    max_logit_len = torch.max(logit_lens)
+    # Synced to Python ints once (each) and reused below, rather than
+    # re-deriving them from the tensors multiple times -- every `int(...)`
+    # / shape-use of a GPU tensor is its own blocking GPU->CPU sync.
+    max_target_len = int(torch.max(target_lens))
+    if max_logit_len_int is None:
+        max_logit_len_int = int(torch.max(logit_lens))
+    max_logit_len = max_logit_len_int
 
     if __debug__:
         # Perform sanity checks on input dimensions and shapes.
@@ -671,14 +681,13 @@ def calculate_alpha_beta(trans_mask, log_target_probs, target_lens,
 
     # Prepare time mask for padding frames. Shape: [B, T, 1]
     time_mask = seq_loss_util.sequence_mask(
-        logit_lens, int(max_logit_len)).unsqueeze(2).to(dtype)
+        logit_lens, max_logit_len).unsqueeze(2).to(dtype)
 
-    max_logit_len_int = int(max_logit_len)
-    for t_f in range(1, max_logit_len_int):
+    for t_f in range(1, max_logit_len):
         # t_b is the time index from the last time step to the first one,
         # kept in sync with t_f so the backward recursion runs alongside
         # the forward one in the same fused, compiled step.
-        t_b = max_logit_len_int - t_f - 1
+        t_b = max_logit_len - t_f - 1
 
         next_beta_lp = log_beta[:, t_b + 1, :] + log_target_probs[:, t_b + 1, :]
 
@@ -706,7 +715,7 @@ def calculate_alpha_beta(trans_mask, log_target_probs, target_lens,
 
     # Final Sequence Masking: Vectorized masking outside the loop.
     label_mask = seq_loss_util.sequence_mask(
-        target_lens, int(max_target_len)).unsqueeze(1).to(dtype)
+        target_lens, max_target_len).unsqueeze(1).to(dtype)
 
     final_valid_mask = time_mask * label_mask  # Shape: [B, T, L]
     log_alpha = torch.where(final_valid_mask == 1.0, log_alpha, LOG_0)
@@ -829,9 +838,16 @@ class ShcLoss(torch.autograd.Function):
         log_target_probs = seq_loss_util.calculate_log_label_prob(
             clamped_labels, log_probs)
 
+        # Synced once here and reused below (for both calculate_alpha_beta's
+        # internal use and seq_mask), instead of re-deriving
+        # int(torch.max(logits_len)) a second time -- each conversion of a
+        # GPU tensor to a Python int is its own blocking GPU->CPU sync.
+        max_logit_len_int = int(torch.max(logits_len))
+
         # Alpha and beta should be calculated.
         log_alpha, log_beta, log_seq_prob,  = calculate_alpha_beta(
-            trans_table, log_target_probs, target_lens, logits_len)
+            trans_table, log_target_probs, target_lens, logits_len,
+            max_logit_len_int=max_logit_len_int)
 
         # "gamma" is the posterior probability of the alignment variable $q_t$.
         #
@@ -854,20 +870,17 @@ class ShcLoss(torch.autograd.Function):
 
         # To ignore an invalid loss case.
         #
-        # If target_lens < logits_len, then the loss is not valid.
+        # If a sample's target is too long to be reachable within its
+        # logit_lens (no valid CTC alignment exists), the forward recursion
+        # leaves log_seq_prob at exactly LOG_0 for that sample. Such samples
+        # must be excluded from both the loss value and the gradient --
+        # zeroing only the gradient (as before) while leaving `loss`
+        # unmasked let a single invalid sample inflate `loss.mean()` by
+        # ~707 with no corresponding learning signal, which is misleading
+        # for logging/monitoring even though backprop itself stayed correct.
+        valid_sample_mask = (log_seq_prob > LOG_0 + EPS).to(dtype)
 
-        # (IMPORTANT)
-        # 2 L - 2 is only for SHC labellilng.
-        # But even in that case,
-#        invalid_length_mask = (torch.greater_equal(
-#            logits_len, 2 * org_target_lens - 2)).type(torch.float32)
-        #invalid_length_mask = validity_flag.type(dtype)
-
-        #loss = -torch.multiply(log_seq_prob, invalid_length_mask)
-        loss = -log_seq_prob
-
-        max_target_len = torch.max(target_lens)
-        num_classes = logits.shape[2]
+        loss = -log_seq_prob * valid_sample_mask
 
         # gamma in probability domain -- matches the original code exactly
         # (`gamma = torch.exp(log_gamma)`, optionally post-processed).
@@ -882,10 +895,7 @@ class ShcLoss(torch.autograd.Function):
 
         # Seqeunce mask
         seq_mask = seq_loss_util.sequence_mask(logits_len,
-                                 maxlen=int(torch.max(logits_len)))
-
-        # Zero out gradients for samples where log_seq_prob is valid (> LOG_0 + EPS)
-        valid_sample_mask = (log_seq_prob > LOG_0 + EPS).to(dtype)
+                                 maxlen=max_logit_len_int)
 
         # Fused, compiled gradient computation (scatter_add_ / exp /
         # subtract / mask), replacing the original step-by-step block.
