@@ -117,39 +117,62 @@ _DEFAULT_CHECKPOINT_TOP_DIR = "/mnt/data/home/chanwcom/models"
 _DEFAULT_RESOURCE_TOP_DIR = ("/mnt/data/home/chanwcom/local_repository/"
                              "cognitive_workflow_kit_emnlp_2026/run/resources")
 
-# GPU hyperparameter presets. Values are unchanged from the old
-# if-0/if-1 blocks -- "4090" is what used to be under `if 1:`, "a100" is
-# what used to be under `if 0:`. `--gpu_profile` picks one of these as a
-# starting point; any individually-passed CLI flag overrides just that key.
+# GPU hyperparameter presets: hardware/batch-shaped settings only (how big a
+# batch and how fast to step), independent of how much data or how long the
+# run trains for -- see _FINETUNE_PROFILES below for that axis.
+# "4090" is what used to be under `if 1:`, "a100" is what used to be under
+# `if 0:`. `--gpu_profile` picks one of these as a starting point; any
+# individually-passed CLI flag overrides just that key.
 _GPU_PROFILES: Dict[str, Dict[str, Any]] = {
     "4090": dict(
         per_device_train_batch_size=24,
         per_device_eval_batch_size=24,
         learning_rate=1e-4,
         gradient_accumulation_steps=2,
-        warmup_steps=500,
-        max_steps=2000,
-        save_steps=2000,
-        eval_steps=250,
-        load_best_model_at_end=True,
+        load_best_model_at_end=False,
     ),
     "a100": dict(
         per_device_train_batch_size=96,
         per_device_eval_batch_size=96,
         learning_rate=4e-4,
         gradient_accumulation_steps=2,
-        warmup_steps=500,
-        max_steps=1000,
-        save_steps=500,
-        eval_steps=250,
         load_best_model_at_end=False,
     ),
 }
 
-# Automatically synchronize save_steps and eval_steps with max_steps for each profile.
-for profile in _GPU_PROFILES.values():
+# Fine-tuning dataset/schedule presets: how much labeled data to fine-tune
+# on, and the step schedule appropriate for that amount.
+#   - `train_subdir`: default training data directory, relative to
+#     --db_top_dir (used only when --train_top_dir isn't passed explicitly).
+#   - `warmup_steps` / `max_steps` / `eval_steps`: schedule sized for that
+#     dataset. `save_steps` is auto-synced to `max_steps` below.
+# `--finetune_profile` picks one of these; any individually-passed CLI flag
+# (--warmup_steps/--max_steps/--eval_steps/--save_steps/--train_top_dir)
+# overrides just that value.
+_FINETUNE_PROFILES: Dict[str, Dict[str, Any]] = {
+    "libri_light_1hr": dict(
+        train_subdir="libri_light/1h",
+        warmup_steps=500,
+        max_steps=2000,
+        eval_steps=250,
+    ),
+    "libri_light_10hr": dict(
+        train_subdir="libri_light/10h",
+        warmup_steps=500,
+        max_steps=4000,
+        eval_steps=500,
+    ),
+    "libri_speech_clean_100hr": dict(
+        train_subdir="libri_light/train-clean-100",
+        warmup_steps=500,
+        max_steps=10000,
+        eval_steps=500,
+    ),
+}
+
+# Automatically synchronize save_steps with max_steps for each profile.
+for profile in _FINETUNE_PROFILES.values():
     profile["save_steps"] = profile["max_steps"]
-    profile["eval_steps"] = profile["max_steps"]
 
 class Wav2Vec2SPMTokenizer(PreTrainedTokenizer):
     """Custom Tokenizer for Wav2Vec2 using SentencePiece.
@@ -413,12 +436,14 @@ def _default_run_name(args: argparse.Namespace) -> str:
     Unlike the old hardcoded `out_name` string, this reflects whatever
     --alpha/--beta/--max_steps/--vocab_size were actually passed, so two
     runs with different hyperparameters never collide on directory name
-    unless they truly are identical runs.
+    unless they truly are identical runs. --finetune_profile is included
+    too, so e.g. 10hr and 100hr runs with the same alpha/beta don't collide.
     """
     if args.vocab_size is not None:
-        return (f"shc_{args.max_steps}steps_alpha_{_fmt_float(args.alpha)}"
-                f"_beta_{_fmt_float(args.beta)}_unigram_{args.vocab_size}")
-    return f"ctc_{args.max_steps}steps_default_vocab"
+        return (f"{args.finetune_profile}_shc_{args.max_steps}steps_alpha_"
+                f"{_fmt_float(args.alpha)}_beta_{_fmt_float(args.beta)}"
+                f"_unigram_{args.vocab_size}")
+    return f"{args.finetune_profile}_ctc_{args.max_steps}steps_default_vocab"
 
 
 def parse_args():
@@ -457,7 +482,7 @@ def parse_args():
     parser.add_argument(
         "--train_top_dir", type=str, default=None,
         help="Training dataset directory. Defaults to "
-             "'<db_top_dir>/libri_light/1h'.")
+             "'<db_top_dir>/<train_subdir of --finetune_profile>'.")
     parser.add_argument(
         "--test_top_dir", type=str, default=None,
         help="Evaluation dataset directory. Defaults to "
@@ -469,6 +494,16 @@ def parse_args():
              "such as the SentencePiece models "
              "('librispeech_unigram_{vocab_size}.model'). (Previously "
              "called `spm_top_dir`.)")
+
+    # --- Fine-tuning dataset / schedule profile ------------------------------
+    parser.add_argument(
+        "--finetune_profile", choices=sorted(_FINETUNE_PROFILES.keys()),
+        default="libri_light_1hr",
+        help="Fine-tuning dataset preset: picks the default --train_top_dir "
+             "(under --db_top_dir) plus a warmup_steps/max_steps/eval_steps/"
+             "save_steps schedule sized for that amount of data. Any of "
+             "--warmup_steps/--max_steps/--eval_steps/--save_steps/"
+             "--train_top_dir passed explicitly overrides just that value.")
 
     # --- GPU / training hyperparameter profile ------------------------------
     parser.add_argument(
@@ -498,11 +533,18 @@ def parse_args():
     args = parser.parse_args()
 
     # Fill in any hyperparameter left as None (i.e. not explicitly passed)
-    # from the chosen --gpu_profile.
-    profile = _GPU_PROFILES[args.gpu_profile]
-    for key, value in profile.items():
-        if getattr(args, key) is None:
-            setattr(args, key, value)
+    # from the chosen --gpu_profile and --finetune_profile. The two cover
+    # disjoint keys (hardware/batch settings vs. dataset/schedule settings),
+    # so the order between them doesn't matter; explicit CLI flags always
+    # win over both.
+    finetune_profile = _FINETUNE_PROFILES[args.finetune_profile]
+    for profile in (_GPU_PROFILES[args.gpu_profile], finetune_profile):
+        for key, value in profile.items():
+            if key == "train_subdir":
+                continue
+            if getattr(args, key) is None:
+                setattr(args, key, value)
+    args.train_subdir = finetune_profile["train_subdir"]
 
     if args.run_name is None:
         args.run_name = _default_run_name(args)
@@ -516,9 +558,10 @@ def main():
     args = parse_args()
 
     # Resolve data directories: an explicit --train_top_dir/--test_top_dir
-    # always wins; otherwise derive from --db_top_dir as before.
+    # always wins; otherwise derive from --db_top_dir, using the
+    # --finetune_profile's default train_subdir.
     train_top_dir = args.train_top_dir or os.path.join(
-        args.db_top_dir, "libri_light/1h")
+        args.db_top_dir, args.train_subdir)
     test_top_dir = args.test_top_dir or os.path.join(
         args.db_top_dir, "libri_speech_webdataset_new_oct_2025/test-clean")
 
