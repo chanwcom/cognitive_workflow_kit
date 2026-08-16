@@ -602,6 +602,93 @@ def _fused_alpha_beta_step(prev_alpha, next_beta_lp, trans_mask, log_target_prob
     return new_alpha, new_beta
 
 
+def _min_hops_to_reach_target(trans_table, target_lens):
+    """Computes the minimum number of frames needed for a valid alignment.
+
+    This is a purely structural (topology/length) computation -- it only
+    looks at which self-loop/step/skip transitions `trans_table` allows for
+    each sample, never at the model's predicted probabilities. That is
+    deliberate: whether a CTC alignment *exists* for a given
+    (target_len, logit_len) pair is fixed by the lengths alone and must not
+    depend on how confident/accurate the current model happens to be.
+
+    (Using `log_seq_prob > LOG_0 + EPS` as a proxy for "no alignment
+    exists" conflates two very different situations: a target that is
+    genuinely too long for the available frames vs. a target that is
+    reachable but whose probability underflows past LOG_0 simply because
+    the model's predictions are currently poor. Early in training, with a
+    freshly-initialized CTC head assigning close to uniform probability
+    over the vocabulary, the second case is common -- e.g. at
+    log(1/32) ~= -3.5/frame, only ~200 frames are needed to underflow past
+    LOG_0 = -706.9 even for a perfectly valid alignment. That was silently
+    zeroing out both loss and gradient for most/all samples early in
+    training.)
+
+    Self-loops (j == l) never help minimize the number of frames (they
+    consume a frame without advancing the label index), so they are
+    excluded below. Beyond that, this makes NO assumption about which
+    specific source offsets (e.g. "l-1" / "l-2", as in standard CTC) are
+    meaningful -- it reads directly off whatever `trans_table` allows from
+    ANY earlier label index. This keeps it correct for other transition
+    schemes too (e.g. `create_trans_allowance_table_shc`'s rules, or future
+    variants), not just the step/skip pattern `label_trans_allowance_table_
+    ctc` happens to produce today.
+
+    The one assumption this DOES rely on -- inherited from the alpha/beta
+    recursion itself, not specific to this function -- is that transitions
+    only ever go from an earlier-or-equal label index to a later one
+    (`trans_table[b, j, l]` is only meaningful for `j <= l`). That
+    monotonicity is what makes computing `log_alpha`/`log_beta` via a
+    single left-to-right / right-to-left sweep over `l` well-defined in the
+    first place, so it isn't an extra restriction imposed here.
+
+    Args:
+        trans_table: (batch_size, max_target_len, max_target_len). 0.0 where
+          a transition is allowed, LOG_0 where it is not.
+        target_lens: (batch_size,) target lengths (post blank-augmentation).
+
+    Returns:
+        (batch_size,) tensor: minimum number of frames required per sample.
+    """
+    batch_size, max_target_len, _ = trans_table.shape
+    device = trans_table.device
+    dtype = trans_table.dtype
+
+    unreachable = float(max_target_len)
+    min_hops = torch.full((batch_size, max_target_len), unreachable,
+                          device=device, dtype=dtype)
+    min_hops[:, 0] = 0.0
+
+    for l in range(1, max_target_len):
+        # `l` can potentially be first reached from ANY earlier label index
+        # j in [0, l) -- not just "l-1" or "l-2" -- whenever `trans_table`
+        # marks that (j -> l) edge as allowed for a given sample. (j == l,
+        # the self-loop, is excluded: it means "stay at l", which cannot be
+        # how l is *first* reached.)
+        #
+        # `allowed_from[:, j]` is, per sample, whether the edge (j -> l) is
+        # legal. `candidates[:, j]` holds "the hop count if I arrive at l
+        # via that j" -- i.e. `min_hops[j] + 1` -- but only where the edge
+        # is actually allowed; elsewhere `torch.where` substitutes
+        # `unreachable` (larger than any real hop count) instead of a real
+        # candidate, so a disallowed edge can never be selected by the
+        # `.min(dim=1)` below. It "wins" only when every other j is also
+        # unreachable, in which case `l` is correctly still unreachable
+        # too, and that `unreachable` value keeps propagating forward
+        # through later iterations the same way.
+        #
+        # Taking `.min(dim=1)` over all j then picks, per sample, whichever
+        # allowed predecessor reaches `l` in the fewest hops.
+        allowed_from = trans_table[:, :l, l] > (LOG_0 / 2)  # (B, l)
+        candidates = torch.where(allowed_from, min_hops[:, :l] + 1.0, unreachable)
+        min_hops[:, l] = candidates.min(dim=1).values
+
+    batch_indices = torch.arange(batch_size, device=device)
+    required_hops = min_hops[batch_indices, target_lens - 1]
+    # required_hops frames are needed *after* the starting frame.
+    return required_hops + 1.0
+
+
 @torch.no_grad()
 def calculate_alpha_beta(trans_mask, log_target_probs, target_lens,
                          logit_lens, max_logit_len_int: Optional[int] = None):
@@ -871,14 +958,20 @@ class ShcLoss(torch.autograd.Function):
         # To ignore an invalid loss case.
         #
         # If a sample's target is too long to be reachable within its
-        # logit_lens (no valid CTC alignment exists), the forward recursion
-        # leaves log_seq_prob at exactly LOG_0 for that sample. Such samples
-        # must be excluded from both the loss value and the gradient --
-        # zeroing only the gradient (as before) while leaving `loss`
-        # unmasked let a single invalid sample inflate `loss.mean()` by
-        # ~707 with no corresponding learning signal, which is misleading
-        # for logging/monitoring even though backprop itself stayed correct.
-        valid_sample_mask = (log_seq_prob > LOG_0 + EPS).to(dtype)
+        # logit_lens, no valid CTC alignment exists, and such samples must
+        # be excluded from both the loss value and the gradient. This is
+        # determined structurally from trans_table/lengths alone (see
+        # `_min_hops_to_reach_target`), NOT by thresholding log_seq_prob
+        # against LOG_0: log_seq_prob is a real accumulated sum of the
+        # model's current per-frame log-probabilities, so a structurally
+        # valid alignment can still legitimately underflow past LOG_0 early
+        # in training (e.g. a freshly-initialized head assigning near-
+        # uniform probability over the vocabulary). Thresholding on that
+        # value would then wrongly zero out loss/gradient for most of a
+        # batch during early training, not just the genuinely infeasible
+        # samples.
+        min_frames_required = _min_hops_to_reach_target(trans_table, target_lens)
+        valid_sample_mask = (logits_len.to(dtype) >= min_frames_required).to(dtype)
 
         loss = -log_seq_prob * valid_sample_mask
 
