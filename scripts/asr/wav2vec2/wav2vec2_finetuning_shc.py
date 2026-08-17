@@ -168,6 +168,19 @@ _FINETUNE_PROFILES: Dict[str, Dict[str, Any]] = {
         max_steps=10000,
         eval_steps=500,
     ),
+    # Full LibriSpeech (train-clean-100 + train-clean-360 + train-other-500,
+    # ~960h combined). Unlike the profiles above, the shards for this one
+    # aren't directly under `train_subdir` -- they're split across three
+    # subdirectories, one per split (see `train_shard_subdirs` below, and
+    # `sample_util.make_dataset`'s `sub_shard_dirs` param that consumes it).
+    "libri_speech_full_960hr": dict(
+        train_subdir="libri_speech_webdataset_new_oct_2025",
+        train_shard_subdirs=(
+            "train-clean-100", "train-clean-360", "train-other-500"),
+        warmup_steps=500,
+        max_steps=50000,
+        eval_steps=1000,
+    ),
 }
 
 # Automatically synchronize save_steps with max_steps for each profile.
@@ -530,6 +543,19 @@ def parse_args():
     parser.add_argument("--no_bf16", dest="bf16", action="store_false")
     parser.add_argument("--eval_accumulation_steps", type=int, default=1)
 
+    # --- Length-based batch bucketing (training data only) ------------------
+    parser.add_argument(
+        "--length_bucket_window_mult", type=int, default=50,
+        help="Local length-bucketing window size for the *training* "
+             "WebDataset stream, as a multiple of "
+             "--per_device_train_batch_size (see "
+             "sample_util._length_bucketed_stream). Reduces per-batch "
+             "padding waste (and thus wall-clock time) by reordering the "
+             "sample stream so each batch is drawn from a locally length-"
+             "sorted window instead of raw shard order, while still "
+             "shuffling the order batches come out in so training doesn't "
+             "sweep short-to-long. Pass <= 1 to disable.")
+
     args = parser.parse_args()
 
     # Fill in any hyperparameter left as None (i.e. not explicitly passed)
@@ -540,11 +566,16 @@ def parse_args():
     finetune_profile = _FINETUNE_PROFILES[args.finetune_profile]
     for profile in (_GPU_PROFILES[args.gpu_profile], finetune_profile):
         for key, value in profile.items():
-            if key == "train_subdir":
+            if key in ("train_subdir", "train_shard_subdirs"):
                 continue
             if getattr(args, key) is None:
                 setattr(args, key, value)
     args.train_subdir = finetune_profile["train_subdir"]
+    # Only set for profiles whose shards are split across multiple
+    # subdirectories (e.g. "libri_speech_full_960hr"); None for the rest,
+    # meaning sample_util.make_dataset() reads 'shard-*.tar' directly under
+    # train_top_dir as before.
+    args.train_shard_subdirs = finetune_profile.get("train_shard_subdirs")
 
     if args.run_name is None:
         args.run_name = _default_run_name(args)
@@ -576,9 +607,16 @@ def main():
     else:
         spm_model_path = None
 
-    # Dataset preparation.
+    # Dataset preparation. Length-bucketing (see --length_bucket_window_mult)
+    # only applies to the training stream -- it trades step-to-step wall-
+    # clock variance for lower average padding waste, which matters for
+    # training throughput; eval isn't performance-sensitive the same way,
+    # so it's left in raw shard order.
     train_dataset = sample_util.make_dataset(
-        train_top_dir, True, spm_model_path)
+        train_top_dir, True, spm_model_path,
+        batch_size=args.per_device_train_batch_size,
+        length_bucket_window_mult=args.length_bucket_window_mult,
+        sub_shard_dirs=args.train_shard_subdirs)
     test_dataset = sample_util.make_dataset(
         test_top_dir, True, spm_model_path)
 
