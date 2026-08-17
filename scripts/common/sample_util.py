@@ -9,7 +9,9 @@ import glob
 import io
 import os
 import random
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Union
+from dataclasses import dataclass
+from typing import (Any, Callable, Dict, Iterator, List, Optional, Sequence,
+                    Union)
 
 # Third-party imports
 import numpy as np
@@ -156,6 +158,131 @@ def _length_bucketed_stream(
         yield from _flush(buf)
 
 
+@dataclass
+class DynamicBatchConfig:
+    """Configures length-budget ("dynamic") batching (see
+    `_dynamic_length_batched_stream`).
+
+    Unlike `batch_size`-based bucketing, which keeps the *sample count* per
+    batch fixed and lets padding vary, dynamic batching keeps an upper bound
+    on the *padded batch cost* (`sample_count * max_length_in_batch`) and
+    lets the sample count vary instead. This is what actually caps peak
+    memory: a fixed `batch_size` still OOMs whenever enough long-audio
+    outliers land in the same batch, whereas a length budget can never be
+    exceeded regardless of which samples happen to land together -- a batch
+    of a few long utterances and a batch of many short ones cost about the
+    same.
+
+    Attributes:
+        collate_fn: Called once per assembled batch (a list of sample
+            dicts) to produce the final padded/tensorized batch dict, e.g.
+            a `DataCollatorCTCWithPadding` instance. Injected rather than
+            imported here so this module stays independent of any
+            particular model's collator.
+        max_batch_length: Budget for `sample_count * max_input_values_len`
+            within one batch, in the same units as `len(sample
+            ["input_values"])` (raw waveform samples for wav2vec2's feature
+            extractor). Must be tuned per-GPU/model; there's no way to
+            derive it analytically here.
+        max_batch_size: Optional hard cap on sample count per batch, even if
+            the length budget would allow more (e.g. to bound BatchNorm-like
+            statistics or op counts). None = uncapped.
+        window_mult: Local sort-window size, as a multiple of an assumed
+            "typical" batch -- reuses the same window/shuffle mechanism as
+            `_length_bucketed_stream`; see its docstring for why a window
+            (not a global sort) and why the per-window shuffle matters.
+        seed: Seed for the per-window batch-order shuffle.
+    """
+    collate_fn: Callable[[List[Dict[str, Any]]], Any]
+    max_batch_length: int
+    max_batch_size: Optional[int] = None
+    window_mult: int = 50
+    seed: int = 0
+
+
+def _dynamic_length_batched_stream(
+    samples: Iterator[Dict[str, Any]],
+    config: DynamicBatchConfig,
+) -> Iterator[Any]:
+    """Groups a sample stream into variable-size, length-budget-capped
+    batches, and yields the already-collated batch (not raw samples).
+
+    This is a WebDataset pipeline stage (added via `.compose()`), and unlike
+    `_length_bucketed_stream` it DOES batch (and collate) samples itself --
+    each item this yields is one full training batch. This means the
+    resulting dataset must be consumed with `DataLoader(batch_size=None)`
+    (automatic batching disabled), since sample count varies batch to batch
+    and there is no fixed `batch_size` for DataLoader to chunk by.
+
+    Batches are built by first locally sorting a window of samples by
+    length (same window/shuffle scheme as `_length_bucketed_stream`, see
+    its docstring), then greedily packing the sorted window: walking from
+    shortest to longest, a sample is added to the current batch unless
+    doing so would push `(current_batch_size + 1) * this_sample_length`
+    over `config.max_batch_length` (or `config.max_batch_size`), in which
+    case the current batch is closed and a new one started with that
+    sample. Because the window is sorted ascending, the newest sample
+    added is always the longest one in the batch so far, so its length
+    alone (not a running max) is the right multiplier -- no need to track
+    a separate running max.
+
+    A single sample whose own length already exceeds `max_batch_length`
+    unavoidably becomes a batch of size 1 that still exceeds the nominal
+    budget; this only bounds *combining* outliers with others, it is not a
+    substitute for filtering genuinely pathological samples (see
+    `make_dataset`'s `max_sample_length`).
+
+    Args:
+        samples: Iterator of already-preprocessed sample dicts (must
+            contain "input_values", whose length is used as the packing
+            key).
+        config: See `DynamicBatchConfig`.
+
+    Yields:
+        `config.collate_fn(batch)` for each assembled batch, in per-window
+        shuffled order (not sorted order -- see `_length_bucketed_stream`
+        for why).
+    """
+    rng = random.Random(config.seed)
+    window_size = max(config.max_batch_size or 1, 1) * config.window_mult
+
+    def _pack(sorted_buf: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+        batches: List[List[Dict[str, Any]]] = []
+        current: List[Dict[str, Any]] = []
+        for sample in sorted_buf:
+            length = len(sample["input_values"])
+            prospective_count = len(current) + 1
+            over_length_budget = (
+                prospective_count * length > config.max_batch_length)
+            over_size_cap = (
+                config.max_batch_size is not None
+                and prospective_count > config.max_batch_size)
+            if current and (over_length_budget or over_size_cap):
+                batches.append(current)
+                current = [sample]
+            else:
+                current.append(sample)
+        if current:
+            batches.append(current)
+        return batches
+
+    def _flush(buf: List[Dict[str, Any]]) -> Iterator[Any]:
+        buf.sort(key=lambda s: len(s["input_values"]))
+        batches = _pack(buf)
+        rng.shuffle(batches)
+        for batch in batches:
+            yield config.collate_fn(batch)
+
+    buf: List[Dict[str, Any]] = []
+    for sample in samples:
+        buf.append(sample)
+        if len(buf) >= window_size:
+            yield from _flush(buf)
+            buf = []
+    if buf:
+        yield from _flush(buf)
+
+
 def make_dataset(
     data_dir: str,
     do_tokenization: bool = True,
@@ -163,6 +290,8 @@ def make_dataset(
     batch_size: Optional[int] = None,
     length_bucket_window_mult: int = 50,
     sub_shard_dirs: Optional[Sequence[str]] = None,
+    max_sample_length: Optional[int] = None,
+    dynamic_batch: Optional[DynamicBatchConfig] = None,
 ) -> wds.WebDataset:
     """Create a WebDataset pipeline with optional SentencePiece support.
 
@@ -185,13 +314,16 @@ def make_dataset(
             entry in `sub_shard_dirs`, each with its own 'shard-*.tar').
         do_tokenization: Whether to apply tokenization during mapping.
         spm_model_path: Path to the SentencePiece *.model file.
-        batch_size: If given (and `length_bucket_window_mult > 1`), reorders
-            the sample stream so that consecutive `batch_size`-sized chunks
-            are length-homogeneous (see `_length_bucketed_stream`). Must
-            match the batch_size the resulting dataset will actually be
-            consumed with (e.g. `TrainingArguments.per_device_train_batch_
-            size`) for the bucketing to line up with real batch boundaries.
-            Omit (or pass 0/None) to leave the stream in raw shard order.
+        batch_size: Fixed-size length bucketing (see
+            `_length_bucketed_stream`). Mutually exclusive with
+            `dynamic_batch` -- pass at most one of the two. If given (and
+            `length_bucket_window_mult > 1`), reorders the sample stream so
+            that consecutive `batch_size`-sized chunks are
+            length-homogeneous. Must match the batch_size the resulting
+            dataset will actually be consumed with (e.g.
+            `TrainingArguments.per_device_train_batch_size`) for the
+            bucketing to line up with real batch boundaries. Omit (or pass
+            0/None) to leave the stream in raw shard order.
         length_bucket_window_mult: Local sort-window size, as a multiple of
             `batch_size`. Ignored if `batch_size` is not given. Pass <= 1
             to disable bucketing even if `batch_size` is given.
@@ -199,10 +331,28 @@ def make_dataset(
             `data_dir`, each containing its own 'shard-*.tar' files, to be
             combined into one shard list. Omit to read 'shard-*.tar'
             directly under `data_dir` (the original single-split layout).
+        max_sample_length: If given, drops any sample whose "input_values"
+            is longer than this (a hard safety cap on pathological
+            outliers, e.g. corrupted/mis-segmented audio). Independent of
+            `batch_size`/`dynamic_batch`; applies in either mode.
+        dynamic_batch: If given, enables length-budget ("dynamic") batching
+            instead of fixed-`batch_size` bucketing (see
+            `_dynamic_length_batched_stream` / `DynamicBatchConfig`).
+            Mutually exclusive with `batch_size`. The returned dataset then
+            yields already-collated BATCHES (not individual samples), so it
+            must be consumed with `DataLoader(batch_size=None)` --
+            `MyCtcTrainer.get_train_dataloader` does this when
+            `dynamic_batching=True`.
 
     Returns:
         A prepared WebDataset pipeline.
     """
+    if batch_size and dynamic_batch is not None:
+        raise ValueError(
+            "batch_size (fixed-size bucketing) and dynamic_batch "
+            "(length-budget batching) are mutually exclusive; pass at "
+            "most one.")
+
     # Initialize SentencePiece processor if a model path is provided
     tokenizer_obj = None
     if spm_model_path:
@@ -225,7 +375,14 @@ def make_dataset(
         .map(lambda x: {"audio": x[0], "text": x[1], "meta": x[2]})
         .map(lambda x: preprocess_sample(x, do_tokenization, tokenizer_obj))
     )
-    if batch_size and length_bucket_window_mult > 1:
+    if max_sample_length:
+        dataset = dataset.select(
+            lambda x: len(x["input_values"]) <= max_sample_length)
+    if dynamic_batch is not None:
+        dataset = dataset.compose(
+            lambda samples: _dynamic_length_batched_stream(
+                samples, dynamic_batch))
+    elif batch_size and length_bucket_window_mult > 1:
         dataset = dataset.compose(
             lambda samples: _length_bucketed_stream(
                 samples, batch_size, length_bucket_window_mult))
