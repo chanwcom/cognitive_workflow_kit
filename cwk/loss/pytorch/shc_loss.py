@@ -103,7 +103,28 @@ dynamic-shape behavior was additionally stress-tested (see point 1 below).
    debug scripts) -- functionally identical either way on the
    `ShcLoss.forward` path, but it documents the intent directly in code.
 
-5) Left unchanged
+5) `_min_hops_to_reach_target`'s label-axis loop (structural feasibility
+   check used for `valid_sample_mask`)
+   -----------------------------------------------------------------------
+   Same "kernel launch overhead dominates" situation as (1), just on the
+   much smaller label axis (L) instead of the time axis (T): the per-`l`
+   DP step (`torch.where` + `.min(dim=1)`) is cheap, but it's still a
+   separate kernel launch on every one of the L loop iterations, every
+   training step.
+   Fix: pulled the per-step body into `_min_hops_step`, compiled the same
+   way as (1). The key enabler is that `trans_col`/`min_hops` are read as
+   the FULL (B, L) tensors on every call (masked by `valid_source` instead
+   of sliced to `:l`), so the shape never changes across the L calls in a
+   given forward pass -- this is what lets it compile once and be reused,
+   the same way `_fused_alpha_beta_step` is reused across all `t_f`.
+   - Measured (CPU, for reference only; GPU busy with another job at
+     benchmarking time): eager -> compiled, B=24/L=40: 3.38ms -> 3.20ms
+     (1.06x); B=24/L=120: 11.61ms -> 10.97ms (1.06x); B=96/L=200:
+     48.44ms -> 37.00ms (1.31x). Modest on CPU; expect a larger relative
+     gain on GPU for the same reason noted in (1) (launch-overhead
+     reduction matters more there) -- not yet verified with real numbers.
+
+6) Left unchanged
    -----------------------------------------------------------------------
    - `create_trans_allowance_table_shc`: dead code inside `ShcLoss.forward`
      (guarded by `if 0:`), never executed. Logic preserved as-is; if you
@@ -602,6 +623,36 @@ def _fused_alpha_beta_step(prev_alpha, next_beta_lp, trans_mask, log_target_prob
     return new_alpha, new_beta
 
 
+@torch.compile(dynamic=True)
+def _min_hops_step(min_hops, trans_col, valid_source, unreachable):
+    """One step of the structural min-hops DP (see `_min_hops_to_reach_target`).
+
+    Pulled out and compiled the same way `_fused_alpha_beta_step` is for the
+    main T-loop: everything here has a FIXED shape on every call --
+    `trans_col`/`min_hops` are always the full (B, L), never a slice that
+    grows with `l` -- so `dynamic=True` lets this compile once and be reused
+    for every `l` in the loop below, instead of tracing/recompiling L times.
+
+    Args:
+        min_hops: (B, L) running DP table. Entries at index >= l still hold
+            the `unreachable` sentinel (not computed yet as of this call).
+        trans_col: (B, L) = trans_table[:, :, l] -- legality of every
+            possible (source -> l) edge for this destination l.
+        valid_source: (L,) bool, True at source indices < l. Excludes l
+            itself (the self-loop, which cannot be how l is first reached)
+            and any index not yet computed.
+        unreachable: 0-d tensor sentinel value (see caller for why it must
+            be safely larger than any real value this is ever compared
+            against downstream).
+
+    Returns:
+        (B,) new value for min_hops[:, l].
+    """
+    allowed = (trans_col > (LOG_0 / 2)) & valid_source.unsqueeze(0)
+    candidates = torch.where(allowed, min_hops + 1.0, unreachable)
+    return candidates.min(dim=1).values
+
+
 def _min_hops_to_reach_target(trans_table, target_lens):
     """Computes the minimum number of frames needed for a valid alignment.
 
@@ -654,34 +705,37 @@ def _min_hops_to_reach_target(trans_table, target_lens):
     device = trans_table.device
     dtype = trans_table.dtype
 
-    unreachable = float(max_target_len)
-    min_hops = torch.full((batch_size, max_target_len), unreachable,
+    # Sentinel for "no path found (yet)". Deliberately `inf` rather than
+    # e.g. `max_target_len`: this value eventually gets compared against
+    # `logits_len` (a frame count, which for real audio is typically far
+    # larger than the label length), so the sentinel must be safely larger
+    # than ANY possible real value on both sides of that comparison, not
+    # merely larger than achievable hop counts. `inf` sidesteps having to
+    # reason about relative magnitudes at all: `inf + 1 == inf`, and
+    # `logits_len >= inf` is always False for any finite `logits_len`, so it
+    # can never be mistaken for "feasible" downstream regardless of scale.
+    # (For today's CTC-only `trans_table`, unconditional step edges mean
+    # every index is always reachable within `max_target_len` hops, so this
+    # sentinel is never actually the final answer in practice -- but a
+    # future transition scheme with a genuinely unreachable destination
+    # would need this to hold.)
+    unreachable = torch.tensor(float("inf"), device=device, dtype=dtype)
+    min_hops = torch.full((batch_size, max_target_len), float("inf"),
                           device=device, dtype=dtype)
     min_hops[:, 0] = 0.0
 
+    idx = torch.arange(max_target_len, device=device)
     for l in range(1, max_target_len):
         # `l` can potentially be first reached from ANY earlier label index
         # j in [0, l) -- not just "l-1" or "l-2" -- whenever `trans_table`
-        # marks that (j -> l) edge as allowed for a given sample. (j == l,
-        # the self-loop, is excluded: it means "stay at l", which cannot be
-        # how l is *first* reached.)
-        #
-        # `allowed_from[:, j]` is, per sample, whether the edge (j -> l) is
-        # legal. `candidates[:, j]` holds "the hop count if I arrive at l
-        # via that j" -- i.e. `min_hops[j] + 1` -- but only where the edge
-        # is actually allowed; elsewhere `torch.where` substitutes
-        # `unreachable` (larger than any real hop count) instead of a real
-        # candidate, so a disallowed edge can never be selected by the
-        # `.min(dim=1)` below. It "wins" only when every other j is also
-        # unreachable, in which case `l` is correctly still unreachable
-        # too, and that `unreachable` value keeps propagating forward
-        # through later iterations the same way.
-        #
-        # Taking `.min(dim=1)` over all j then picks, per sample, whichever
-        # allowed predecessor reaches `l` in the fewest hops.
-        allowed_from = trans_table[:, :l, l] > (LOG_0 / 2)  # (B, l)
-        candidates = torch.where(allowed_from, min_hops[:, :l] + 1.0, unreachable)
-        min_hops[:, l] = candidates.min(dim=1).values
+        # marks that (j -> l) edge as allowed for a given sample.
+        # `trans_col`/`valid_source` are always the FULL (B, L) / (L,)
+        # shape (never a slice that grows with `l`), which is what lets
+        # `_min_hops_step` be compiled once and reused for every `l`.
+        trans_col = trans_table[:, :, l]      # (B, L)
+        valid_source = idx < l                # (L,); excludes j >= l
+        min_hops[:, l] = _min_hops_step(
+            min_hops, trans_col, valid_source, unreachable)
 
     batch_indices = torch.arange(batch_size, device=device)
     required_hops = min_hops[batch_indices, target_lens - 1]
