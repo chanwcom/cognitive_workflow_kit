@@ -97,8 +97,12 @@ from common import sample_util
 db_top_dir = "/mnt/data/database"
 test_top_dir = os.path.join(
     db_top_dir, "libri_speech_webdataset_new_oct_2025/test-clean")
-spm_top_dir = ("/mnt/data/home/chanwcom/local_repository/"
-              "cognitive_workflow_kit_emnlp_2026/run/resources")
+# Repo-relative, not tied to any one user's home directory: this script
+# lives at <repo_root>/scripts/asr/wav2vec2/, and the SPM resources are
+# checked into <repo_root>/resources/spm/.
+_REPO_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+spm_top_dir = os.path.join(_REPO_ROOT, "resources", "spm")
 
 
 # -----------------------------------------------------------------------
