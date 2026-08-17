@@ -107,15 +107,20 @@ from cwk.loss.pytorch import shc_loss
 #     model definitions/configs, so "checkpoint" describes its contents
 #     more accurately than "model".
 #   - `spm_top_dir` -> `resource_top_dir`: the actual path
-#     (".../run/resources") was already a general resource directory, not
-#     SPM-specific, and the SPM model filename is still built the same way
-#     (`librispeech_unigram_{vocab_size}.model`) underneath it. Renaming
-#     acknowledges that other shared resources (LMs, lexicons, etc.) could
-#     reasonably live in the same directory later.
+#     ("<repo_root>/resources/spm") was already a general resource
+#     directory, not SPM-specific, and the SPM model filename is still
+#     built the same way (`librispeech_unigram_{vocab_size}.model`)
+#     underneath it. Renaming acknowledges that other shared resources
+#     (LMs, lexicons, etc.) could reasonably live in the same directory
+#     later.
 _DEFAULT_DB_TOP_DIR = "/mnt/data/database"
 _DEFAULT_CHECKPOINT_TOP_DIR = "/mnt/data/home/chanwcom/models"
-_DEFAULT_RESOURCE_TOP_DIR = ("/mnt/data/home/chanwcom/local_repository/"
-                             "cognitive_workflow_kit_emnlp_2026/run/resources")
+# Repo-relative, not tied to any one user's home directory: this script
+# lives at <repo_root>/scripts/asr/wav2vec2/, and the SPM resources are
+# checked into <repo_root>/resources/spm/.
+_REPO_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+_DEFAULT_RESOURCE_TOP_DIR = os.path.join(_REPO_ROOT, "resources", "spm")
 
 # GPU hyperparameter presets: hardware/batch-shaped settings only (how big a
 # batch and how fast to step), independent of how much data or how long the
