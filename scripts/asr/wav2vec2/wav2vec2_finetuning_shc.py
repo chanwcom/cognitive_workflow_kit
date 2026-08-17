@@ -153,13 +153,13 @@ _FINETUNE_PROFILES: Dict[str, Dict[str, Any]] = {
     "libri_light_1hr": dict(
         train_subdir="libri_light/1h",
         warmup_steps=500,
-        max_steps=2000,
-        eval_steps=250,
+        max_steps=2500,
+        eval_steps=500,
     ),
     "libri_light_10hr": dict(
         train_subdir="libri_light/10h",
         warmup_steps=500,
-        max_steps=4000,
+        max_steps=5000,
         eval_steps=500,
     ),
     "libri_speech_clean_100hr": dict(
@@ -179,7 +179,7 @@ _FINETUNE_PROFILES: Dict[str, Dict[str, Any]] = {
             "train-clean-100", "train-clean-360", "train-other-500"),
         warmup_steps=500,
         max_steps=50000,
-        eval_steps=1000,
+        eval_steps=500,
     ),
 }
 
