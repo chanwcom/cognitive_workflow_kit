@@ -83,6 +83,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 import evaluate
 import numpy as np
 import torch
+from torch.utils.data import DataLoader
 from transformers import (AutoModelForCTC, AutoProcessor,
                           PreTrainedTokenizer, Trainer, TrainingArguments)
 
@@ -402,12 +403,54 @@ class DataCollatorCTCWithPadding:
 
 class MyCtcTrainer(Trainer):
     """Custom Trainer to override loss computation with custom Shc loss."""
-    def __init__(self, vocab_size=None, alpha=0.0, beta=0.0, *args, **kwargs):
+    def __init__(self, vocab_size=None, alpha=0.0, beta=0.0,
+                dynamic_batching=False, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # To include the boundary token at the end.
         self.custom_vocab_size = vocab_size
         self.alpha = alpha
         self.beta = beta
+        self.dynamic_batching = dynamic_batching
+
+    def get_train_dataloader(self) -> DataLoader:
+        """Builds the training DataLoader.
+
+        Default behavior (`dynamic_batching=False`) is unchanged: fixed
+        `per_device_train_batch_size`, with `train_dataset` already
+        length-bucketed by `sample_util._length_bucketed_stream` so that
+        each `batch_size`-sized chunk DataLoader groups is
+        length-homogeneous.
+
+        When `dynamic_batching=True`, `train_dataset` is instead a
+        WebDataset pipeline built with `sample_util.DynamicBatchConfig`
+        (see `sample_util._dynamic_length_batched_stream`): each item it
+        yields is ALREADY one fully collated training batch, with sample
+        count varying batch-to-batch so that `sample_count *
+        max_input_length` never exceeds a fixed budget -- this is what
+        actually bounds peak memory against outlier-length audio, unlike a
+        fixed `per_device_train_batch_size` which can still combine
+        several long-audio outliers into one OOM-ing batch.
+
+        The standard Trainer path can't express a varying batch size (it
+        always asks DataLoader to group a fixed `batch_size` via
+        `collate_fn`), so this uses `DataLoader(batch_size=None)` instead,
+        which disables DataLoader's own batching/collation and passes each
+        already-batched item straight through.
+        """
+        if not self.dynamic_batching:
+            return super().get_train_dataloader()
+
+        if self.train_dataset is None:
+            raise ValueError("Trainer: training requires a train_dataset.")
+
+        dataloader = DataLoader(
+            self.train_dataset,
+            batch_size=None,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=self.args.dataloader_pin_memory,
+            persistent_workers=self.args.dataloader_persistent_workers,
+        )
+        return self.accelerator.prepare(dataloader)
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         with torch.device(inputs["input_values"].device.type):
@@ -561,6 +604,43 @@ def parse_args():
              "shuffling the order batches come out in so training doesn't "
              "sweep short-to-long. Pass <= 1 to disable.")
 
+    # --- Dynamic (length-budget) batching (training data only) --------------
+    parser.add_argument(
+        "--dynamic_batching", action="store_true", default=False,
+        help="Replace fixed --per_device_train_batch_size bucketing with "
+             "length-budget batching (see sample_util.DynamicBatchConfig): "
+             "sample count per training batch varies so that "
+             "sample_count * max_input_length_in_batch stays under "
+             "--max_batch_audio_len, instead of staying at a fixed count. "
+             "This is what actually bounds peak memory against "
+             "outlier-length audio -- a fixed batch_size can still OOM "
+             "whenever several long-audio outliers land in the same "
+             "batch. Mutually exclusive with fixed-size bucketing; "
+             "--per_device_train_batch_size is ignored for the training "
+             "dataloader when this is set (eval is unaffected).")
+    parser.add_argument(
+        "--max_batch_audio_len", type=int, default=None,
+        help="Required when --dynamic_batching is set. Budget for "
+             "sample_count * max_input_values_len within one training "
+             "batch, in raw waveform samples (same units as "
+             "len(sample['input_values'])). Must be tuned per-GPU/model; "
+             "there's no way to derive it analytically. As a starting "
+             "point, try (typical --per_device_train_batch_size) * "
+             "(a representative max input length for your data).")
+    parser.add_argument(
+        "--max_dynamic_batch_size", type=int, default=None,
+        help="Optional hard cap on sample count per training batch under "
+             "--dynamic_batching, even if --max_batch_audio_len would "
+             "allow more. Omit for no cap.")
+    parser.add_argument(
+        "--max_sample_audio_len", type=int, default=None,
+        help="Drops any training/eval sample whose raw audio is longer "
+             "than this many waveform samples -- a hard safety net "
+             "against pathological outliers (e.g. corrupted or "
+             "mis-segmented audio) that no amount of batching can absorb "
+             "on their own. Applies regardless of --dynamic_batching. "
+             "Omit to disable.")
+
     args = parser.parse_args()
 
     # Fill in any hyperparameter left as None (i.e. not explicitly passed)
@@ -581,6 +661,11 @@ def parse_args():
     # meaning sample_util.make_dataset() reads 'shard-*.tar' directly under
     # train_top_dir as before.
     args.train_shard_subdirs = finetune_profile.get("train_shard_subdirs")
+
+    if args.dynamic_batching and args.max_batch_audio_len is None:
+        parser.error(
+            "--dynamic_batching requires --max_batch_audio_len (there's no "
+            "sane default -- it depends on your GPU memory and model).")
 
     if args.run_name is None:
         args.run_name = _default_run_name(args)
@@ -612,22 +697,46 @@ def main():
     else:
         spm_model_path = None
 
-    # Dataset preparation. Length-bucketing (see --length_bucket_window_mult)
-    # only applies to the training stream -- it trades step-to-step wall-
-    # clock variance for lower average padding waste, which matters for
-    # training throughput; eval isn't performance-sensitive the same way,
-    # so it's left in raw shard order.
-    train_dataset = sample_util.make_dataset(
-        train_top_dir, True, spm_model_path,
-        batch_size=args.per_device_train_batch_size,
-        length_bucket_window_mult=args.length_bucket_window_mult,
-        sub_shard_dirs=args.train_shard_subdirs)
-    test_dataset = sample_util.make_dataset(
-        test_top_dir, True, spm_model_path)
-
-    # Initialize data collator.
+    # Initialize data collator. Built before the datasets below because
+    # --dynamic_batching needs it as the collate_fn baked into the training
+    # WebDataset pipeline itself (see DynamicBatchConfig).
     data_collator = DataCollatorCTCWithPadding(
         processor=processor, padding="longest")
+
+    # Dataset preparation. Batching strategy for the *training* stream only
+    # -- eval isn't performance/memory-sensitive the same way, so it's
+    # always left in raw shard order, consumed with the normal fixed
+    # per_device_eval_batch_size DataLoader path.
+    if args.dynamic_batching:
+        # Length-budget batching: sample count per training batch varies so
+        # that sample_count * max_input_length_in_batch stays under
+        # --max_batch_audio_len, instead of staying at a fixed count. This
+        # is what actually bounds peak memory against outlier-length audio
+        # (see MyCtcTrainer.get_train_dataloader). The dataset already
+        # yields fully collated batches, so --per_device_train_batch_size
+        # is not used for training here.
+        train_dataset = sample_util.make_dataset(
+            train_top_dir, True, spm_model_path,
+            dynamic_batch=sample_util.DynamicBatchConfig(
+                collate_fn=data_collator,
+                max_batch_length=args.max_batch_audio_len,
+                max_batch_size=args.max_dynamic_batch_size,
+                window_mult=args.length_bucket_window_mult),
+            sub_shard_dirs=args.train_shard_subdirs,
+            max_sample_length=args.max_sample_audio_len)
+    else:
+        # Fixed-size length bucketing (see --length_bucket_window_mult):
+        # trades step-to-step wall-clock variance for lower average padding
+        # waste, without changing the batch_size itself.
+        train_dataset = sample_util.make_dataset(
+            train_top_dir, True, spm_model_path,
+            batch_size=args.per_device_train_batch_size,
+            length_bucket_window_mult=args.length_bucket_window_mult,
+            sub_shard_dirs=args.train_shard_subdirs,
+            max_sample_length=args.max_sample_audio_len)
+    test_dataset = sample_util.make_dataset(
+        test_top_dir, True, spm_model_path,
+        max_sample_length=args.max_sample_audio_len)
 
     actual_vocab_size = len(processor.tokenizer)
 
@@ -673,7 +782,8 @@ def main():
         compute_metrics=make_compute_metrics(processor),
         vocab_size=args.vocab_size,
         alpha=args.alpha,
-        beta=args.beta
+        beta=args.beta,
+        dynamic_batching=args.dynamic_batching
     )
 
     trainer.train()
