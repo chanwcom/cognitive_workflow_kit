@@ -244,7 +244,30 @@ def _dynamic_length_batched_stream(
         for why).
     """
     rng = random.Random(config.seed)
-    window_size = max(config.max_batch_size or 1, 1) * config.window_mult
+    # Window size, in raw samples, for the local sort/pack buffer. Sized as
+    # a multiple of an ASSUMED typical batch size, the same idea as
+    # `_length_bucketed_stream`'s `batch_size * window_mult` -- but unlike
+    # that function, there's no real `batch_size` here to multiply by (that
+    # is the whole point of dynamic batching), so `config.max_batch_size`
+    # is used as a stand-in WHEN the caller set one. When it's None (the
+    # common case -- no hard cap), falling back to `1 * window_mult` was a
+    # bug: it collapsed the window to just `window_mult` (default 50)
+    # samples, nowhere near enough to hold even one budget-sized batch, let
+    # alone the many batches this needs to meaningfully sort/shuffle
+    # across. That produced far smaller, far more numerous batches than
+    # the budget actually allows -- with no correctness impact (the packer
+    # still enforces `max_batch_length` no matter how small the window is,
+    # so this was never an OOM risk), but real throughput impact (more,
+    # smaller optimizer steps to process the same data, i.e. slower
+    # wall-clock) and, more importantly, an effective-batch-size /
+    # effective-samples-seen mismatch against the (fixed) --max_steps
+    # schedule the --finetune_profile presets assume.
+    # `_ASSUMED_BATCH_SIZE_FOR_WINDOWING` is a heuristic fallback for that
+    # unset case, not a measured value.
+    _ASSUMED_BATCH_SIZE_FOR_WINDOWING = 64
+    window_size = (
+        (config.max_batch_size or _ASSUMED_BATCH_SIZE_FOR_WINDOWING)
+        * config.window_mult)
 
     def _pack(sorted_buf: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
         batches: List[List[Dict[str, Any]]] = []
