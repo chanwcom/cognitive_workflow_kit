@@ -315,6 +315,7 @@ def make_dataset(
     sub_shard_dirs: Optional[Sequence[str]] = None,
     max_sample_length: Optional[int] = None,
     dynamic_batch: Optional[DynamicBatchConfig] = None,
+    seed: int = 0,
 ) -> wds.WebDataset:
     """Create a WebDataset pipeline with optional SentencePiece support.
 
@@ -366,6 +367,11 @@ def make_dataset(
             must be consumed with `DataLoader(batch_size=None)` --
             `MyCtcTrainer.get_train_dataloader` does this when
             `dynamic_batching=True`.
+        seed: Seed for the fixed-`batch_size` bucketing's per-window batch-
+            order shuffle (see `_length_bucketed_stream`). Ignored when
+            `dynamic_batch` is given -- pass `seed` on the
+            `DynamicBatchConfig` itself for that path instead, since it
+            already carries its own `seed` field.
 
     Returns:
         A prepared WebDataset pipeline.
@@ -408,5 +414,5 @@ def make_dataset(
     elif batch_size and length_bucket_window_mult > 1:
         dataset = dataset.compose(
             lambda samples: _length_bucketed_stream(
-                samples, batch_size, length_bucket_window_mult))
+                samples, batch_size, length_bucket_window_mult, seed=seed))
     return dataset
