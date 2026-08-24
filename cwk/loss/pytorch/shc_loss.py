@@ -916,7 +916,9 @@ class ShcLoss(torch.autograd.Function):
                 target_lens,
                 logits,
                 logits_len,
-                vocab_size=None, alpha=0.0, beta=0.0):
+                vocab_size=None, alpha=0.0, beta=0.0,
+                peak_preserving=False, peak_preserving_gamma=0.0,
+                peak_capping=False):
         """Calculates the Sequential Hypothesis Classifier (SHC) loss.
 
         Args:
@@ -929,6 +931,19 @@ class ShcLoss(torch.autograd.Function):
             logits: The predicted "logit value". The shape is given by
                 (batch_size, max_logit_seq_len, num_classes).
             logits_len: The len of logits that has the shape of (batch_size).
+            peak_preserving: If True, uses
+                apply_peak_preserving_selective_estimated_target_smoothing
+                (driven by peak_preserving_gamma) instead of the
+                alpha/beta-driven SETS post-processing.
+            peak_preserving_gamma: Fraction of each non-peak class's
+                probability mass redistributed uniformly over the
+                other active, non-peak classes. Only used when
+                peak_preserving is True.
+            peak_capping: If True (and peak_preserving is False), uses
+                apply_peak_capping_selective_estimated_target_smoothing
+                (driven by `alpha` as the confidence-cap parameter,
+                cap = 1 - alpha) instead of the alpha/beta-driven SETS
+                post-processing. Ignored if peak_preserving is True.
 
         Note that zero values are assumed to be masked-values.
 
@@ -1033,12 +1048,16 @@ class ShcLoss(torch.autograd.Function):
         # (`gamma = torch.exp(log_gamma)`, optionally post-processed).
         gamma = torch.exp(log_gamma)
 
-        # Optional post-processing on gamma (kept eager: `alpha` is a static
-        # python-float hyperparameter, so this conditional never toggles
-        # across calls for a given model config and is not worth compiling).
-        if alpha > 0.0:
+        # Optional post-processing on gamma (kept eager: `alpha`/
+        # `peak_preserving`/`peak_capping` are static python
+        # hyperparameters, so this conditional never toggles across calls
+        # for a given model config and is not worth compiling).
+        if peak_preserving or peak_capping or alpha > 0.0:
             gamma = shc_loss_util.apply_post_processing(
-                gamma, logits_len, alpha, beta)
+                gamma, logits_len, alpha, beta,
+                peak_preserving=peak_preserving,
+                gamma=peak_preserving_gamma,
+                peak_capping=peak_capping)
 
         # Seqeunce mask
         seq_mask = seq_loss_util.sequence_mask(logits_len,
@@ -1059,4 +1078,5 @@ class ShcLoss(torch.autograd.Function):
 
         gradient = torch.multiply(gradient, torch.reshape(grad, (-1, 1, 1)))
 
-        return None, None, gradient, None, None, None, None
+        return (None, None, gradient, None, None, None, None, None, None,
+               None)
