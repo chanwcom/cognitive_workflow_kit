@@ -83,6 +83,243 @@ import torch
 
 LOG_0 = -706.893623  # float(np.log(1e-307))
 
+def _masked_frame_mean(per_frame, logits_len):
+    """Averages a (B, T) per-frame quantity over each sequence's valid frames.
+
+    Args:
+        per_frame: Float tensor of shape (B, T).
+        logits_len: Long tensor of shape (B,).
+
+    Returns:
+        Float tensor of shape (B,).
+    """
+    max_time = per_frame.shape[1]
+    time_idx = torch.arange(max_time, device=per_frame.device)
+    valid = (time_idx.unsqueeze(0) < logits_len.unsqueeze(1)).to(
+        per_frame.dtype)  # (B, T).
+    denom = logits_len.to(per_frame.dtype).clamp(min=1.0)
+    return (per_frame * valid).sum(dim=1) / denom
+
+
+def _frame_entropy(probs):
+    """Per-frame Shannon entropy (nats) of a (B, T, K) distribution.
+
+    Uses torch.xlogy, which returns exactly 0 at p == 0 rather than the
+    NaN that `p * log(p)` would produce there. That matters here because
+    the smoothed targets are deliberately zero off the active set.
+    """
+    return -torch.xlogy(probs, probs).sum(dim=-1)
+
+
+def apply_entropy_matched_smoothing(est_probs, acoustic_probs, logits_len,
+                                     eps=1e-6, n_iter=20, alpha_max=1.0,
+                                     kappa=1.0, return_stats=False):
+    """Smooths a target until its entropy matches the model's own.
+
+    This is SETS with beta = 1 (mix in the masked uniform), except that
+    alpha is not a hyperparameter: it is SOLVED FOR, once per example,
+    so that the smoothed target's mean per-frame entropy equals the
+    acoustic posterior's.
+
+    The principle. `est_probs` is the alignment posterior
+    p(k_t = c | X, Y): it was computed by conditioning on the ground
+    truth Y, so it is more certain than the model's own evidence
+    supports, and by exactly the conditional mutual information
+
+        I(K_t ; Y | X) = H(K_t | X) - H(K_t | X, Y)
+
+    Matching the two entropies pays that leaked information back, which
+    is why the right amount of smoothing differs per utterance (each one
+    leaks a different amount) and why it needs no tuning.
+
+    Concretely, with A = {c : est_probs[c] >= eps}, N = |A|:
+
+        m   = 1/N on A, 0 elsewhere            (masked uniform)
+        q~  = est_probs restricted to A, renormalized
+        z(a) = (1 - a) * q~ + a * m
+
+    and alpha_b solves, over that example's valid frames,
+
+        mean_t H(z_{b,t}(alpha_b)) = mean_t H(acoustic_probs_{b,t})
+
+    Why bisection is safe here. Writing h(a) = H((1-a) q~ + a m) for one
+    frame, H is strictly concave and z(a) is affine in a, so h is
+    concave. Its derivative is
+
+        h'(a) = -sum_c (m_c - q~_c) log z_c(a)
+
+    (the +1 from d/dz of -z log z drops out because sum_c (m_c - q~_c) = 0).
+    Since m is UNIFORM on A, log m_c = -log N is constant there, so
+
+        h'(1) = log N * sum_c (m_c - q~_c) = 0
+
+    and concavity makes h' non-increasing, hence h'(a) >= h'(1) = 0 on
+    [0, 1]. So h -- and its mean over frames -- is non-decreasing, the
+    root is unique, and plain bisection converges. This is why q~ is
+    renormalized onto A first: with est_probs' sub-eps tail left in, m
+    is no longer uniform on the mixture's support, h'(1) is no longer
+    exactly 0, and monotonicity degrades from a theorem to an empirical
+    observation. (The discarded mass is at most K * eps, ~3e-5 for
+    K = 32 and eps = 1e-6.)
+
+    The same reasoning also shows why this function is class-space only:
+    the entropy being matched is H(K_t | X) over output CLASSES, so
+    est_probs must be over the same alphabet as acoustic_probs. It also
+    shows what breaks in label space, where the effective mixing
+    distribution is the blank-heavy scatter of the masked uniform rather
+    than a uniform: there h'(1) = H(m) - H(q~) - KL(q~ || m) can be
+    negative, h peaks at an interior a* and falls afterwards, and
+    bisection over [0, 1] would silently return a wrong root. Supporting
+    that needs a bracket-then-bisect search, which is deliberately not
+    implemented here.
+
+    Args:
+        est_probs: Float tensor of shape (B, T, C). The target to smooth,
+            i.e. the alignment posterior already mapped into class space.
+        acoustic_probs: Float tensor of shape (B, T, C). The model's own
+            softmax output, p(k_t | X). Must be over the SAME class axis
+            as est_probs. Should be detached: this whole computation is
+            target construction, not part of the differentiated graph.
+        logits_len: Long tensor of shape (B,). Valid (unpadded) length of
+            each sequence.
+        eps: Activity threshold. A class counts as reachable at (b, t)
+            when est_probs >= eps. This is load-bearing: N = |A| sets the
+            highest entropy the mixture can reach (log N), so a larger
+            eps lowers that ceiling and makes the alpha = 1 clamp fire
+            more often.
+        n_iter: Bisection iterations. 20 gives alpha to ~1e-6, far finer
+            than needed; the cost is negligible (see below) so there is
+            no reason to economize.
+        alpha_max: Upper clamp on the solved alpha. 1.0 disables it. A
+            safety net for early training, where the model is near-
+            uniform and the entropy target can exceed anything the
+            mixture can reach.
+        kappa: Fraction of the entropy gap to close, in (0, 1]. 1.0 is
+            exact matching. Lower values repay only part of the leaked
+            information, which keeps the interpretation intact while
+            weakening the intervention -- a more principled dial than a
+            hard alpha_max if the solved alpha turns out too large.
+        return_stats: If True, also returns a dict of diagnostics (see
+            Returns). Intended for observe-only pilot runs, where alpha
+            is measured but not used.
+
+    Returns:
+        Float tensor of shape (B, T, C) with smoothing applied and
+        padded time steps zeroed. If return_stats is True, returns
+        (smoothed, stats) where stats holds per-example (B,) tensors:
+            alpha       solved (and clamped) smoothing weight
+            h_lo        mean_t H(q~), the entropy at alpha = 0
+            h_hi        mean_t log N, the ceiling at alpha = 1
+            h_target    mean_t H(acoustic_probs), the matching target
+            case_b      1.0 where h_target >= h_hi (clamped to alpha_max)
+            case_c      1.0 where h_target <= h_lo (clamped to 0)
+            n_active    mean_t N
+            h_prime_1   mean_t h'(1); should be ~0, which empirically
+                        checks the monotonicity argument above
+
+    Cost: each bisection step is one (B, T, C) elementwise pass plus a
+    reduction, so ~22 passes total. Against a measured 1.74 s training
+    step (1hr profile, ~20k frames per batch, C = 32) that is under
+    0.05% -- about 1.4 s added over a 2000-step run. Bisection is
+    preferred over a fixed 0.01 grid not for speed but for resolution: a
+    0.01 grid quantizes a solved alpha of ~0.02 down to three distinct
+    levels, which would erase the per-example adaptivity that is the
+    whole point of the method.
+    """
+    assert est_probs.shape == acoustic_probs.shape, (
+        f"est_probs {tuple(est_probs.shape)} and acoustic_probs "
+        f"{tuple(acoustic_probs.shape)} must share the class axis; this "
+        f"smoothing is class-space only (see the docstring).")
+    assert 0.0 < kappa <= 1.0, f"kappa must be in (0, 1], got {kappa}"
+
+    orig_dtype = est_probs.dtype
+    # Entropies are differences of logs of small numbers; do the solve in
+    # float32 even when training runs in bf16.
+    target_probs = est_probs.float()
+    model_probs = acoustic_probs.float()
+    tiny = torch.finfo(torch.float32).tiny
+
+    batch, max_time, _ = target_probs.shape
+
+    active = target_probs >= eps  # (B, T, C).
+    n_active = active.sum(dim=-1, keepdim=True).clamp(min=1).float()
+    masked_uniform = active.float() / n_active  # m.
+
+    # q~: restrict to the active set and renormalize, so that m is exactly
+    # uniform on the mixture's support (see the docstring's proof).
+    restricted = target_probs * active
+    restricted = restricted / restricted.sum(
+        dim=-1, keepdim=True).clamp(min=tiny)
+
+    def mixture_entropy(alpha_b):
+        """mean_t H((1-a) q~ + a m) for each example; alpha_b is (B,)."""
+        a = alpha_b.view(batch, 1, 1)
+        mixture = (1.0 - a) * restricted + a * masked_uniform
+        return _masked_frame_mean(_frame_entropy(mixture), logits_len)
+
+    h_lo = mixture_entropy(torch.zeros(batch, device=target_probs.device))
+    h_hi = mixture_entropy(torch.ones(batch, device=target_probs.device))
+    h_target = _masked_frame_mean(_frame_entropy(model_probs), logits_len)
+    if kappa < 1.0:
+        h_target = h_lo + kappa * (h_target - h_lo)
+
+    lo = torch.zeros(batch, device=target_probs.device)
+    hi = torch.ones(batch, device=target_probs.device)
+    for _ in range(n_iter):
+        mid = 0.5 * (lo + hi)
+        below = mixture_entropy(mid) < h_target
+        lo = torch.where(below, mid, lo)
+        hi = torch.where(below, hi, mid)
+    alpha = 0.5 * (lo + hi)
+
+    # Cases the bisection cannot express (see the module-level discussion
+    # of failure modes). Ordering matters: the degenerate case is checked
+    # last so it wins over case_b, since when q~ == m the entropy is flat
+    # in alpha and any value is equally correct -- 0 is the least
+    # intrusive.
+    case_b = h_target >= h_hi  # Ceiling too low: smooth as hard as allowed.
+    case_c = h_target <= h_lo  # Target already diffuse enough: leave it.
+    degenerate = (h_hi - h_lo) < 1e-9  # q~ already uniform on A.
+    alpha = torch.where(case_b, torch.ones_like(alpha), alpha)
+    alpha = torch.where(case_c, torch.zeros_like(alpha), alpha)
+    alpha = torch.where(degenerate, torch.zeros_like(alpha), alpha)
+    alpha = alpha.clamp(max=alpha_max)
+
+    a = alpha.view(batch, 1, 1)
+    smoothed = (1.0 - a) * restricted + a * masked_uniform
+    # alpha == 0 must be the exact identity, not q~ (which differs from
+    # est_probs by the discarded sub-eps tail).
+    smoothed = torch.where(a == 0.0, target_probs, smoothed)
+
+    time_idx = torch.arange(max_time, device=target_probs.device)
+    valid = (time_idx.unsqueeze(0) < logits_len.unsqueeze(1))  # (B, T).
+    smoothed = smoothed * valid.unsqueeze(-1).float()
+    smoothed = smoothed.to(orig_dtype)
+
+    if not return_stats:
+        return smoothed
+
+    # h'(1) = -sum_{c in A} (m_c - q~_c) log m_c, which the docstring's
+    # argument says is exactly 0 for uniform m. Logging it turns that
+    # proof into something the pilot can check against real data.
+    log_m = torch.log(masked_uniform.clamp(min=tiny))
+    h_prime_1 = -torch.where(
+        active, (masked_uniform - restricted) * log_m,
+        torch.zeros_like(log_m)).sum(dim=-1)
+    stats = {
+        "alpha": alpha,
+        "h_lo": h_lo,
+        "h_hi": h_hi,
+        "h_target": h_target,
+        "case_b": case_b.float(),
+        "case_c": case_c.float(),
+        "n_active": _masked_frame_mean(
+            n_active.squeeze(-1), logits_len),
+        "h_prime_1": _masked_frame_mean(h_prime_1, logits_len),
+    }
+    return smoothed, stats
+
+
 def apply_post_processing(est_probs, logits_len, alpha, beta, eps=1e-6,
                            peak_preserving=False, gamma=None,
                            peak_capping=False):
