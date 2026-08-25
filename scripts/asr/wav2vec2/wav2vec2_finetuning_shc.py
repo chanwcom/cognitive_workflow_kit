@@ -89,7 +89,7 @@ from transformers import (AutoModelForCTC, AutoProcessor,
 
 # Custom imports
 from common import sample_util
-from cwk.loss.pytorch import shc_loss
+from cwk.loss.pytorch import shc_loss, shc_loss_util
 
 # Default directory settings. These are now just the *defaults* for the
 # corresponding CLI flags (see parse_args()) rather than fixed module-level
@@ -461,6 +461,49 @@ class MyCtcTrainer(Trainer):
             persistent_workers=self.args.dataloader_persistent_workers,
         )
         return self.accelerator.prepare(dataloader)
+
+    def log(self, logs, *args, **kwargs):
+        """Folds the entropy-matched alpha diagnostics into the normal log.
+
+        With --alpha_mode=entropy_matched the smoothing weight is solved
+        for per example and changes over training, so the run's behaviour
+        is not recoverable from its configuration the way a fixed alpha
+        is. Recording it has to happen during the run: `save_steps`
+        equals `max_steps`, so a finished run leaves a single checkpoint
+        and probing that gives one point, not a trajectory.
+
+        Merging into the existing log dict rather than printing
+        separately keeps the output parseable by the sweep
+        orchestrators, which read each `{...}` line with
+        `ast.literal_eval` and key off "eval_wer"/"train_runtime" --
+        extra keys are ignored there.
+
+        The dict is empty for every other alpha_mode, so this is inert
+        unless entropy matching actually ran.
+        """
+        stats = shc_loss_util.pop_last_entropy_match_stats()
+        if stats:
+            alpha = stats["alpha"].float()
+            quantiles = torch.quantile(
+                alpha, torch.tensor([0.1, 0.5, 0.9], device=alpha.device))
+            logs = dict(logs)
+            logs.update({
+                "em_alpha_p10": round(quantiles[0].item(), 6),
+                "em_alpha_p50": round(quantiles[1].item(), 6),
+                "em_alpha_p90": round(quantiles[2].item(), 6),
+                # Fraction of examples pinned at the reachable ceiling,
+                # i.e. asked for more entropy than the mixture can give.
+                "em_at_ceiling": round(
+                    (alpha >= stats["peak"].float() - 1e-6).float()
+                    .mean().item(), 4),
+                "em_at_zero": round((alpha <= 1e-9).float().mean().item(), 4),
+                "em_h_lo": round(stats["h_lo"].float().mean().item(), 4),
+                "em_h_target": round(
+                    stats["h_target"].float().mean().item(), 4),
+                "em_h_ceiling": round(
+                    stats["h_ceiling"].float().mean().item(), 4),
+            })
+        super().log(logs, *args, **kwargs)
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         with torch.device(inputs["input_values"].device.type):

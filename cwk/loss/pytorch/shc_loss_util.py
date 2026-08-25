@@ -111,6 +111,38 @@ def _frame_entropy(probs):
     return -torch.xlogy(probs, probs).sum(dim=-1)
 
 
+# Per-example diagnostics from the most recent entropy-matched solve.
+#
+# The solved alpha is not a hyperparameter anyone chose, so the only way
+# to know what the method actually did during a run is to record it as it
+# happens. That cannot be recovered afterwards: `save_steps` equals
+# `max_steps`, so a finished run leaves exactly one checkpoint, and
+# probing it measures a single point rather than a trajectory. Worse, a
+# checkpoint from a DIFFERENT variant's run answers "what would matching
+# pick for this model" rather than "what did matching actually use",
+# which is a different question once the smoothing feeds back into the
+# model it is measured on.
+#
+# Populated unconditionally, since every value stored here is already
+# computed by the solve -- keeping them costs nothing. Tensors are kept
+# on device and left unconverted so that recording never forces a
+# GPU->CPU sync in the training loop; the consumer converts them at
+# whatever cadence it logs.
+_LAST_ENTROPY_MATCH_STATS = {}
+
+
+def pop_last_entropy_match_stats():
+    """Returns and clears diagnostics from the last entropy-matched solve.
+
+    Returns:
+        Dict of (B,) tensors -- alpha, h_lo, h_ceiling, h_target, peak --
+        or an empty dict if no solve has run since the last call.
+    """
+    stats = dict(_LAST_ENTROPY_MATCH_STATS)
+    _LAST_ENTROPY_MATCH_STATS.clear()
+    return stats
+
+
 def _mixture_entropy(q_tilde, mix, alpha, logits_len):
     """mean_t H((1-a) q~ + a m) per example; `alpha` is (B,)."""
     a = alpha.view(-1, 1, 1)
@@ -457,6 +489,15 @@ def _finish_entropy_matched_smoothing(original, q_tilde, mix, model_probs,
     alpha, h_lo, h_ceiling, peak = _solve_entropy_matched_alpha(
         q_tilde, mix, h_target, logits_len, n_iter, monotone)
     alpha = alpha.clamp(max=alpha_max)
+
+    _LAST_ENTROPY_MATCH_STATS.clear()
+    _LAST_ENTROPY_MATCH_STATS.update({
+        "alpha": alpha.detach(),
+        "h_lo": h_lo.detach(),
+        "h_ceiling": h_ceiling.detach(),
+        "h_target": h_target.detach(),
+        "peak": peak.detach(),
+    })
 
     a = alpha.view(-1, 1, 1)
     smoothed = (1.0 - a) * q_tilde + a * mix
