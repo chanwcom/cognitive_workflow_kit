@@ -405,8 +405,9 @@ class MyCtcTrainer(Trainer):
     """Custom Trainer to override loss computation with custom Shc loss."""
     def __init__(self, vocab_size=None, alpha=0.0, beta=0.0,
                 peak_preserving=False, gamma=0.0, peak_capping=False,
-                smoothing_space="label", dynamic_batching=False,
-                *args, **kwargs):
+                smoothing_space="label", alpha_mode="fixed",
+                entropy_match_alpha_max=1.0, entropy_match_kappa=1.0,
+                dynamic_batching=False, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # To include the boundary token at the end.
         self.custom_vocab_size = vocab_size
@@ -416,6 +417,9 @@ class MyCtcTrainer(Trainer):
         self.gamma = gamma
         self.peak_capping = peak_capping
         self.smoothing_space = smoothing_space
+        self.alpha_mode = alpha_mode
+        self.entropy_match_alpha_max = entropy_match_alpha_max
+        self.entropy_match_kappa = entropy_match_kappa
         self.dynamic_batching = dynamic_batching
 
     def get_train_dataloader(self) -> DataLoader:
@@ -487,6 +491,9 @@ class MyCtcTrainer(Trainer):
                 self.gamma,
                 self.peak_capping,
                 self.smoothing_space,
+                self.alpha_mode,
+                self.entropy_match_alpha_max,
+                self.entropy_match_kappa,
             ).mean()
 
         if return_outputs:
@@ -544,6 +551,15 @@ def _default_run_name(args: argparse.Namespace) -> str:
     # which were label-space) keeps resolving to the same directory.
     if args.smoothing_space != "label":
         suffix += f"_{args.smoothing_space}space"
+    if args.alpha_mode != "fixed":
+        # alpha is solved for, so the alpha/beta already in the name
+        # are meaningless; what identifies the run is the clamp and
+        # the repayment fraction instead.
+        suffix += "_hmatch"
+        if args.entropy_match_alpha_max < 1.0:
+            suffix += f"_amax{_fmt_float(args.entropy_match_alpha_max)}"
+        if args.entropy_match_kappa < 1.0:
+            suffix += f"_kappa{_fmt_float(args.entropy_match_kappa)}"
     if args.vocab_size is not None:
         if args.peak_preserving:
             return (f"{args.finetune_profile}_shc_{args.max_steps}steps_"
@@ -604,6 +620,26 @@ def parse_args():
              "classes present in the transcript, whereas in 'class' space "
              "it is genuinely uniform over the vocabulary. See the module "
              "docstring of cwk/loss/pytorch/shc_loss_util.py.")
+    parser.add_argument(
+        "--alpha_mode", type=str, default="fixed",
+        choices=["fixed", "entropy_matched"],
+        help="How the smoothing weight is chosen. 'fixed' (default) "
+             "uses --alpha as given. 'entropy_matched' ignores "
+             "--alpha/--beta and instead solves, per example, for the "
+             "alpha whose smoothed target has the same mean per-frame "
+             "entropy as the model's own acoustic posterior -- i.e. it "
+             "repays the information the target leaked from the labels. "
+             "Requires --smoothing_space=class.")
+    parser.add_argument(
+        "--entropy_match_alpha_max", type=float, default=1.0,
+        help="Upper clamp on the solved alpha. 1.0 (default) disables "
+             "it. Only used with --alpha_mode=entropy_matched.")
+    parser.add_argument(
+        "--entropy_match_kappa", type=float, default=1.0,
+        help="Fraction of the entropy gap to close, in (0, 1]. 1.0 "
+             "(default) is exact matching; lower values repay only "
+             "part of the leaked information. Only used with "
+             "--alpha_mode=entropy_matched.")
 
     # --- Run naming / output location -------------------------------------
     parser.add_argument(
@@ -917,6 +953,9 @@ def main():
         gamma=args.gamma,
         peak_capping=args.peak_capping,
         smoothing_space=args.smoothing_space,
+        alpha_mode=args.alpha_mode,
+        entropy_match_alpha_max=args.entropy_match_alpha_max,
+        entropy_match_kappa=args.entropy_match_kappa,
         dynamic_batching=args.dynamic_batching
     )
 

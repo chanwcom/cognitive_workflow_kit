@@ -957,7 +957,9 @@ class ShcLoss(torch.autograd.Function):
                 logits_len,
                 vocab_size=None, alpha=0.0, beta=0.0,
                 peak_preserving=False, peak_preserving_gamma=0.0,
-                peak_capping=False, smoothing_space="label"):
+                peak_capping=False, smoothing_space="label",
+                alpha_mode="fixed", entropy_match_alpha_max=1.0,
+                entropy_match_kappa=1.0):
         """Calculates the Sequential Hypothesis Classifier (SHC) loss.
 
         Args:
@@ -1000,6 +1002,21 @@ class ShcLoss(torch.autograd.Function):
                     is the space in which the smoothed target is directly
                     comparable to the acoustic posterior p(k_t | X) --
                     same alphabet, same random variable.
+            alpha_mode: Either "fixed" (default) or "entropy_matched".
+                "fixed" uses the `alpha` argument as-is, the historical
+                behavior. "entropy_matched" ignores `alpha`/`beta` and
+                instead SOLVES for alpha per example, so that the
+                smoothed target's mean per-frame entropy equals the
+                acoustic posterior's -- see
+                shc_loss_util.apply_entropy_matched_smoothing. Requires
+                smoothing_space="class", since the entropy being matched
+                is over output classes; the combination is rejected
+                rather than silently comparing entropies across
+                different alphabets.
+            entropy_match_alpha_max: Upper clamp on the solved alpha.
+                Only used when alpha_mode is "entropy_matched".
+            entropy_match_kappa: Fraction of the entropy gap to close, in
+                (0, 1]. Only used when alpha_mode is "entropy_matched".
 
         Note that zero values are assumed to be masked-values.
 
@@ -1116,6 +1133,15 @@ class ShcLoss(torch.autograd.Function):
         assert smoothing_space in ("label", "class"), (
             f"smoothing_space must be 'label' or 'class', got "
             f"{smoothing_space!r}")
+        assert alpha_mode in ("fixed", "entropy_matched"), (
+            f"alpha_mode must be 'fixed' or 'entropy_matched', got "
+            f"{alpha_mode!r}")
+        assert not (alpha_mode == "entropy_matched"
+                    and smoothing_space != "class"), (
+            "alpha_mode='entropy_matched' requires smoothing_space="
+            "'class': the entropy being matched is over output classes, "
+            "so the target must live on that same alphabet. See "
+            "shc_loss_util.apply_entropy_matched_smoothing.")
         smoothing_enabled = peak_preserving or peak_capping or alpha > 0.0
 
         if smoothing_space == "class":
@@ -1123,7 +1149,18 @@ class ShcLoss(torch.autograd.Function):
             # over output classes, p(k_t = c | X, Y).
             ground_truth_prob = _scatter_to_class_space(
                 gamma, log_probs, clamped_labels)
-            if smoothing_enabled:
+            if alpha_mode == "entropy_matched":
+                # alpha is solved for per example rather than passed in,
+                # so `alpha`/`beta` play no part here. log_probs is
+                # already detached (forward runs under no_grad), which is
+                # what this needs: it is target construction, not part of
+                # the differentiated graph.
+                ground_truth_prob = (
+                    shc_loss_util.apply_entropy_matched_smoothing(
+                        ground_truth_prob, log_probs.exp(), logits_len,
+                        alpha_max=entropy_match_alpha_max,
+                        kappa=entropy_match_kappa))
+            elif smoothing_enabled:
                 ground_truth_prob = shc_loss_util.apply_post_processing(
                     ground_truth_prob, logits_len, alpha, beta,
                     peak_preserving=peak_preserving,
@@ -1156,6 +1193,8 @@ class ShcLoss(torch.autograd.Function):
         # One entry per non-ctx argument of `forward`, in order:
         # labels, target_lens, logits, logits_len, vocab_size, alpha, beta,
         # peak_preserving, peak_preserving_gamma, peak_capping,
-        # smoothing_space. Only `logits` (position 3) receives a gradient.
+        # smoothing_space, alpha_mode, entropy_match_alpha_max,
+        # entropy_match_kappa.
+        # Only `logits` (position 3) receives a gradient.
         return (None, None, gradient, None, None, None, None, None, None,
-               None, None)
+               None, None, None, None, None)
