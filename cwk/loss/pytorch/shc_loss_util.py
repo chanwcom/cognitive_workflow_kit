@@ -111,6 +111,133 @@ def _frame_entropy(probs):
     return -torch.xlogy(probs, probs).sum(dim=-1)
 
 
+def _mixture_entropy(q_tilde, mix, alpha, logits_len):
+    """mean_t H((1-a) q~ + a m) per example; `alpha` is (B,)."""
+    a = alpha.view(-1, 1, 1)
+    mixture = (1.0 - a) * q_tilde + a * mix
+    return _masked_frame_mean(_frame_entropy(mixture), logits_len)
+
+
+def _mixture_entropy_gradient(q_tilde, mix, alpha, logits_len):
+    """mean_t h'(a), where h(a) = H((1-a) q~ + a m).
+
+        h'(a) = -sum_c (m_c - q~_c) log z_c(a)
+
+    The +1 from d/dz of -z log z drops out because the coefficients sum
+    to zero. Terms where z_c is 0 (off both supports) contribute nothing
+    and are masked out rather than evaluated, since log 0 is -inf there.
+    """
+    a = alpha.view(-1, 1, 1)
+    z = (1.0 - a) * q_tilde + a * mix
+    support = z > 0
+    tiny = torch.finfo(z.dtype).tiny
+    terms = (mix - q_tilde) * torch.log(z.clamp(min=tiny))
+    per_frame = -torch.where(support, terms, torch.zeros_like(terms)).sum(
+        dim=-1)
+    return _masked_frame_mean(per_frame, logits_len)
+
+
+def _entropy_peak_alpha(q_tilde, mix, logits_len, n_iter):
+    """Locates a* = argmax_a h(a) on [0, 1].
+
+    Needed only when `mix` is not uniform on the mixture's support. h is
+    concave, so h' is non-increasing and a* is where it crosses zero;
+    bisecting on h' finds it. When h'(1) >= 0 the function never turns
+    over and a* = 1 (the monotone case); when h'(0) <= 0 it is already
+    past its peak at a = 0.
+    """
+    batch = q_tilde.shape[0]
+    device = q_tilde.device
+    zeros = torch.zeros(batch, device=device)
+    ones = torch.ones(batch, device=device)
+
+    grad_at_0 = _mixture_entropy_gradient(q_tilde, mix, zeros, logits_len)
+    grad_at_1 = _mixture_entropy_gradient(q_tilde, mix, ones, logits_len)
+
+    lo, hi = zeros.clone(), ones.clone()
+    for _ in range(n_iter):
+        mid = 0.5 * (lo + hi)
+        rising = _mixture_entropy_gradient(
+            q_tilde, mix, mid, logits_len) > 0.0
+        lo = torch.where(rising, mid, lo)
+        hi = torch.where(rising, hi, mid)
+    peak = 0.5 * (lo + hi)
+
+    peak = torch.where(grad_at_1 >= 0.0, ones, peak)
+    peak = torch.where(grad_at_0 <= 0.0, zeros, peak)
+    return peak
+
+
+def _solve_entropy_matched_alpha(q_tilde, mix, h_target, logits_len,
+                                  n_iter, monotone):
+    """Solves mean_t H((1-a) q~ + a m) = h_target for a, per example.
+
+    Args:
+        q_tilde: (B, T, K) target, already restricted to the active set
+            and renormalized.
+        mix: (B, T, K) distribution being mixed in.
+        h_target: (B,) entropy to match.
+        logits_len: (B,) valid lengths.
+        n_iter: bisection iterations.
+        monotone: True when `mix` is uniform on the support, which makes
+            h'(1) = 0 and h non-decreasing (see
+            apply_entropy_matched_smoothing's docstring). The search then
+            runs over the whole of [0, 1]. When False -- the label-space
+            case, where the mixing distribution is the blank-heavy
+            scatter of a masked uniform -- h can turn over at an interior
+            a*, so the peak is located first and the search is confined
+            to [0, a*]. Searching [0, 1] there would let bisection land
+            on the falling branch, or on nothing at all when both
+            endpoints sit below the target.
+
+    Returns:
+        (alpha, h_lo, h_ceiling, peak): all (B,). h_ceiling is the
+        highest entropy actually reachable, h(a*) -- which is h(1) only
+        in the monotone case.
+    """
+    batch = q_tilde.shape[0]
+    device = q_tilde.device
+    zeros = torch.zeros(batch, device=device)
+
+    if monotone:
+        peak = torch.ones(batch, device=device)
+    else:
+        peak = _entropy_peak_alpha(q_tilde, mix, logits_len, n_iter)
+
+    h_lo = _mixture_entropy(q_tilde, mix, zeros, logits_len)
+    h_ceiling = _mixture_entropy(q_tilde, mix, peak, logits_len)
+
+    lo, hi = zeros.clone(), peak.clone()
+    for _ in range(n_iter):
+        mid = 0.5 * (lo + hi)
+        below = _mixture_entropy(q_tilde, mix, mid, logits_len) < h_target
+        lo = torch.where(below, mid, lo)
+        hi = torch.where(below, hi, mid)
+    alpha = 0.5 * (lo + hi)
+
+    # Cases the search cannot express. Ordering matters: the degenerate
+    # check is last so it wins over the ceiling clamp, since when the
+    # entropy is flat in alpha any value is equally correct and 0 is the
+    # least intrusive.
+    reached_ceiling = h_target >= h_ceiling
+    already_diffuse = h_target <= h_lo
+    degenerate = (h_ceiling - h_lo) < 1e-9
+    alpha = torch.where(reached_ceiling, peak, alpha)
+    alpha = torch.where(already_diffuse, zeros, alpha)
+    alpha = torch.where(degenerate, zeros, alpha)
+    return alpha, h_lo, h_ceiling, peak
+
+
+def _restrict_and_renormalize(probs, eps):
+    """Masks to the active set and renormalizes; returns (q~, active, N)."""
+    active = probs >= eps
+    n_active = active.sum(dim=-1, keepdim=True).clamp(min=1).float()
+    restricted = probs * active
+    restricted = restricted / restricted.sum(dim=-1, keepdim=True).clamp(
+        min=torch.finfo(torch.float32).tiny)
+    return restricted, active, n_active
+
+
 def apply_entropy_matched_smoothing(est_probs, acoustic_probs, logits_len,
                                      eps=1e-6, n_iter=20, alpha_max=1.0,
                                      kappa=1.0, return_stats=False):
@@ -232,90 +359,132 @@ def apply_entropy_matched_smoothing(est_probs, acoustic_probs, logits_len,
         f"smoothing is class-space only (see the docstring).")
     assert 0.0 < kappa <= 1.0, f"kappa must be in (0, 1], got {kappa}"
 
-    orig_dtype = est_probs.dtype
-    # Entropies are differences of logs of small numbers; do the solve in
-    # float32 even when training runs in bf16.
     target_probs = est_probs.float()
-    model_probs = acoustic_probs.float()
-    tiny = torch.finfo(torch.float32).tiny
+    restricted, _, n_active = _restrict_and_renormalize(target_probs, eps)
+    masked_uniform = (target_probs >= eps).float() / n_active
+    return _finish_entropy_matched_smoothing(
+        target_probs, restricted, masked_uniform, acoustic_probs.float(),
+        logits_len, est_probs.dtype, n_iter, alpha_max, kappa,
+        n_active, monotone=True, return_stats=return_stats)
 
-    batch, max_time, _ = target_probs.shape
 
-    active = target_probs >= eps  # (B, T, C).
-    n_active = active.sum(dim=-1, keepdim=True).clamp(min=1).float()
-    masked_uniform = active.float() / n_active  # m.
+def apply_label_space_entropy_matched_smoothing(
+        est_probs, mix_probs, acoustic_probs, logits_len, n_iter=20,
+        alpha_max=1.0, kappa=1.0, return_stats=False):
+    """Entropy matching against an arbitrary, non-uniform mixing prior.
 
-    # q~: restrict to the active set and renormalize, so that m is exactly
-    # uniform on the mixture's support (see the docstring's proof).
-    restricted = target_probs * active
-    restricted = restricted / restricted.sum(
-        dim=-1, keepdim=True).clamp(min=tiny)
+    This is the L-SETS-H entry point. The caller supplies both operands
+    already scattered into class space:
 
-    def mixture_entropy(alpha_b):
-        """mean_t H((1-a) q~ + a m) for each example; alpha_b is (B,)."""
-        a = alpha_b.view(batch, 1, 1)
-        mixture = (1.0 - a) * restricted + a * masked_uniform
-        return _masked_frame_mean(_frame_entropy(mixture), logits_len)
+        est_probs  = scatter(gamma restricted to its active label
+                     positions, renormalized)
+        mix_probs  = scatter(masked uniform over those label positions)
 
-    h_lo = mixture_entropy(torch.zeros(batch, device=target_probs.device))
-    h_hi = mixture_entropy(torch.ones(batch, device=target_probs.device))
+    Doing it that way is exact rather than an approximation: scatter is
+    linear, so smoothing in label space and then scattering equals
+    scattering both operands and mixing in class space,
+
+        scatter((1-a) g~ + a m_L) = (1-a) scatter(g~) + a scatter(m_L)
+
+    which is what lets the entropy be evaluated over classes -- the only
+    alphabet on which comparing against the acoustic posterior means
+    anything -- while the intervention itself is still the label-space
+    one.
+
+    The difference from the class-space variant is that `mix_probs` is
+    NOT uniform. Roughly half of the blank-augmented label positions are
+    blank, so the scattered masked uniform puts ~0.5 on blank and spreads
+    the rest by how many reachable positions each class occupies. That
+    costs the monotonicity theorem:
+
+        h'(1) = H(m) - H(q~) - KL(q~ || m)
+
+    which is 0 only when m is uniform on the support, and is comfortably
+    negative otherwise (~ -1.1 for a confident model against a
+    blank-heavy prior). h then rises to an interior peak a* and falls
+    after it, so this path locates a* first and searches only [0, a*].
+    Consequences worth knowing when reading results from it: the
+    reachable entropy ceiling is h(a*), strictly below log N, so the
+    ceiling clamp fires more often here than in class space.
+
+    Args:
+        est_probs: (B, T, C) scattered, restricted, renormalized target.
+        mix_probs: (B, T, C) scattered masked uniform. Must already be a
+            distribution over the class axis.
+        acoustic_probs: (B, T, C) the model's softmax output, detached.
+        logits_len: (B,) valid lengths.
+        n_iter: bisection iterations, used for both the peak search and
+            the entropy solve.
+        alpha_max: upper clamp on the solved alpha.
+        kappa: fraction of the entropy gap to close, in (0, 1].
+        return_stats: as in apply_entropy_matched_smoothing, with
+            `h_hi` reporting h(a*) and an extra `peak` entry holding a*.
+
+    Returns:
+        (B, T, C) smoothed target, or (smoothed, stats).
+    """
+    assert est_probs.shape == acoustic_probs.shape == mix_probs.shape, (
+        "est_probs, mix_probs and acoustic_probs must all share the "
+        "class axis")
+    assert 0.0 < kappa <= 1.0, f"kappa must be in (0, 1], got {kappa}"
+
+    target_probs = est_probs.float()
+    n_active = (mix_probs > 0).float().sum(dim=-1, keepdim=True)
+    return _finish_entropy_matched_smoothing(
+        target_probs, target_probs, mix_probs.float(),
+        acoustic_probs.float(), logits_len, est_probs.dtype, n_iter,
+        alpha_max, kappa, n_active, monotone=False,
+        return_stats=return_stats)
+
+
+def _finish_entropy_matched_smoothing(original, q_tilde, mix, model_probs,
+                                       logits_len, out_dtype, n_iter,
+                                       alpha_max, kappa, n_active,
+                                       monotone, return_stats):
+    """Shared tail of both entropy-matched variants.
+
+    Kept in one place because everything after "what exactly is being
+    mixed in" -- the solve, the clamps, the padding mask, the stats --
+    is identical whether the prior is uniform or not.
+    """
     h_target = _masked_frame_mean(_frame_entropy(model_probs), logits_len)
+    h_lo_probe = _mixture_entropy(
+        q_tilde, mix, torch.zeros(q_tilde.shape[0], device=q_tilde.device),
+        logits_len)
     if kappa < 1.0:
-        h_target = h_lo + kappa * (h_target - h_lo)
+        h_target = h_lo_probe + kappa * (h_target - h_lo_probe)
 
-    lo = torch.zeros(batch, device=target_probs.device)
-    hi = torch.ones(batch, device=target_probs.device)
-    for _ in range(n_iter):
-        mid = 0.5 * (lo + hi)
-        below = mixture_entropy(mid) < h_target
-        lo = torch.where(below, mid, lo)
-        hi = torch.where(below, hi, mid)
-    alpha = 0.5 * (lo + hi)
-
-    # Cases the bisection cannot express (see the module-level discussion
-    # of failure modes). Ordering matters: the degenerate case is checked
-    # last so it wins over case_b, since when q~ == m the entropy is flat
-    # in alpha and any value is equally correct -- 0 is the least
-    # intrusive.
-    case_b = h_target >= h_hi  # Ceiling too low: smooth as hard as allowed.
-    case_c = h_target <= h_lo  # Target already diffuse enough: leave it.
-    degenerate = (h_hi - h_lo) < 1e-9  # q~ already uniform on A.
-    alpha = torch.where(case_b, torch.ones_like(alpha), alpha)
-    alpha = torch.where(case_c, torch.zeros_like(alpha), alpha)
-    alpha = torch.where(degenerate, torch.zeros_like(alpha), alpha)
+    alpha, h_lo, h_ceiling, peak = _solve_entropy_matched_alpha(
+        q_tilde, mix, h_target, logits_len, n_iter, monotone)
     alpha = alpha.clamp(max=alpha_max)
 
-    a = alpha.view(batch, 1, 1)
-    smoothed = (1.0 - a) * restricted + a * masked_uniform
-    # alpha == 0 must be the exact identity, not q~ (which differs from
-    # est_probs by the discarded sub-eps tail).
-    smoothed = torch.where(a == 0.0, target_probs, smoothed)
+    a = alpha.view(-1, 1, 1)
+    smoothed = (1.0 - a) * q_tilde + a * mix
+    # alpha == 0 must be the exact identity: q_tilde can differ from the
+    # original by the discarded sub-eps tail.
+    smoothed = torch.where(a == 0.0, original, smoothed)
 
-    time_idx = torch.arange(max_time, device=target_probs.device)
-    valid = (time_idx.unsqueeze(0) < logits_len.unsqueeze(1))  # (B, T).
-    smoothed = smoothed * valid.unsqueeze(-1).float()
-    smoothed = smoothed.to(orig_dtype)
+    max_time = original.shape[1]
+    time_idx = torch.arange(max_time, device=original.device)
+    valid = time_idx.unsqueeze(0) < logits_len.unsqueeze(1)  # (B, T).
+    smoothed = (smoothed * valid.unsqueeze(-1).float()).to(out_dtype)
 
     if not return_stats:
         return smoothed
 
-    # h'(1) = -sum_{c in A} (m_c - q~_c) log m_c, which the docstring's
-    # argument says is exactly 0 for uniform m. Logging it turns that
-    # proof into something the pilot can check against real data.
-    log_m = torch.log(masked_uniform.clamp(min=tiny))
-    h_prime_1 = -torch.where(
-        active, (masked_uniform - restricted) * log_m,
-        torch.zeros_like(log_m)).sum(dim=-1)
     stats = {
         "alpha": alpha,
         "h_lo": h_lo,
-        "h_hi": h_hi,
+        "h_hi": h_ceiling,
         "h_target": h_target,
-        "case_b": case_b.float(),
-        "case_c": case_c.float(),
-        "n_active": _masked_frame_mean(
-            n_active.squeeze(-1), logits_len),
-        "h_prime_1": _masked_frame_mean(h_prime_1, logits_len),
+        "case_b": (h_target >= h_ceiling).float(),
+        "case_c": (h_target <= h_lo).float(),
+        "n_active": _masked_frame_mean(n_active.squeeze(-1), logits_len),
+        "h_prime_1": _mixture_entropy_gradient(
+            q_tilde, mix,
+            torch.ones(q_tilde.shape[0], device=q_tilde.device),
+            logits_len),
+        "peak": peak,
     }
     return smoothed, stats
 

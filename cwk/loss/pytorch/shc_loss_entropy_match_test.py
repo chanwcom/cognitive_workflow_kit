@@ -265,5 +265,123 @@ class EntropyMatchedSmoothingTest(unittest.TestCase):
                                        atol=1e-5))
 
 
+
+def _blank_heavy_case(batch=3, max_time=4):
+    """A target/prior pair shaped like the label-space one.
+
+    The mixing prior puts ~0.5 on class 0, mimicking what the masked
+    uniform over blank-augmented label positions becomes once scattered
+    into class space (roughly half of those positions are blank). The
+    target is confident on a DIFFERENT class, which is what drives
+    KL(q~ || m) up and h'(1) negative.
+    """
+    target_row = torch.tensor([0.05, 0.80, 0.10, 0.05, 0.0, 0.0])
+    mix_row = torch.tensor([0.50, 0.20, 0.20, 0.10, 0.0, 0.0])
+    acoustic_row = torch.tensor([0.30, 0.35, 0.20, 0.10, 0.03, 0.02])
+
+    target = target_row.repeat(batch, max_time, 1).clone()
+    mix = mix_row.repeat(batch, max_time, 1).clone()
+    acoustic = acoustic_row.repeat(batch, max_time, 1).clone()
+    logits_len = torch.full((batch,), max_time)
+    return target, mix, acoustic, logits_len
+
+
+class LabelSpaceEntropyMatchedSmoothingTest(unittest.TestCase):
+    """Tests for the non-uniform-prior (L-SETS-H) entry point."""
+
+    def test_non_uniform_prior_really_is_non_monotone(self):
+        """The premise of the whole bracket-then-bisect path.
+
+        If entropy were still monotone in alpha here, the extra peak
+        search would be dead weight and plain bisection would do. This
+        asserts the opposite: with a blank-heavy prior the entropy rises,
+        peaks, and comes back down.
+        """
+        target, mix, _, logits_len = _blank_heavy_case()
+        curve = [
+            shc_loss_util._mixture_entropy(
+                target, mix,
+                torch.full((target.shape[0],), step / 40.0), logits_len)[0]
+            for step in range(41)
+        ]
+        peak_index = max(range(len(curve)), key=lambda i: curve[i])
+        self.assertGreater(peak_index, 0, "entropy never rose")
+        self.assertLess(peak_index, 40, "entropy never turned over")
+        self.assertLess(curve[-1], curve[peak_index],
+                        "h(1) should sit below the peak")
+
+    def test_h_prime_1_is_negative_for_a_blank_heavy_prior(self):
+        """h'(1) = H(m) - H(q~) - KL(q~||m), which uniform m alone zeroes."""
+        target, mix, acoustic, logits_len = _blank_heavy_case()
+        _, stats = (
+            shc_loss_util.apply_label_space_entropy_matched_smoothing(
+                target, mix, acoustic, logits_len, return_stats=True))
+        self.assertTrue(torch.all(stats["h_prime_1"] < 0.0))
+
+    def test_solution_stays_on_the_rising_branch(self):
+        """The solved alpha must not land past the peak."""
+        target, mix, acoustic, logits_len = _blank_heavy_case()
+        _, stats = (
+            shc_loss_util.apply_label_space_entropy_matched_smoothing(
+                target, mix, acoustic, logits_len, return_stats=True))
+        self.assertTrue(torch.all(stats["alpha"] <= stats["peak"] + 1e-6))
+        self.assertTrue(torch.all(stats["peak"] < 1.0),
+                        "fixture should have an interior peak")
+
+    def test_ceiling_is_the_peak_not_h_of_one(self):
+        """Reachable entropy is h(a*), which is strictly below h(1) here."""
+        target, mix, acoustic, logits_len = _blank_heavy_case()
+        _, stats = (
+            shc_loss_util.apply_label_space_entropy_matched_smoothing(
+                target, mix, acoustic, logits_len, return_stats=True))
+        ones = torch.ones(target.shape[0])
+        h_at_one = shc_loss_util._mixture_entropy(
+            target, mix, ones, logits_len)
+        self.assertTrue(torch.all(stats["h_hi"] > h_at_one))
+
+    def test_matches_the_target_entropy_when_reachable(self):
+        """Where the target is inside the reachable range, it is hit."""
+        target, mix, acoustic, logits_len = _blank_heavy_case()
+        smoothed, stats = (
+            shc_loss_util.apply_label_space_entropy_matched_smoothing(
+                target, mix, acoustic, logits_len, return_stats=True))
+        interior = (stats["case_b"] == 0) & (stats["case_c"] == 0)
+        if torch.any(interior):
+            achieved = _mean_frame_entropy(smoothed, logits_len)
+            self.assertTrue(torch.allclose(
+                achieved[interior], stats["h_target"][interior],
+                atol=1e-4))
+
+    def test_uniform_prior_reproduces_the_class_space_answer(self):
+        """Handed a uniform prior, the general path must agree with the
+        specialized one -- the peak search should then find a* = 1."""
+        target, acoustic, logits_len = _interior_case()
+        eps = 1e-6
+        restricted, active, n_active = (
+            shc_loss_util._restrict_and_renormalize(target, eps))
+        mix = active.float() / n_active
+
+        _, specialized = shc_loss_util.apply_entropy_matched_smoothing(
+            target, acoustic, logits_len, return_stats=True)
+        _, general = (
+            shc_loss_util.apply_label_space_entropy_matched_smoothing(
+                restricted, mix, acoustic, logits_len, return_stats=True))
+
+        self.assertTrue(torch.allclose(general["peak"], torch.ones_like(
+            general["peak"]), atol=1e-6))
+        self.assertTrue(torch.allclose(
+            specialized["alpha"], general["alpha"], atol=1e-5))
+
+    def test_output_is_a_distribution(self):
+        """Rows must stay valid despite the different mixing prior."""
+        target, mix, acoustic, logits_len = _blank_heavy_case()
+        smoothed = (
+            shc_loss_util.apply_label_space_entropy_matched_smoothing(
+                target, mix, acoustic, logits_len))
+        sums = smoothed.sum(dim=-1)
+        self.assertTrue(torch.allclose(sums, torch.ones_like(sums),
+                                       atol=1e-5))
+        self.assertTrue(torch.all(smoothed >= 0.0))
+
 if __name__ == "__main__":
     unittest.main()

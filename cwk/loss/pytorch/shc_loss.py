@@ -1136,15 +1136,40 @@ class ShcLoss(torch.autograd.Function):
         assert alpha_mode in ("fixed", "entropy_matched"), (
             f"alpha_mode must be 'fixed' or 'entropy_matched', got "
             f"{alpha_mode!r}")
-        assert not (alpha_mode == "entropy_matched"
-                    and smoothing_space != "class"), (
-            "alpha_mode='entropy_matched' requires smoothing_space="
-            "'class': the entropy being matched is over output classes, "
-            "so the target must live on that same alphabet. See "
-            "shc_loss_util.apply_entropy_matched_smoothing.")
         smoothing_enabled = peak_preserving or peak_capping or alpha > 0.0
 
-        if smoothing_space == "class":
+        if alpha_mode == "entropy_matched" and smoothing_space == "label":
+            # L-SETS-H. The entropy has to be evaluated over classes --
+            # that is the only alphabet on which comparing against the
+            # acoustic posterior means anything -- but the intervention
+            # itself should stay the label-space one. Scatter is linear,
+            # so scattering BOTH operands and mixing in class space is
+            # exactly equal to mixing in label space and scattering:
+            #   scatter((1-a) g~ + a m_L)
+            #     = (1-a) scatter(g~) + a scatter(m_L)
+            # The scattered m_L is not uniform (roughly half the label
+            # positions are blank), which is why this path uses the
+            # bracket-then-bisect solver.
+            active_label = gamma >= 1e-6
+            n_label = active_label.sum(
+                dim=-1, keepdim=True).clamp(min=1).to(gamma.dtype)
+            mix_label = active_label.to(gamma.dtype) / n_label
+            gamma_restricted = gamma * active_label
+            gamma_restricted = gamma_restricted / gamma_restricted.sum(
+                dim=-1, keepdim=True).clamp(min=1e-30)
+
+            ground_truth_prob = _scatter_to_class_space(
+                gamma_restricted, log_probs, clamped_labels)
+            mix_prob = _scatter_to_class_space(
+                mix_label, log_probs, clamped_labels)
+            ground_truth_prob = (
+                shc_loss_util.apply_label_space_entropy_matched_smoothing(
+                    ground_truth_prob, mix_prob, log_probs.exp(),
+                    logits_len, alpha_max=entropy_match_alpha_max,
+                    kappa=entropy_match_kappa))
+            gradient = _gradient_from_class_probs(
+                ground_truth_prob, log_probs, seq_mask, valid_sample_mask)
+        elif smoothing_space == "class":
             # Scatter L -> C FIRST, so the smoothing acts on the posterior
             # over output classes, p(k_t = c | X, Y).
             ground_truth_prob = _scatter_to_class_space(
