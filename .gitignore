@@ -1,0 +1,17 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Bazel convenience symlinks and outputs
+bazel-*
+
+# Packaging / build artifacts
+build/
+*.egg-info/
+
+# Manual "save the old version before editing" backups
+*.org
+
+# Local scratch + experiment outputs. Large (754M as of this commit) and
+# purely local; the reproducible parts live in scripts/ instead.
+run/

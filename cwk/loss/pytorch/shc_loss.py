@@ -869,41 +869,80 @@ def calculate_alpha_beta(trans_mask, log_target_probs, target_lens,
 
 
 @torch.compile(dynamic=True)
-def _compute_gradient(gamma, log_probs, clamped_labels, seq_mask,
-                       valid_sample_mask):
-    """Fuses the gamma->gradient computation block into one compiled graph.
+def _scatter_to_class_space(gamma, log_probs, clamped_labels):
+    """Maps the alignment posterior from label-position space to class space.
 
-    This is the scatter_add_ -> exp -> subtract -> mask chain from the
-    original `ShcLoss.forward`. It has no data-dependent control flow, so it
-    compiles cleanly as a single graph and lets Inductor fuse the
-    elementwise ops around the scatter.
+    gamma[b, t, l] is a distribution over blank-augmented label POSITIONS.
+    Summing the positions that carry the same label id gives the posterior
+    over output CLASSES:
+
+        ground_truth_prob[b, t, c] = sum_{l : labels[b, l] == c} gamma[b, t, l]
+                                   = p(k_t = c | X, Y)
+
+    Total mass is preserved, so the result sums to 1 over the class axis
+    whenever gamma sums to 1 over the label axis.
 
     IMPORTANT: `gamma` must already be in probability domain (i.e. this
-    function expects `torch.exp(log_gamma)`, with the optional
-    `shc_loss_util.apply_post_processing` already applied if `alpha > 0.0`)
-    -- matching the original code's semantics exactly. Do NOT pass log_gamma
-    here; the original never round-trips gamma through log-domain again
-    before the scatter_add_, and doing so would change the numerics.
+    function expects `torch.exp(log_gamma)`) -- matching the original
+    code's semantics exactly. Do NOT pass log_gamma here; the original
+    never round-trips gamma through log-domain again before the
+    scatter_add_, and doing so would change the numerics.
 
     Args:
         gamma: (B, T, L) posterior of the alignment variable, probability
-            domain, optionally post-processed.
-        log_probs: (B, T, C) log_softmax(logits, dim=-1).
+            domain, optionally already post-processed ("label" space).
+        log_probs: (B, T, C) log_softmax(logits, dim=-1). Used only for its
+            shape/dtype/device.
         clamped_labels: (B, L) label ids clamped to >= 0.
+
+    Returns:
+        ground_truth_prob: (B, T, C).
+    """
+    ground_truth_prob = torch.zeros_like(log_probs)
+    expanded_indices = clamped_labels.unsqueeze(1).expand(-1, log_probs.size(1), -1)
+    ground_truth_prob.scatter_add_(2, expanded_indices, gamma)
+    return ground_truth_prob
+
+
+@torch.compile(dynamic=True)
+def _gradient_from_class_probs(ground_truth_prob, log_probs, seq_mask,
+                                valid_sample_mask):
+    """Forms the CTC gradient from a class-space target distribution.
+
+    This is the exp -> subtract -> mask tail of the original
+    `ShcLoss.forward`. It has no data-dependent control flow, so it
+    compiles cleanly as a single graph.
+
+    Args:
+        ground_truth_prob: (B, T, C) target distribution over classes,
+            optionally already post-processed ("class" space).
+        log_probs: (B, T, C) log_softmax(logits, dim=-1).
         seq_mask: (B, T) boolean/float sequence mask over the logit axis.
         valid_sample_mask: (B,) 1.0 for samples with a valid log_seq_prob.
 
     Returns:
         gradient: (B, T, C) tensor, same convention as the original code.
     """
-    ground_truth_prob = torch.zeros_like(log_probs)
-    expanded_indices = clamped_labels.unsqueeze(1).expand(-1, log_probs.size(1), -1)
-    ground_truth_prob.scatter_add_(2, expanded_indices, gamma)
-
     gradient = -(ground_truth_prob - log_probs.exp())
     gradient = gradient * seq_mask.unsqueeze(2).to(gradient.dtype)
     gradient = gradient * valid_sample_mask.view(-1, 1, 1)
     return gradient
+
+
+def _compute_gradient(gamma, log_probs, clamped_labels, seq_mask,
+                       valid_sample_mask):
+    """scatter_add_ -> exp -> subtract -> mask, i.e. the original chain.
+
+    Kept as a single entry point so the historical "label"-space path is
+    expressed exactly as before; it is now just the composition of the two
+    compiled halves above, which the "class"-space path interleaves
+    smoothing between. Same ops in the same order, so numerics are
+    unchanged.
+    """
+    ground_truth_prob = _scatter_to_class_space(
+        gamma, log_probs, clamped_labels)
+    return _gradient_from_class_probs(
+        ground_truth_prob, log_probs, seq_mask, valid_sample_mask)
 
 
 class ShcLoss(torch.autograd.Function):
@@ -918,7 +957,7 @@ class ShcLoss(torch.autograd.Function):
                 logits_len,
                 vocab_size=None, alpha=0.0, beta=0.0,
                 peak_preserving=False, peak_preserving_gamma=0.0,
-                peak_capping=False):
+                peak_capping=False, smoothing_space="label"):
         """Calculates the Sequential Hypothesis Classifier (SHC) loss.
 
         Args:
@@ -944,6 +983,23 @@ class ShcLoss(torch.autograd.Function):
                 (driven by `alpha` as the confidence-cap parameter,
                 cap = 1 - alpha) instead of the alpha/beta-driven SETS
                 post-processing. Ignored if peak_preserving is True.
+            smoothing_space: Either "label" (default) or "class". Selects
+                WHICH AXIS the smoothing above is applied to. This is a
+                substantive algorithmic choice, not an implementation
+                detail -- see `shc_loss_util`'s module docstring for what
+                each one actually does to the target distribution.
+
+                "label": smooth `gamma` (B, T, L) over blank-augmented
+                    label POSITIONS, before the scatter into class space.
+                    This is the historical behavior and what every SETS /
+                    PP-SETS / PC-SETS result produced so far used, so it
+                    remains the default and those runs stay reproducible.
+                "class": scatter first, then smooth `ground_truth_prob`
+                    (B, T, C) over actual output CLASSES. This is what the
+                    smoothing functions' own docstrings describe, and it
+                    is the space in which the smoothed target is directly
+                    comparable to the acoustic posterior p(k_t | X) --
+                    same alphabet, same random variable.
 
         Note that zero values are assumed to be masked-values.
 
@@ -1048,25 +1104,44 @@ class ShcLoss(torch.autograd.Function):
         # (`gamma = torch.exp(log_gamma)`, optionally post-processed).
         gamma = torch.exp(log_gamma)
 
-        # Optional post-processing on gamma (kept eager: `alpha`/
-        # `peak_preserving`/`peak_capping` are static python
-        # hyperparameters, so this conditional never toggles across calls
-        # for a given model config and is not worth compiling).
-        if peak_preserving or peak_capping or alpha > 0.0:
-            gamma = shc_loss_util.apply_post_processing(
-                gamma, logits_len, alpha, beta,
-                peak_preserving=peak_preserving,
-                gamma=peak_preserving_gamma,
-                peak_capping=peak_capping)
-
         # Seqeunce mask
         seq_mask = seq_loss_util.sequence_mask(logits_len,
                                  maxlen=max_logit_len_int)
 
-        # Fused, compiled gradient computation (scatter_add_ / exp /
-        # subtract / mask), replacing the original step-by-step block.
-        gradient = _compute_gradient(
-            gamma, log_probs, clamped_labels, seq_mask, valid_sample_mask)
+        # Optional post-processing on the target distribution (kept eager:
+        # `alpha`/`peak_preserving`/`peak_capping`/`smoothing_space` are
+        # static python hyperparameters, so these conditionals never
+        # toggle across calls for a given model config and are not worth
+        # compiling).
+        assert smoothing_space in ("label", "class"), (
+            f"smoothing_space must be 'label' or 'class', got "
+            f"{smoothing_space!r}")
+        smoothing_enabled = peak_preserving or peak_capping or alpha > 0.0
+
+        if smoothing_space == "class":
+            # Scatter L -> C FIRST, so the smoothing acts on the posterior
+            # over output classes, p(k_t = c | X, Y).
+            ground_truth_prob = _scatter_to_class_space(
+                gamma, log_probs, clamped_labels)
+            if smoothing_enabled:
+                ground_truth_prob = shc_loss_util.apply_post_processing(
+                    ground_truth_prob, logits_len, alpha, beta,
+                    peak_preserving=peak_preserving,
+                    gamma=peak_preserving_gamma,
+                    peak_capping=peak_capping)
+            gradient = _gradient_from_class_probs(
+                ground_truth_prob, log_probs, seq_mask, valid_sample_mask)
+        else:
+            # Historical path: smooth over blank-augmented label positions,
+            # then scatter. Byte-for-byte the original behavior.
+            if smoothing_enabled:
+                gamma = shc_loss_util.apply_post_processing(
+                    gamma, logits_len, alpha, beta,
+                    peak_preserving=peak_preserving,
+                    gamma=peak_preserving_gamma,
+                    peak_capping=peak_capping)
+            gradient = _compute_gradient(
+                gamma, log_probs, clamped_labels, seq_mask, valid_sample_mask)
 
         ctx.save_for_backward(gradient)
 
@@ -1078,5 +1153,9 @@ class ShcLoss(torch.autograd.Function):
 
         gradient = torch.multiply(gradient, torch.reshape(grad, (-1, 1, 1)))
 
+        # One entry per non-ctx argument of `forward`, in order:
+        # labels, target_lens, logits, logits_len, vocab_size, alpha, beta,
+        # peak_preserving, peak_preserving_gamma, peak_capping,
+        # smoothing_space. Only `logits` (position 3) receives a gradient.
         return (None, None, gradient, None, None, None, None, None, None,
-               None)
+               None, None)

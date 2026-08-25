@@ -405,7 +405,8 @@ class MyCtcTrainer(Trainer):
     """Custom Trainer to override loss computation with custom Shc loss."""
     def __init__(self, vocab_size=None, alpha=0.0, beta=0.0,
                 peak_preserving=False, gamma=0.0, peak_capping=False,
-                dynamic_batching=False, *args, **kwargs):
+                smoothing_space="label", dynamic_batching=False,
+                *args, **kwargs):
         super().__init__(*args, **kwargs)
         # To include the boundary token at the end.
         self.custom_vocab_size = vocab_size
@@ -414,6 +415,7 @@ class MyCtcTrainer(Trainer):
         self.peak_preserving = peak_preserving
         self.gamma = gamma
         self.peak_capping = peak_capping
+        self.smoothing_space = smoothing_space
         self.dynamic_batching = dynamic_batching
 
     def get_train_dataloader(self) -> DataLoader:
@@ -484,6 +486,7 @@ class MyCtcTrainer(Trainer):
                 self.peak_preserving,
                 self.gamma,
                 self.peak_capping,
+                self.smoothing_space,
             ).mean()
 
         if return_outputs:
@@ -537,6 +540,10 @@ def _default_run_name(args: argparse.Namespace) -> str:
     identical in every other naming input and would overwrite each other.
     """
     suffix = _batching_suffix(args) + f"_seed{args.seed}"
+    # Only tagged when non-default, so every existing run name (all of
+    # which were label-space) keeps resolving to the same directory.
+    if args.smoothing_space != "label":
+        suffix += f"_{args.smoothing_space}space"
     if args.vocab_size is not None:
         if args.peak_preserving:
             return (f"{args.finetune_profile}_shc_{args.max_steps}steps_"
@@ -583,6 +590,20 @@ def parse_args():
              "parameter, cap = 1 - alpha) instead of the alpha/beta-"
              "driven SETS post-processing. --beta/--gamma are ignored "
              "when this is set. Ignored if --peak_preserving is set.")
+    parser.add_argument(
+        "--smoothing_space", type=str, default="label",
+        choices=["label", "class"],
+        help="Which axis the smoothing is applied to. 'label' (default) "
+             "smooths the alignment posterior over blank-augmented label "
+             "POSITIONS before scattering to classes -- the historical "
+             "behavior every SETS/PP-SETS/PC-SETS result so far used. "
+             "'class' scatters first and smooths over actual output "
+             "CLASSES. These are different algorithms, not two spellings "
+             "of one: in 'label' space a uniform mixin lands as roughly "
+             "50%% blank plus an occurrence-weighted prior over only the "
+             "classes present in the transcript, whereas in 'class' space "
+             "it is genuinely uniform over the vocabulary. See the module "
+             "docstring of cwk/loss/pytorch/shc_loss_util.py.")
 
     # --- Run naming / output location -------------------------------------
     parser.add_argument(
@@ -895,6 +916,7 @@ def main():
         peak_preserving=args.peak_preserving,
         gamma=args.gamma,
         peak_capping=args.peak_capping,
+        smoothing_space=args.smoothing_space,
         dynamic_batching=args.dynamic_batching
     )
 

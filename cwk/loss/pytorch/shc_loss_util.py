@@ -1,4 +1,70 @@
-"""A module implementing utilities for sequence losses."""
+"""A module implementing utilities for sequence losses.
+
+===============================================================================
+WHICH AXIS IS BEING SMOOTHED? (read this before editing anything below)
+===============================================================================
+
+Every smoothing function here operates generically on the LAST axis of its
+input. It does NOT know or care what that axis means. The docstrings below
+therefore call it "K categories".
+
+`ShcLoss.forward` can drive these functions in either of two spaces, selected
+by its `smoothing_space` argument:
+
+  * "label" (the historical default, and what every SETS / PP-SETS / PC-SETS
+    experiment run so far used): the input is `gamma` with shape (B, T, L),
+    where L is the BLANK-AUGMENTED LABEL SEQUENCE length. The last axis
+    indexes label *positions*, not classes. Smoothing happens BEFORE the
+    scatter_add_ that maps L -> C.
+
+  * "class": the input is `ground_truth_prob` with shape (B, T, C), where C
+    is the vocabulary size. Smoothing happens AFTER that scatter_add_, so
+    the last axis indexes actual output classes.
+
+Both are mathematically valid -- the smoothed row sums to 1 either way, and
+the resulting cross-entropy target is a proper distribution over classes in
+both cases. But they are genuinely DIFFERENT algorithms, and the difference
+is large. It matters enough that it must be described accurately in any
+write-up, so it is spelled out here.
+
+Concretely, ShcLoss builds the augmented label sequence as
+[t0, blank, t1, blank, ..., t_{U-1}] (length L = 2U - 1, see
+`seq_loss_util.to_blank_augmented_labels` with boundary_blanks=False), so
+roughly HALF of all label positions are blank. A distribution that is
+uniform over the L axis is therefore very far from uniform over classes.
+Measured for a 20-token transcript with C = 32 (L = 39):
+
+    "plain uniform" (beta = 0), i.e. 1/L on every label position
+      -> in class space: blank = 0.487, only the 15 classes that occur in
+         the transcript get any mass at all (each proportional to how many
+         times it occurs), and the other 17 classes get EXACTLY 0.
+      -> a true uniform over classes would instead be 0.031 on all 32.
+      -> entropy 2.00 nats, vs. log(32) = 3.47 for a true class uniform.
+
+    "masked uniform" (beta = 1), i.e. 1/N_p on the label positions that are
+    reachable at frame t
+      -> in class space: blank = 0.47..0.60 depending on how wide the
+         reachable band is, with only a handful of non-blank classes
+         receiving mass and the remaining ~25-29 classes getting 0.
+
+So in the "label" space, what actually gets mixed into the target is not a
+uniform prior but a blank-heavy, occurrence-count-weighted prior supported
+only on classes present in that utterance's transcript. That is much closer
+to unigram label smoothing (with a strong CTC blank prior) than to classical
+uniform label smoothing -- arguably a better prior for CTC, but definitely
+not the same thing, and NOT what the phrase "smooth toward the uniform
+distribution" would lead a reader to expect.
+
+Note also that `peak = argmax(dim=-1)` means different things in the two
+spaces: in "label" space it is the most probable label POSITION, which need
+not correspond to the most probable CLASS (blank's mass is split across the
+~L/2 blank positions, so blank can dominate in class space while losing the
+per-position argmax). `apply_peak_preserving_...` and
+`apply_peak_capping_...` inherit this, so PC-SETS's `y[peak] > 1 - alpha`
+gate triggers on a systematically smaller quantity in "label" space than a
+class-space reading of the same threshold would suggest.
+===============================================================================
+"""
 
 # pylint: disable=no-member, invalid-name, import-error
 
@@ -23,8 +89,12 @@ def apply_post_processing(est_probs, logits_len, alpha, beta, eps=1e-6,
     """Dispatches to the selected post-processing variant.
 
     Args:
-        est_probs: Float tensor of shape (B, T, C). Probability
-            distributions over C classes, per batch/time step.
+        est_probs: Float tensor of shape (B, T, K). Probability
+            distributions over the last axis's K categories, per
+            batch/time step. NOTE: K is NOT necessarily the vocabulary
+            size -- see the module docstring. ShcLoss passes the
+            blank-augmented label axis (K = L) in "label" space and the
+            class axis (K = C) in "class" space.
         logits_len: Long tensor of shape (B,). Valid (unpadded)
             length of each sequence in the batch.
         alpha: Python float in [0, 1]. Overall smoothing weight when
@@ -49,7 +119,7 @@ def apply_post_processing(est_probs, logits_len, alpha, beta, eps=1e-6,
             ignored). Ignored if peak_preserving is True.
 
     Returns:
-        Float tensor of shape (B, T, C), same shape/dtype as
+        Float tensor of shape (B, T, K), same shape/dtype as
         est_probs, with smoothing applied. Time steps beyond
         logits_len are set to 0.
     """
@@ -68,8 +138,12 @@ def apply_selective_estimated_target_smoothing(est_probs, logits_len, alpha,
     """Applies masked-uniform label smoothing to a batch of probs.
 
     Args:
-        est_probs: Float tensor of shape (B, T, C). Probability
-            distributions over C classes, per batch/time step.
+        est_probs: Float tensor of shape (B, T, K). Probability
+            distributions over the last axis's K categories, per
+            batch/time step. NOTE: K is NOT necessarily the vocabulary
+            size -- see the module docstring. ShcLoss passes the
+            blank-augmented label axis (K = L) in "label" space and the
+            class axis (K = C) in "class" space.
         logits_len: Long tensor of shape (B,). Valid (unpadded)
             length of each sequence in the batch.
         alpha: Python float in [0, 1]. Overall smoothing weight
@@ -82,7 +156,7 @@ def apply_selective_estimated_target_smoothing(est_probs, logits_len, alpha,
             "active" (prob >= eps) for both p_p and u_p.
 
     Returns:
-        Float tensor of shape (B, T, C), same shape/dtype as
+        Float tensor of shape (B, T, K), same shape/dtype as
         est_probs, with smoothing applied. Time steps beyond
         logits_len are set to 0.
 
@@ -100,12 +174,20 @@ def apply_selective_estimated_target_smoothing(est_probs, logits_len, alpha,
     (1.0 - beta) + gamma * p_p to equal 1.
 
     where, for each (b, t):
-        - y(b, t)   : the C-dim probability vector est_probs[b, t, :].
-        - p_p(b, t) : fraction of classes with prob >= eps
-                      (N_p / C).
-        - u_p(b, t) : masked uniform dist. 1/C on classes with
+        - y(b, t)   : the K-dim probability vector est_probs[b, t, :].
+        - p_p(b, t) : fraction of categories with prob >= eps
+                      (N_p / K).
+        - u_p(b, t) : masked uniform dist. 1/K on categories with
                       prob >= eps, 0 elsewhere.
-        - u         : plain uniform dist, 1/C everywhere.
+        - u         : uniform dist over the last axis, 1/K everywhere.
+
+    IMPORTANT: "uniform" here means uniform over the LAST AXIS, which is
+    only the class axis in "class" space. In the historical "label"
+    space, u is uniform over blank-augmented label POSITIONS, which in
+    class space is a blank-heavy, occurrence-count-weighted prior
+    supported only on the classes present in the transcript -- roughly
+    blank = 0.49 rather than 1/32 = 0.031. See the module docstring for
+    measured numbers.
 
     Positions t >= logits_len[b] are padding and are zeroed out in
     the output (don't-care region).
@@ -120,11 +202,12 @@ def apply_selective_estimated_target_smoothing(est_probs, logits_len, alpha,
     n_p = ge_mask.sum(dim=-1, keepdim=True).to(est_probs.dtype)
     p_p = n_p / c
 
-    # u_p(b, t, c) = 1/C where prob >= eps, else 0.
+    # u_p(b, t, k) = 1/K where prob >= eps, else 0.
     u_p = ge_mask.to(est_probs.dtype) / c
 
-    # u is the plain uniform distribution, a scalar broadcastable
-    # constant (1/C on every class).
+    # u is uniform over the LAST AXIS, a scalar broadcastable constant
+    # (1/K on every category of that axis -- which is a label position,
+    # not a class, in "label" space; see the module docstring).
     u = 1.0 / c
 
     # gamma(b, t) = beta / p_p(b, t), shape (B, T, 1).
@@ -157,12 +240,22 @@ def apply_peak_preserving_selective_estimated_target_smoothing(
     """Peak-preserving variant of Selective Estimated Target Smoothing.
 
     Unlike apply_selective_estimated_target_smoothing, the argmax
-    ("peak") class of each (b, t) distribution is left completely
+    ("peak") category of each (b, t) distribution is left completely
     untouched; only the remaining probability mass is smoothed.
 
+    NOTE: "peak" is the argmax of the LAST AXIS. In "label" space that
+    is the most probable label POSITION, which is not necessarily the
+    most probable CLASS -- blank's mass is spread over the ~L/2 blank
+    positions, so blank can be the dominant class while still losing
+    the per-position argmax. See the module docstring.
+
     Args:
-        est_probs: Float tensor of shape (B, T, C). Probability
-            distributions over C classes, per batch/time step.
+        est_probs: Float tensor of shape (B, T, K). Probability
+            distributions over the last axis's K categories, per
+            batch/time step. NOTE: K is NOT necessarily the vocabulary
+            size -- see the module docstring. ShcLoss passes the
+            blank-augmented label axis (K = L) in "label" space and the
+            class axis (K = C) in "class" space.
         logits_len: Long tensor of shape (B,). Valid (unpadded)
             length of each sequence in the batch.
         gamma: Python float in [0, 1]. Fraction of each non-peak
@@ -174,7 +267,7 @@ def apply_peak_preserving_selective_estimated_target_smoothing(
             (prob >= eps).
 
     Returns:
-        Float tensor of shape (B, T, C), same shape/dtype as
+        Float tensor of shape (B, T, K), same shape/dtype as
         est_probs, with smoothing applied. Time steps beyond
         logits_len are set to 0.
 
@@ -241,9 +334,22 @@ def apply_peak_capping_selective_estimated_target_smoothing(
     (b, t) positions where the peak is already at or below that cap
     are left completely untouched.
 
+    NOTE: as in the peak-preserving variant, "peak" is the argmax of
+    the LAST AXIS. This matters more here than there, because the cap
+    is a threshold on that value: in "label" space the peak is a single
+    label POSITION, whose probability is systematically smaller than
+    the corresponding class probability (blank's mass is split across
+    the ~L/2 blank positions). The same numeric cap therefore fires
+    considerably less often in "label" space than a class-space reading
+    of `y[peak] > 1 - alpha` would suggest. See the module docstring.
+
     Args:
-        est_probs: Float tensor of shape (B, T, C). Probability
-            distributions over C classes, per batch/time step.
+        est_probs: Float tensor of shape (B, T, K). Probability
+            distributions over the last axis's K categories, per
+            batch/time step. NOTE: K is NOT necessarily the vocabulary
+            size -- see the module docstring. ShcLoss passes the
+            blank-augmented label axis (K = L) in "label" space and the
+            class axis (K = C) in "class" space.
         logits_len: Long tensor of shape (B,). Valid (unpadded)
             length of each sequence in the batch.
         alpha: Python float in [0, 1]. Defines the confidence cap
@@ -253,7 +359,7 @@ def apply_peak_capping_selective_estimated_target_smoothing(
             (prob >= eps).
 
     Returns:
-        Float tensor of shape (B, T, C), same shape/dtype as
+        Float tensor of shape (B, T, K), same shape/dtype as
         est_probs, with capping applied. Time steps beyond
         logits_len are set to 0.
 
