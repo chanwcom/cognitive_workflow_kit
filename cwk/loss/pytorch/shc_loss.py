@@ -1133,9 +1133,14 @@ class ShcLoss(torch.autograd.Function):
         assert smoothing_space in ("label", "class"), (
             f"smoothing_space must be 'label' or 'class', got "
             f"{smoothing_space!r}")
-        assert alpha_mode in ("fixed", "entropy_matched"), (
-            f"alpha_mode must be 'fixed' or 'entropy_matched', got "
-            f"{alpha_mode!r}")
+        assert alpha_mode in ("fixed", "entropy_matched",
+                              "entropy_matched_selective"), (
+            f"alpha_mode must be 'fixed', 'entropy_matched' or "
+            f"'entropy_matched_selective', got {alpha_mode!r}")
+        assert not (alpha_mode == "entropy_matched_selective"
+                    and smoothing_space != "class"), (
+            "alpha_mode='entropy_matched_selective' requires "
+            "smoothing_space='class'.")
         smoothing_enabled = peak_preserving or peak_capping or alpha > 0.0
 
         if alpha_mode == "entropy_matched" and smoothing_space == "label":
@@ -1174,7 +1179,7 @@ class ShcLoss(torch.autograd.Function):
             # over output classes, p(k_t = c | X, Y).
             ground_truth_prob = _scatter_to_class_space(
                 gamma, log_probs, clamped_labels)
-            if alpha_mode == "entropy_matched":
+            if alpha_mode.startswith("entropy_matched"):
                 # alpha is solved for per example rather than passed in,
                 # so `alpha`/`beta` play no part here. log_probs is
                 # already detached (forward runs under no_grad), which is
@@ -1184,7 +1189,9 @@ class ShcLoss(torch.autograd.Function):
                     shc_loss_util.apply_entropy_matched_smoothing(
                         ground_truth_prob, log_probs.exp(), logits_len,
                         alpha_max=entropy_match_alpha_max,
-                        kappa=entropy_match_kappa))
+                        kappa=entropy_match_kappa,
+                        restrict_reference=(
+                            alpha_mode == "entropy_matched_selective")))
             elif smoothing_enabled:
                 ground_truth_prob = shc_loss_util.apply_post_processing(
                     ground_truth_prob, logits_len, alpha, beta,

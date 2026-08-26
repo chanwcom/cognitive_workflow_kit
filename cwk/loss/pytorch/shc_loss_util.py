@@ -272,7 +272,8 @@ def _restrict_and_renormalize(probs, eps):
 
 def apply_entropy_matched_smoothing(est_probs, acoustic_probs, logits_len,
                                      eps=1e-6, n_iter=20, alpha_max=1.0,
-                                     kappa=1.0, return_stats=False):
+                                     kappa=1.0, restrict_reference=False,
+                                     return_stats=False):
     """Smooths a target until its entropy matches the model's own.
 
     This is SETS with beta = 1 (mix in the masked uniform), except that
@@ -392,10 +393,38 @@ def apply_entropy_matched_smoothing(est_probs, acoustic_probs, logits_len,
     assert 0.0 < kappa <= 1.0, f"kappa must be in (0, 1], got {kappa}"
 
     target_probs = est_probs.float()
+    active = target_probs >= eps
     restricted, _, n_active = _restrict_and_renormalize(target_probs, eps)
-    masked_uniform = (target_probs >= eps).float() / n_active
+    masked_uniform = active.float() / n_active
+
+    reference = acoustic_probs.float()
+    if restrict_reference:
+        # Measure the model's uncertainty on the SAME support the target
+        # lives on, instead of over the whole vocabulary.
+        #
+        # Without this the two entropies are over different alphabets:
+        # H(q~) ranges over the ~3 classes reachable at this frame, while
+        # H(p) ranges over all C of them. H(p) is then structurally the
+        # larger of the two -- at initialization it is near log C = 3.47
+        # against a ceiling of log N ~ 1.2 -- so the target entropy is
+        # simply unreachable, alpha clamps at its maximum for the whole
+        # run, the model never learns, H(p) never falls, and the clamp
+        # never releases. That is the collapse measured at alpha_max=1.0
+        # (eval_wer 0.9974 against a 0.2261 baseline).
+        #
+        # Restricting p to the active set makes H(p|A) <= log N hold by
+        # construction, since the uniform is the maximum-entropy
+        # distribution on A. Unreachability becomes structurally
+        # impossible. Measured on 1hr checkpoints, this also drops the
+        # trained-alpha -> solved-alpha slope from ~0.95 (an identity map
+        # that returns whatever alpha it was given, hence uninformative)
+        # to ~0.75, so the solved alpha actually moves.
+        reference = reference * active
+        reference = reference / reference.sum(
+            dim=-1, keepdim=True).clamp(min=torch.finfo(torch.float32).tiny)
+
     return _finish_entropy_matched_smoothing(
-        target_probs, restricted, masked_uniform, acoustic_probs.float(),
+        target_probs, restricted, masked_uniform, reference,
         logits_len, est_probs.dtype, n_iter, alpha_max, kappa,
         n_active, monotone=True, return_stats=return_stats)
 
