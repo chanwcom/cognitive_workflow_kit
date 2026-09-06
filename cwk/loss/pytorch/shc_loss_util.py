@@ -21,6 +21,12 @@ by its `smoothing_space` argument:
     is the vocabulary size. Smoothing happens AFTER that scatter_add_, so
     the last axis indexes actual output classes.
 
+  * "hybrid": the two ENDS OF THE BETA BLEND are taken from different
+    axes. beta = 1 keeps the label-space masked uniform exactly as it is
+    (blank-heavy, occurrence-weighted); beta = 0 becomes a genuine uniform
+    over the C classes instead of a uniform over label positions. See
+    `apply_mixed_prior_smoothing`.
+
 Both are mathematically valid -- the smoothed row sums to 1 either way, and
 the resulting cross-entropy target is a proper distribution over classes in
 both cases. But they are genuinely DIFFERENT algorithms, and the difference
@@ -54,6 +60,53 @@ to unigram label smoothing (with a strong CTC blank prior) than to classical
 uniform label smoothing -- arguably a better prior for CTC, but definitely
 not the same thing, and NOT what the phrase "smooth toward the uniform
 distribution" would lead a reader to expect.
+
+Note that only the beta = 0 END of that blend is wrong. The beta = 1 end,
+1/N_p over the REACHABLE positions, is a defensible CTC prior: it is
+blank-heavy because CTC alignments genuinely are, and it up-weights a
+label that occurs several times because several positions can emit it.
+What has no defence is the beta = 0 end, where "uniform" silently means
+uniform over label positions.
+
+"hybrid" fixes exactly that one end and leaves the other alone:
+
+    mix = (1 - beta) * (1/C over classes)
+        + beta       * scatter(1/N_p over reachable label positions)
+
+    beta = 0  ->  textbook uniform LS,  (1 - alpha) * y + alpha / C
+    beta = 1  ->  the historical L-SETS prior, unchanged
+
+Both endpoints are now things a reader already has a name for, so beta
+interpolates between two known methods rather than between one known and
+one accidental one. beta = 1 is byte-for-byte equal to "label" space
+because scatter is linear:
+
+    scatter((1-a) g + a m_L) = (1-a) scatter(g) + a scatter(m_L)
+
+Measured on [4, blank, 7, blank, 4] with all five positions reachable
+(blank at 2 of 5, class 4 at 2 of 5) and C = 8:
+
+    beta = 0  ->  0.125 on every class, blank included  (= 1/C)
+    beta = 1  ->  blank 0.40, class 4 0.40 (two occurrences), class 7
+                  0.20, every absent class 0.00
+
+It is also padding-independent at EVERY beta, which "label" is not.
+Measured end to end through ShcLoss, one short utterance run alone versus
+batched behind a 3x longer one:
+
+    hybrid  beta 0.00 .. 1.00   max|grad diff| = 0.0 at every beta
+    label   beta 0.00           max|grad diff| = 2.1e-02
+            beta 0.25 / 0.50 / 0.75   1.6e-02 / 1.1e-02 / 5.3e-03
+            beta 1.00                 3.0e-08
+
+The leak is proportional to (1 - beta) because the component that spreads
+over all L positions is the one weighted by (1 - beta) -- and L is the
+batch's padded width. Replacing that component with 1/C removes the only
+term that ever saw the padding. gamma itself is exactly 0.0 on padded
+positions (not merely small), so the >= eps test excludes them for any
+eps; this matters because padded positions carry label id 0, i.e. blank,
+so a leak there would land on the one class already most at risk of being
+over-weighted.
 
 Note also that `peak = argmax(dim=-1)` means different things in the two
 spaces: in "label" space it is the most probable label POSITION, which need
@@ -706,6 +759,67 @@ def apply_selective_estimated_target_smoothing(est_probs, logits_len, alpha,
     # any padded time steps (t >= logits_len[b]).
     time_idx = torch.arange(t, device=est_probs.device)
     valid = time_idx.unsqueeze(0) < logits_len.unsqueeze(1)  # (B, T)
+    y_ls = y_ls * valid.unsqueeze(-1).to(est_probs.dtype)
+
+    return y_ls
+
+
+def apply_mixed_prior_smoothing(est_probs, prior_probs, logits_len, alpha,
+                                 beta):
+    """Smooths toward a beta-blend of the class uniform and a given prior.
+
+    Both operands live on the class axis, and `prior_probs` is whatever
+    the caller wants the beta = 1 end of the blend to be:
+
+        y_ls = (1 - alpha) * y
+               + alpha * ((1 - beta) * 1/C + beta * prior_probs)
+
+    This exists for the "hybrid" smoothing space, whose two endpoints are
+    each something a reader already has a name for. The caller passes the
+    label-space masked uniform, scattered into class space, as
+    `prior_probs`, which makes
+
+        beta = 0  textbook uniform label smoothing, (1-alpha)*y + alpha/C
+        beta = 1  the historical L-SETS prior: blank-heavy (about half the
+                  label positions are blank) and occurrence-weighted (a
+                  class sitting at several reachable positions collects a
+                  share per position)
+
+    and beta interpolates between them. Contrast
+    apply_selective_estimated_target_smoothing, which builds both ends of
+    the blend on whichever single axis it was handed: in label space that
+    makes its beta = 0 end a blank-heavy prior over transcript classes
+    rather than a uniform one, which is the defect this replaces.
+
+    Args:
+        est_probs: Float tensor of shape (B, T, C). Target distribution
+            over the C output classes -- i.e. already scattered out of
+            label space.
+        prior_probs: Float tensor of shape (B, T, C). The beta = 1 end of
+            the blend. Must sum to 1 over the class axis on every valid
+            (b, t), which the scatter of an L-normalized distribution
+            does automatically (scatter preserves total mass).
+        logits_len: Long tensor of shape (B,). Valid (unpadded) length of
+            each sequence in the batch.
+        alpha: Python float in [0, 1]. Overall smoothing weight. Fixed
+            scalar.
+        beta: Python float in [0, 1]. Weight of `prior_probs` against the
+            class uniform. Fixed scalar.
+
+    Returns:
+        Float tensor of shape (B, T, C), same shape/dtype as est_probs,
+        with smoothing applied. Time steps beyond logits_len are set to 0.
+    """
+    b, t, c = est_probs.shape
+
+    # sum(mix) = (1 - beta) * 1 + beta * 1 = 1, so no 1/p_p correction is
+    # needed here -- unlike apply_selective_estimated_target_smoothing,
+    # whose u_p is a sub-distribution summing to p_p rather than to 1.
+    mix = (1.0 - beta) / c + beta * prior_probs
+    y_ls = (1.0 - alpha) * est_probs + alpha * mix
+
+    time_idx = torch.arange(t, device=est_probs.device)
+    valid = time_idx.unsqueeze(0) < logits_len.unsqueeze(1)  # (B, T).
     y_ls = y_ls * valid.unsqueeze(-1).to(est_probs.dtype)
 
     return y_ls
