@@ -985,23 +985,38 @@ class ShcLoss(torch.autograd.Function):
                 (driven by `alpha` as the confidence-cap parameter,
                 cap = 1 - alpha) instead of the alpha/beta-driven SETS
                 post-processing. Ignored if peak_preserving is True.
-            smoothing_space: Either "label" (default) or "class". Selects
-                WHICH AXIS the smoothing above is applied to. This is a
-                substantive algorithmic choice, not an implementation
-                detail -- see `shc_loss_util`'s module docstring for what
-                each one actually does to the target distribution.
+            smoothing_space: One of "label" (default), "class" or
+                "hybrid". Selects WHICH AXIS the smoothing above is
+                applied to. This is a substantive algorithmic choice, not
+                an implementation detail -- see `shc_loss_util`'s module
+                docstring for what each one actually does to the target
+                distribution.
 
                 "label": smooth `gamma` (B, T, L) over blank-augmented
                     label POSITIONS, before the scatter into class space.
                     This is the historical behavior and what every SETS /
                     PP-SETS / PC-SETS result produced so far used, so it
                     remains the default and those runs stay reproducible.
+                    Both halves of the prior live on the label axis, so
+                    "uniform" here means uniform over positions, which in
+                    class space is a blank-heavy, occurrence-weighted
+                    prior rather than a uniform one.
                 "class": scatter first, then smooth `ground_truth_prob`
                     (B, T, C) over actual output CLASSES. This is what the
                     smoothing functions' own docstrings describe, and it
                     is the space in which the smoothed target is directly
                     comparable to the acoustic posterior p(k_t | X) --
                     same alphabet, same random variable.
+                "hybrid": take the two ENDS OF THE BETA BLEND from
+                    different axes, so that each end is a method with a
+                    name. beta = 1 keeps the label-space masked uniform
+                    exactly as it is -- blank-heavy, occurrence-weighted,
+                    byte-for-byte the "label" result, since scatter is
+                    linear -- while beta = 0 becomes a genuine uniform
+                    over the C classes, i.e. textbook label smoothing,
+                    rather than a uniform over label positions. Also
+                    padding-independent at every beta, which "label" is
+                    not for beta < 1.
             alpha_mode: Either "fixed" (default) or "entropy_matched".
                 "fixed" uses the `alpha` argument as-is, the historical
                 behavior. "entropy_matched" ignores `alpha`/`beta` and
@@ -1130,8 +1145,8 @@ class ShcLoss(torch.autograd.Function):
         # static python hyperparameters, so these conditionals never
         # toggle across calls for a given model config and are not worth
         # compiling).
-        assert smoothing_space in ("label", "class"), (
-            f"smoothing_space must be 'label' or 'class', got "
+        assert smoothing_space in ("label", "class", "hybrid"), (
+            f"smoothing_space must be 'label', 'class' or 'hybrid', got "
             f"{smoothing_space!r}")
         assert alpha_mode in ("fixed", "entropy_matched",
                               "entropy_matched_selective"), (
@@ -1141,6 +1156,9 @@ class ShcLoss(torch.autograd.Function):
                     and smoothing_space != "class"), (
             "alpha_mode='entropy_matched_selective' requires "
             "smoothing_space='class'.")
+        assert not (alpha_mode != "fixed" and smoothing_space == "hybrid"), (
+            "smoothing_space='hybrid' only supports alpha_mode='fixed'; "
+            f"got {alpha_mode!r}.")
         smoothing_enabled = peak_preserving or peak_capping or alpha > 0.0
 
         if alpha_mode == "entropy_matched" and smoothing_space == "label":
@@ -1198,6 +1216,33 @@ class ShcLoss(torch.autograd.Function):
                     peak_preserving=peak_preserving,
                     gamma=peak_preserving_gamma,
                     peak_capping=peak_capping)
+            gradient = _gradient_from_class_probs(
+                ground_truth_prob, log_probs, seq_mask, valid_sample_mask)
+        elif smoothing_space == "hybrid":
+            # beta = 1 end: the label-space masked uniform, unchanged --
+            # 1/N_p over the reachable label POSITIONS, so blank (about
+            # half the positions) and any repeated label still collect a
+            # share per position. beta = 0 end: 1/C over classes.
+            # Scattering the beta = 1 end into class space and blending
+            # there is exact rather than approximate, since scatter is
+            # linear:
+            #   scatter((1-a) g + a m_L) = (1-a) scatter(g) + a scatter(m_L)
+            # so beta = 1 here reproduces "label" space at beta = 1
+            # exactly, while beta = 0 becomes textbook uniform LS instead
+            # of the blank-heavy prior "label" space lands on.
+            ground_truth_prob = _scatter_to_class_space(
+                gamma, log_probs, clamped_labels)
+            if smoothing_enabled:
+                active_label = (gamma >= 1e-6).to(gamma.dtype)
+                n_active = active_label.sum(
+                    dim=-1, keepdim=True).clamp(min=1.0)
+                mix_label = active_label / n_active  # sums to 1 over L.
+                mix_prob = _scatter_to_class_space(
+                    mix_label, log_probs, clamped_labels)
+                ground_truth_prob = (
+                    shc_loss_util.apply_mixed_prior_smoothing(
+                        ground_truth_prob, mix_prob, logits_len,
+                        alpha, beta))
             gradient = _gradient_from_class_probs(
                 ground_truth_prob, log_probs, seq_mask, valid_sample_mask)
         else:
