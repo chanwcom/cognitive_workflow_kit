@@ -266,6 +266,52 @@ def test_label_space_target_is_invariant_to_batch_mate_length():
             f"length {mate_len}; it must not depend on batch padding")
 
 
+def test_empty_transcript_does_not_wreck_the_batch_gradient():
+    """An L=0 transcript must not poison the other samples' gradients.
+
+    `to_blank_augmented_labels` returns 2L - 1, so an empty transcript
+    reaches the loss with a length of -1. Two things then go wrong, and
+    neither is contained by the masks downstream, because they act on the
+    gradient by multiplication and both NaN * 0 and 3e10 * 0 survive it:
+
+      - `sequence_mask(-1)` selects no label position, so the whole label
+        axis masks to -inf, logsumexp returns -inf, and the normalization
+        computes -inf - (-inf) = NaN. The loss scalar still reads finite,
+        so a run dies with a loss curve that looks healthy right up to
+        the step where every parameter turns to NaN.
+      - SETS's `axis_lens` width goes negative, making p_p and u_p
+        negative and gamma = beta / p_p explode to about -3e10. Finite,
+        but a gradient that size ruins the step just as thoroughly.
+
+    Both are fixed by clamping the length to 1, which leaves position 0
+    (blank) valid, so an empty transcript gets the target "all mass on
+    blank" -- finite, and the right answer for an empty transcript.
+
+    LibriSpeech and libri-light never ship an empty transcript, so this
+    needs a corrupt shard, a tokenizer returning nothing, or a new
+    corpus. Low probability, unbounded cost.
+    """
+    for space in ("class", "label", "hybrid"):
+        for beta in (0.0, 0.5, 1.0):
+            torch.manual_seed(0)
+            logits = (torch.randn(2, 50, 32) * 0.1).requires_grad_(True)
+            labels = torch.full((2, 10), -1, dtype=torch.long)
+            labels[1, :10] = torch.randint(1, 32, (10,))
+            loss = shc_loss.ShcLoss.apply(
+                labels, torch.tensor([0, 10]), logits.log_softmax(-1),
+                torch.full((2,), 50), 32, 0.06, beta, False, 0.0, False,
+                space).mean()
+            loss.backward()
+            where = f"space={space} beta={beta}"
+            assert torch.isfinite(loss), where
+            assert torch.isfinite(logits.grad).all(), where
+            # Guard the magnitude too: the axis_lens half of this failed
+            # finitely, so a finiteness check alone would have missed it.
+            assert logits.grad.abs().max() < 10.0, (
+                f"{where}: gradient blew up to "
+                f"{logits.grad.abs().max().item():.3g}")
+
+
 if __name__ == "__main__":
     # Allow running without pytest installed.
     tests = [
@@ -273,6 +319,7 @@ if __name__ == "__main__":
         test_no_padding_sample_unaffected,
         test_long_utterance_target_is_not_all_blank,
         test_label_space_target_is_invariant_to_batch_mate_length,
+        test_empty_transcript_does_not_wreck_the_batch_gradient,
     ]
     for t in tests:
         t()

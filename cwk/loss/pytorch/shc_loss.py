@@ -1134,8 +1134,23 @@ class ShcLoss(torch.autograd.Function):
         # this: it removes utterances whose transcript is too long to
         # align at all, whereas these utterances align fine and merely
         # underflow. It is also computed after this point.
+        # clamp(min=1): to_blank_augmented_labels returns 2L - 1, so an
+        # empty transcript (L = 0) arrives here with a length of -1, and
+        # sequence_mask then selects NO position. That would mask the whole
+        # label axis to -inf, making logsumexp return -inf and the
+        # normalization -inf - (-inf) = NaN. NaN * 0 = NaN, so neither
+        # seq_mask nor valid_sample_mask below can contain it, and a single
+        # empty transcript turns every model parameter's gradient into NaN
+        # while the loss scalar still reads finite. Keeping position 0 valid
+        # instead gives such a sample the target "all mass on blank", which
+        # is both finite and the right answer for an empty transcript
+        # (position 0 of a blank-augmented sequence is blank).
+        #
+        # Bit-identical for any real batch: target_lens = 2L - 1 >= 1 for
+        # every L >= 1, so the clamp only touches degenerate samples.
         label_mask = seq_loss_util.sequence_mask(
-            target_lens, maxlen=log_gamma.shape[2]).unsqueeze(1).bool()
+            target_lens.clamp(min=1),
+            maxlen=log_gamma.shape[2]).unsqueeze(1).bool()
         log_gamma = log_gamma.masked_fill(~label_mask, float("-inf"))
         # Normalize in float32: logsumexp over a few hundred label
         # positions spanning hundreds of nats loses the valid mass
@@ -1300,12 +1315,18 @@ class ShcLoss(torch.autograd.Function):
                 # own positions. Without it the mass on padded positions
                 # scatters onto blank (padded labels clamp to 0), making
                 # a sample's target depend on its batch-mates' lengths.
+                # clamp(min=1) for the same reason as the label_mask above:
+                # an empty transcript arrives with 2L - 1 = -1, and a
+                # negative width makes SETS's p_p and u_p negative, so
+                # gamma = beta / p_p blows up (measured -3e10). Finite, so
+                # it would not NaN, but a gradient that large on one sample
+                # wrecks the step just as thoroughly.
                 gamma = shc_loss_util.apply_post_processing(
                     gamma, logits_len, alpha, beta,
                     peak_preserving=peak_preserving,
                     gamma=peak_preserving_gamma,
                     peak_capping=peak_capping,
-                    axis_lens=target_lens)
+                    axis_lens=target_lens.clamp(min=1))
             gradient = _compute_gradient(
                 gamma, log_probs, clamped_labels, seq_mask, valid_sample_mask)
 
