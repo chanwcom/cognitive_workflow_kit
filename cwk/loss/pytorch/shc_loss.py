@@ -1110,7 +1110,41 @@ class ShcLoss(torch.autograd.Function):
         # blank-augmented label sequence index.
         # The shape of log_gamma is (batch_size, max_logits_len, max_target_len).
         log_gamma = log_alpha + log_beta
-        log_gamma = log_gamma - torch.logsumexp(log_gamma, axis=2, keepdim=True)
+
+        # Label positions past target_lens are padding, and
+        # calculate_alpha_beta leaves them at the FINITE floor LOG_0
+        # (-706.89), not -inf -- so they enter log_gamma at 2 * LOG_0 =
+        # -1413.79. Normalizing without excluding them is only safe while
+        # every real alignment scores above that floor, which is exactly
+        # what fails early in training: a long utterance accumulates T
+        # per-frame log-probabilities, and at T >= ~800 with a not-yet-
+        # confident head the best real path falls below -1413.79. The
+        # padding then dominates logsumexp, every valid position
+        # normalizes to about -140 or lower, exp() flushes it to zero,
+        # and since padding labels are clamp(min=0) = blank the scatter
+        # hands back a target of "blank with probability 1" for that
+        # utterance. Masking to -inf first makes the padding contribute
+        # nothing, so the normalization is over real alignments only.
+        #
+        # This is inert wherever the failure does not occur: when the best
+        # real path outscores the floor, the padding's share of the
+        # denominator is exp(-140)-ish, and the result is bit-identical.
+        #
+        # Note the sample-level `valid_sample_mask` below cannot cover
+        # this: it removes utterances whose transcript is too long to
+        # align at all, whereas these utterances align fine and merely
+        # underflow. It is also computed after this point.
+        label_mask = seq_loss_util.sequence_mask(
+            target_lens, maxlen=log_gamma.shape[2]).unsqueeze(1).bool()
+        log_gamma = log_gamma.masked_fill(~label_mask, float("-inf"))
+        # Normalize in float32: logsumexp over a few hundred label
+        # positions spanning hundreds of nats loses the valid mass
+        # entirely in bfloat16. A no-op on the float32 that log_softmax
+        # actually produces on CUDA.
+        log_gamma = log_gamma.float()
+        log_gamma = log_gamma - torch.logsumexp(log_gamma, axis=2,
+                                                keepdim=True)
+        log_gamma = log_gamma.to(dtype)
 
         # To ignore an invalid loss case.
         #
@@ -1149,13 +1183,20 @@ class ShcLoss(torch.autograd.Function):
             f"smoothing_space must be 'label', 'class' or 'hybrid', got "
             f"{smoothing_space!r}")
         assert alpha_mode in ("fixed", "entropy_matched",
-                              "entropy_matched_selective"), (
-            f"alpha_mode must be 'fixed', 'entropy_matched' or "
-            f"'entropy_matched_selective', got {alpha_mode!r}")
+                              "entropy_matched_selective",
+                              "active_support"), (
+            f"alpha_mode must be 'fixed', 'entropy_matched', "
+            f"'entropy_matched_selective' or 'active_support', got "
+            f"{alpha_mode!r}")
         assert not (alpha_mode == "entropy_matched_selective"
                     and smoothing_space != "class"), (
             "alpha_mode='entropy_matched_selective' requires "
             "smoothing_space='class'.")
+        assert not (alpha_mode == "active_support"
+                    and smoothing_space != "class"), (
+            "alpha_mode='active_support' requires smoothing_space='class': "
+            "its per-class rate alpha/K is only meaningful when K is the "
+            "output class axis, not the blank-augmented label axis.")
         assert not (alpha_mode != "fixed" and smoothing_space == "hybrid"), (
             "smoothing_space='hybrid' only supports alpha_mode='fixed'; "
             f"got {alpha_mode!r}.")
@@ -1210,6 +1251,10 @@ class ShcLoss(torch.autograd.Function):
                         kappa=entropy_match_kappa,
                         restrict_reference=(
                             alpha_mode == "entropy_matched_selective")))
+            elif alpha_mode == "active_support":
+                ground_truth_prob = (
+                    shc_loss_util.apply_active_support_smoothing(
+                        ground_truth_prob, logits_len, alpha))
             elif smoothing_enabled:
                 ground_truth_prob = shc_loss_util.apply_post_processing(
                     ground_truth_prob, logits_len, alpha, beta,
@@ -1249,11 +1294,18 @@ class ShcLoss(torch.autograd.Function):
             # Historical path: smooth over blank-augmented label positions,
             # then scatter. Byte-for-byte the original behavior.
             if smoothing_enabled:
+                # `axis_lens=target_lens`: here the smoothed axis is the
+                # batch's padded blank-augmented label width, so the
+                # uniform component has to be confined to each sample's
+                # own positions. Without it the mass on padded positions
+                # scatters onto blank (padded labels clamp to 0), making
+                # a sample's target depend on its batch-mates' lengths.
                 gamma = shc_loss_util.apply_post_processing(
                     gamma, logits_len, alpha, beta,
                     peak_preserving=peak_preserving,
                     gamma=peak_preserving_gamma,
-                    peak_capping=peak_capping)
+                    peak_capping=peak_capping,
+                    axis_lens=target_lens)
             gradient = _compute_gradient(
                 gamma, log_probs, clamped_labels, seq_mask, valid_sample_mask)
 

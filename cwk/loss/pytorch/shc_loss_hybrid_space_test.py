@@ -275,10 +275,17 @@ class HybridSpaceTest(unittest.TestCase):
         This is the strongest form of the padding claim: it goes through
         ShcLoss itself rather than a reconstruction, so a leak anywhere in
         the chain -- gamma, the active mask, the scatter of the mixing
-        prior, the blend -- would show up. "label" space fails this at
-        every beta < 1, by an amount proportional to (1 - beta), since the
-        component that spreads over all L positions is the one weighted by
-        (1 - beta).
+        prior, the blend -- would show up.
+
+        "label" space used to fail this at every beta < 1, by an amount
+        proportional to (1 - beta), because the component spread over all
+        L positions is the one weighted by (1 - beta) and L is the
+        batch's padded width. That is now fixed at the source: SETS
+        confines its uniform component to each sample's own label length
+        (`axis_lens`), so "label" space is invariant too and is asserted
+        as such below. It used to be this test's negative control -- the
+        proof that the probe was sensitive enough to catch a real leak --
+        which is why the assertion is kept rather than deleted.
         """
         num_classes, max_time = 12, 30
         short = torch.tensor([[4, 7, 4]])
@@ -315,10 +322,13 @@ class HybridSpaceTest(unittest.TestCase):
                 (grad_alone("hybrid", beta)
                  - grad_padded("hybrid", beta)).abs().max().item(), 1e-6,
                 msg=f"hybrid leaked padding at beta={beta}")
-        # Sensitivity: the same probe does catch the known "label" leak.
-        self.assertGreater(
-            (grad_alone("label", 0.0)
-             - grad_padded("label", 0.0)).abs().max().item(), 1e-4)
+        # "label" space no longer leaks either (see the docstring): this
+        # was the negative control back when it did.
+        for beta in (0.0, 0.25, 0.5, 0.75, 1.0):
+            self.assertLess(
+                (grad_alone("label", beta)
+                 - grad_padded("label", beta)).abs().max().item(), 1e-6,
+                msg=f"label leaked padding at beta={beta}")
 
     def test_rejects_entropy_matched_alpha_mode(self):
         """Entropy matching is only defined for the class-space solve."""

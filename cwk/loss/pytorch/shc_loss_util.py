@@ -196,6 +196,36 @@ def pop_last_entropy_match_stats():
     return stats
 
 
+_LAST_ACTIVE_SUPPORT_STATS = {}
+
+
+def pop_last_active_support_stats():
+    """Returns and clears diagnostics from the last active-support smooth.
+
+    The active fraction N_a/K is what sets the effective smoothing weight
+    in `apply_active_support_smoothing`, and it moves over training as the
+    alignment posterior sharpens -- so the run's actual smoothing strength
+    is not recoverable from its configuration. Recording it has to happen
+    during the run.
+
+    Returns:
+        Dict of scalars -- as_n_active (frames-weighted mean over every
+        batch since the last call), as_frac and as_alpha_eff -- or an
+        empty dict if no such smoothing has run since the last call.
+    """
+    acc = dict(_LAST_ACTIVE_SUPPORT_STATS)
+    _LAST_ACTIVE_SUPPORT_STATS.clear()
+    if not acc or acc.get("n_frames", 0.0) <= 0:
+        return {}
+    mean_n_a = acc["sum_n_a"] / acc["n_frames"]
+    c = acc["c"]
+    return {
+        "as_n_active": mean_n_a,
+        "as_frac": mean_n_a / c,
+        "as_alpha_eff": acc["alpha"] * mean_n_a / c,
+    }
+
+
 def _mixture_entropy(q_tilde, mix, alpha, logits_len):
     """mean_t H((1-a) q~ + a m) per example; `alpha` is (B,)."""
     a = alpha.view(-1, 1, 1)
@@ -614,7 +644,7 @@ def _finish_entropy_matched_smoothing(original, q_tilde, mix, model_probs,
 
 def apply_post_processing(est_probs, logits_len, alpha, beta, eps=1e-6,
                            peak_preserving=False, gamma=None,
-                           peak_capping=False):
+                           peak_capping=False, axis_lens=None):
     """Dispatches to the selected post-processing variant.
 
     Args:
@@ -659,11 +689,12 @@ def apply_post_processing(est_probs, logits_len, alpha, beta, eps=1e-6,
         return apply_peak_capping_selective_estimated_target_smoothing(
             est_probs, logits_len, alpha, eps)
     return apply_selective_estimated_target_smoothing(
-        est_probs, logits_len, alpha, beta, eps)
+        est_probs, logits_len, alpha, beta, eps, axis_lens=axis_lens)
 
 
 def apply_selective_estimated_target_smoothing(est_probs, logits_len, alpha,
-                                                beta, eps=1e-6):
+                                                beta, eps=1e-6,
+                                                axis_lens=None):
     """Applies masked-uniform label smoothing to a batch of probs.
 
     Args:
@@ -723,21 +754,42 @@ def apply_selective_estimated_target_smoothing(est_probs, logits_len, alpha,
     """
     b, t, c = est_probs.shape
 
+    # Effective width of the last axis, per sample. In "class" space the
+    # axis is the vocabulary and every column is real, so `axis_lens` is
+    # None and this is just K. In "label" space the axis is the batch's
+    # PADDED blank-augmented label width, and columns past a sample's own
+    # length are padding: spreading the uniform component over them puts
+    # alpha * (K - S) / K of the smoothing mass on positions that do not
+    # exist, and since padded labels are clamp(min=0) = blank, all of it
+    # scatters onto blank. Measured at alpha=0.1: an utterance filling
+    # the batch width kept blank at 0.55, while one at 17% of it was
+    # pushed to 0.93 -- i.e. a sample's target depended on how long its
+    # batch-mates happened to be.
+    if axis_lens is None:
+        axis_mask = None
+        width = float(c)
+    else:
+        axis_mask = (torch.arange(c, device=est_probs.device)
+                     .unsqueeze(0) < axis_lens.unsqueeze(1))     # (B, K)
+        axis_mask = axis_mask.unsqueeze(1).to(est_probs.dtype)   # (B, 1, K)
+        width = axis_lens.view(-1, 1, 1).to(est_probs.dtype)
+
     # Single boolean mask (non-strict ">=") shared by both p_p and
     # u_p, as they now use the same activity threshold.
     ge_mask = est_probs >= eps  # (B, T, C).
 
-    # p_p(b, t) = N_p / C, kept as (B, T, 1) for broadcasting.
+    # p_p(b, t) = N_p / width, kept as (B, T, 1) for broadcasting.
     n_p = ge_mask.sum(dim=-1, keepdim=True).to(est_probs.dtype)
-    p_p = n_p / c
+    p_p = n_p / width
 
-    # u_p(b, t, k) = 1/K where prob >= eps, else 0.
-    u_p = ge_mask.to(est_probs.dtype) / c
+    # u_p(b, t, k) = 1/width where prob >= eps, else 0. Padding is
+    # already excluded here: a padded position carries no alignment
+    # posterior, so it never clears `eps`.
+    u_p = ge_mask.to(est_probs.dtype) / width
 
-    # u is uniform over the LAST AXIS, a scalar broadcastable constant
-    # (1/K on every category of that axis -- which is a label position,
-    # not a class, in "label" space; see the module docstring).
-    u = 1.0 / c
+    # u is uniform over the VALID part of the last axis -- a label
+    # position, not a class, in "label" space; see the module docstring.
+    u = 1.0 / width if axis_mask is None else axis_mask / width
 
     # gamma(b, t) = beta / p_p(b, t), shape (B, T, 1).
     # Division (not multiplication) is required so that
@@ -762,6 +814,102 @@ def apply_selective_estimated_target_smoothing(est_probs, logits_len, alpha,
     y_ls = y_ls * valid.unsqueeze(-1).to(est_probs.dtype)
 
     return y_ls
+
+
+def apply_active_support_smoothing(est_probs, logits_len, alpha, eps=1e-6):
+    """Uniform label smoothing restricted to the per-frame active support.
+
+    Implements:
+        y_s(b, t) = (1 - alpha * p_p(b, t)) * y(b, t)
+                    + alpha * p_p(b, t) * u_a(b, t)
+
+    where, for each (b, t) INDEPENDENTLY (per frame, not per example):
+        - N_a(b, t) : number of categories with prob >= eps.
+        - p_p(b, t) : N_a / K, the active fraction.
+        - u_a(b, t) : 1/N_a on those categories, 0 elsewhere.
+
+    Since p_p * u_a is 1/K on every active category and 0 elsewhere, the
+    whole thing collapses to a statement that needs no division:
+
+        active category   : y_s = (1 - alpha * N_a/K) * y + alpha/K
+        inactive category : y_s = (1 - alpha * N_a/K) * y  ( = 0, as y = 0)
+
+    So this is textbook uniform smoothing -- the SAME alpha/K per class --
+    with the categories that cannot occur at this frame simply left out,
+    and only the mass actually handed out (alpha * N_a/K, not alpha)
+    taken away from y. It is a valid distribution: the mixin sums to
+    p_p and y sums to 1, so the total is (1 - alpha*p_p) + alpha*p_p = 1.
+
+    How this differs from `apply_selective_estimated_target_smoothing`
+    (SETS), which at beta=1 also mixes toward u_a:
+
+        SETS(beta=1) : y_s = (1 - alpha) y + alpha * u_a
+                       -> alpha/N_a on each active class
+        this         : y_s = (1 - alpha*p_p) y + alpha*p_p * u_a
+                       -> alpha/K   on each active class
+
+    SETS spreads a FIXED total mass alpha over however few classes are
+    reachable, so a frame with 4 reachable classes out of 32 gets alpha/4
+    on each -- eight times what textbook smoothing would give. This keeps
+    the per-class RATE fixed at alpha/K instead and lets the total vary,
+    which is the conservative reading of "smooth, but only where the
+    alignment says something could actually occur".
+
+    Practical consequence worth knowing before sweeping alpha: because
+    N_a/K is small in class space (measured around 4/32 on CTC alignment
+    posteriors), the mass actually moved is roughly alpha/8. An alpha
+    that is well tuned for textbook smoothing will be far too weak here,
+    so the useful alpha range is correspondingly larger.
+
+    Args:
+        est_probs: Float tensor of shape (B, T, K). See
+            `apply_selective_estimated_target_smoothing` for what K is in
+            each smoothing space.
+        logits_len: Long tensor of shape (B,). Valid (unpadded) length of
+            each sequence.
+        alpha: Python float in [0, 1]. Per-class smoothing rate, in units
+            of 1/K.
+        eps: Threshold at or above which a category counts as active.
+
+    Returns:
+        Float tensor of shape (B, T, K). Padded time steps are zeroed.
+    """
+    b, t, c = est_probs.shape
+
+    ge_mask = est_probs >= eps                                   # (B, T, K)
+    n_a = ge_mask.sum(dim=-1, keepdim=True).to(est_probs.dtype)  # (B, T, 1)
+    p_p = n_a / c
+
+    # alpha * p_p * u_a reduces to alpha/K on the active set, so the
+    # 1/N_a division is never formed -- no clamp or zero-guard needed.
+    mixin = ge_mask.to(est_probs.dtype) * (alpha / c)
+    y_ls = (1.0 - alpha * p_p) * est_probs + mixin
+
+    time_idx = torch.arange(t, device=est_probs.device)
+    valid = time_idx.unsqueeze(0) < logits_len.unsqueeze(1)      # (B, T)
+
+    # Effective smoothing weight is alpha * N_a/K, and N_a shrinks as the
+    # alignment posterior sharpens, so this anneals on its own over
+    # training. Averaged over valid frames only -- padded frames have
+    # N_a = 0 and would drag the mean down.
+    # Accumulated across every call since the last pop, NOT overwritten
+    # per batch: the training stream is length-bucketed, so consecutive
+    # batches are similar to each other and very different from the next
+    # bucket. Recording only the newest batch made this quantity swing
+    # between ~2.6 and ~17 from one logging step to the next, which reads
+    # as a training-dynamics trend but is only which bucket happened to
+    # land last. Weighted by valid frames so long and short batches
+    # contribute in proportion to the frames they actually smooth.
+    n_valid = valid.sum().to(est_probs.dtype)
+    sum_n_a = (n_a.squeeze(-1) * valid).sum()
+    _LAST_ACTIVE_SUPPORT_STATS["sum_n_a"] = (
+        _LAST_ACTIVE_SUPPORT_STATS.get("sum_n_a", 0.0) + sum_n_a.detach())
+    _LAST_ACTIVE_SUPPORT_STATS["n_frames"] = (
+        _LAST_ACTIVE_SUPPORT_STATS.get("n_frames", 0.0) + n_valid.detach())
+    _LAST_ACTIVE_SUPPORT_STATS["alpha"] = alpha
+    _LAST_ACTIVE_SUPPORT_STATS["c"] = c
+
+    return y_ls * valid.unsqueeze(-1).to(est_probs.dtype)
 
 
 def apply_mixed_prior_smoothing(est_probs, prior_probs, logits_len, alpha,

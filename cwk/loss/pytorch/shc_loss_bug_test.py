@@ -41,6 +41,7 @@ shorter sequence.
 """
 import torch
 
+from cwk.loss.pytorch import seq_loss_util, shc_loss
 from cwk.loss.pytorch.shc_loss import calculate_alpha_beta, LOG_0
 
 
@@ -154,11 +155,124 @@ def test_no_padding_sample_unaffected():
     assert torch.allclose(log_beta_batched[0], log_beta_solo[0])
 
 
+def test_long_utterance_target_is_not_all_blank():
+    """A long, padded utterance must not get a degenerate all-blank target.
+
+    `calculate_alpha_beta` floors padded label positions at the FINITE
+    LOG_0, so they reach `log_gamma = log_alpha + log_beta` at 2 * LOG_0
+    = -1413.79. Normalizing log_gamma over the label axis without
+    excluding them was only safe while every real alignment scored above
+    that floor. It does not, early in training: a long utterance sums T
+    per-frame log-probabilities, so around T >= 800 with a not-yet-
+    confident head the best real path drops below -1413.79, padding wins
+    the logsumexp, every valid position normalizes to roughly -140, exp()
+    flushes it to zero, and -- padding labels being clamp(min=0) = blank
+    -- the scatter returns "blank with probability 1" for that utterance.
+
+    Guards the shape of the target, not a tolerance: the failure is total
+    (all mass on blank, exactly one active class), so the assertions are
+    that real classes keep mass at all.
+    """
+    torch.manual_seed(0)
+    num_classes, max_logit_len = 32, 1200
+    real_len, padded_len = 180, 210
+
+    labels = torch.full((2, padded_len), -100, dtype=torch.long)
+    labels[0, :real_len] = torch.randint(1, num_classes, (real_len,))
+    labels[1, :padded_len] = torch.randint(1, num_classes, (padded_len,))
+    target_lens = (labels >= 0).sum(1)
+
+    # A freshly-initialized head: near-uniform over the vocabulary, which
+    # is what drives the per-frame log-probabilities low enough to matter.
+    logits = torch.randn(2, max_logit_len, num_classes) * 0.01
+    log_probs = torch.log_softmax(logits, dim=-1)
+    logit_lens = torch.full((2,), max_logit_len, dtype=torch.long)
+
+    log_probs.requires_grad_(True)
+    loss = shc_loss.ShcLoss.apply(
+        labels, target_lens, log_probs, logit_lens, num_classes,
+        0.0, 0.0, False, 0.0, False, "class", "fixed", 1.0, 1.0)
+    assert torch.isfinite(loss).all(), loss
+    loss.sum().backward()
+
+    # Read the target back out of the production gradient rather than
+    # rebuilding it here -- a helper that recomputed the normalization
+    # would pass whether or not ShcLoss itself is fixed. ShcLoss forms
+    # `gradient = log_probs.exp() - ground_truth_prob`, so:
+    target = log_probs.exp().detach() - log_probs.grad
+    # Sample 0 is the padded one; sample 1 sets the batch width and so
+    # carries no padding, which is what makes it immune.
+    mid = max_logit_len // 2
+    blank_mass = target[0, mid, 0].item()
+    n_active = int((target[0, mid] >= 1e-6).sum())
+    assert blank_mass < 0.99, (
+        f"target collapsed onto blank: blank mass {blank_mass}")
+    assert n_active > 1, f"only {n_active} class carries any target mass"
+
+
+def _label_space_target_for_fixed_utterance(mate_len):
+    """Target for one FIXED utterance, batched against a mate of varying
+    length. Only the padded label width changes between calls."""
+    gen = torch.Generator().manual_seed(7)
+    num_classes, max_logit_len, own_len = 32, 400, 60
+    own = torch.randint(1, num_classes, (own_len,), generator=gen)
+
+    if mate_len == 0:
+        labels = own.unsqueeze(0)
+    else:
+        width = max(own_len, mate_len)
+        labels = torch.full((2, width), -100, dtype=torch.long)
+        labels[0, :own_len] = own
+        labels[1, :mate_len] = torch.randint(
+            1, num_classes, (mate_len,), generator=gen)
+    target_lens = (labels >= 0).sum(1)
+
+    gen2 = torch.Generator().manual_seed(11)
+    base = torch.randn(1, max_logit_len, num_classes, generator=gen2) * 0.01
+    base[:, :, 0] += 4.0                      # blank-leaning, as in training
+    logits = base.expand(labels.shape[0], -1, -1).contiguous()
+    log_probs = torch.log_softmax(logits, dim=-1).requires_grad_(True)
+    logit_lens = torch.full((labels.shape[0],), max_logit_len,
+                            dtype=torch.long)
+
+    loss = shc_loss.ShcLoss.apply(
+        labels, target_lens, log_probs, logit_lens, num_classes,
+        0.1, 0.0, False, 0.0, False, "label", "fixed", 1.0, 1.0)
+    loss.sum().backward()
+    return (log_probs.exp().detach() - log_probs.grad)[0]
+
+
+def test_label_space_target_is_invariant_to_batch_mate_length():
+    """An utterance's smoothed target must not depend on its batch-mates.
+
+    In "label" space the smoothed axis is the batch's PADDED
+    blank-augmented label width, so the uniform component of SETS used to
+    be spread over positions past the utterance's own length. Padded
+    labels are clamp(min=0) = blank, so that share scattered onto blank:
+    the same utterance drifted by ~4e-2 in target probability purely
+    because a longer utterance shared its batch. Fixed by confining the
+    uniform to each sample's own label length (`axis_lens`).
+
+    Only bites at beta < 1 -- at beta = 1 the uniform term drops out.
+    Class space is unaffected: its axis is the vocabulary, which has no
+    padding.
+    """
+    solo = _label_space_target_for_fixed_utterance(0)
+    for mate_len in (60, 120, 240, 400):
+        batched = _label_space_target_for_fixed_utterance(mate_len)
+        max_diff = (batched - solo).abs().max().item()
+        assert max_diff < 1e-6, (
+            f"target moved by {max_diff:.3e} when batched against a mate of "
+            f"length {mate_len}; it must not depend on batch padding")
+
+
 if __name__ == "__main__":
     # Allow running without pytest installed.
     tests = [
         test_batched_result_matches_solo_computation,
         test_no_padding_sample_unaffected,
+        test_long_utterance_target_is_not_all_blank,
+        test_label_space_target_is_invariant_to_batch_mate_length,
     ]
     for t in tests:
         t()
