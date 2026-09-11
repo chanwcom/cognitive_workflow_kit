@@ -689,5 +689,206 @@ class ApplyPeakCappingSelectiveEstimatedTargetSmoothingTest(unittest.TestCase):
         self.assertTrue(torch.allclose(direct, via_dispatcher, atol=1e-6))
 
 
+
+
+def _fas_probs(batch=3, time=7, classes=32, seed=0, sharp=False):
+    """Random rows on the simplex. `sharp` raises them to a power first, so
+    the active set is narrow the way a trained CTC posterior's is."""
+    g = torch.Generator().manual_seed(seed)
+    x = torch.rand(batch, time, classes, generator=g)
+    if sharp:
+        x = x ** 8
+    return x / x.sum(-1, keepdim=True)
+
+
+class FlooredActiveSupportTest(unittest.TestCase):
+    """Covers apply_floored_active_support_smoothing.
+
+    The two endpoint tests are the load-bearing ones: they are exact, not
+    approximate, so an FAS run at beta=0 is guaranteed to reproduce an AS
+    run and an FAS run at beta=1 a textbook-LS run. A factor-of-C slip or
+    an active/inactive swap would still produce plausible-looking WERs, so
+    these are the only cheap way to catch one.
+    """
+
+    def test_beta_zero_equals_active_support(self):
+        """beta=0 removes the floor entirely, which is exactly AS."""
+        p = _fas_probs()
+        c = p.shape[-1]
+        ll = torch.full((p.shape[0],), p.shape[1])
+        for alpha in (0.05, 0.40, 1.0):
+            got = shc_loss_util.apply_floored_active_support_smoothing(
+                p, ll, alpha, beta=0.0, eps=1e-6)
+            want = shc_loss_util.apply_active_support_smoothing(
+                p, ll, alpha, eps=1e-6)
+            self.assertTrue(torch.equal(got, want), f"alpha={alpha}")
+
+    def test_beta_one_equals_textbook_label_smoothing(self):
+        """beta=1 gives every class alpha/C, so the active set -- and hence
+        the threshold -- must drop out of the result entirely."""
+        p = _fas_probs()
+        c = p.shape[-1]
+        ll = torch.full((p.shape[0],), p.shape[1])
+        for alpha in (0.05, 0.15, 0.40):
+            for eps in (1e-10, 1e-6, 1e-3):
+                got = shc_loss_util.apply_floored_active_support_smoothing(
+                    p, ll, alpha, beta=1.0, eps=eps)
+                want = (1.0 - alpha) * p + alpha / c
+                self.assertTrue(torch.allclose(got, want, atol=1e-7),
+                                f"alpha={alpha} eps={eps}")
+
+    def test_sums_to_one_on_valid_frames(self):
+        p = _fas_probs(sharp=True)
+        ll = torch.full((p.shape[0],), p.shape[1])
+        for alpha in (0.1, 0.5, 1.0):
+            for beta in (0.0, 0.3, 0.7, 1.0):
+                y = shc_loss_util.apply_floored_active_support_smoothing(
+                    p, ll, alpha, beta)
+                self.assertTrue(
+                    torch.allclose(y.sum(-1), torch.ones_like(y.sum(-1)),
+                                   atol=1e-5), f"alpha={alpha} beta={beta}")
+
+    def test_never_negative_even_when_every_class_is_active(self):
+        """Holding the ACTIVE rate at alpha/C bounds the total mass by
+        alpha, so no clamp is needed. A uniform input makes every class
+        active, which is the worst case for that bound."""
+        c = 32
+        p = torch.full((2, 5, c), 1.0 / c)
+        ll = torch.full((2,), 5)
+        for alpha in (0.4, 0.8, 1.0):
+            for beta in (0.0, 0.5, 1.0):
+                y = shc_loss_util.apply_floored_active_support_smoothing(
+                    p, ll, alpha, beta)
+                self.assertGreaterEqual(float(y.min()), 0.0,
+                                        f"alpha={alpha} beta={beta}")
+
+    def test_active_rate_is_independent_of_beta(self):
+        """alpha alone sets the active rate -- the property that makes an
+        (alpha, beta) grid separable, so assert it directly."""
+        p = _fas_probs(sharp=True)
+        ll = torch.full((p.shape[0],), p.shape[1])
+        alpha, c, eps = 0.40, p.shape[-1], 1e-10
+        mask = p > eps
+        for beta in (0.0, 0.5, 1.0):
+            y = shc_loss_util.apply_floored_active_support_smoothing(
+                p, ll, alpha, beta, eps=eps)
+            n_a = mask.sum(-1, keepdim=True).to(p.dtype)
+            m = (alpha / c) * (n_a + beta * (c - n_a))
+            rate = (y - (1.0 - m) * p)[mask]
+            self.assertTrue(
+                torch.allclose(rate, torch.full_like(rate, alpha / c),
+                               atol=1e-7), f"beta={beta}")
+
+    def test_inactive_rate_scales_with_beta(self):
+        """beta reads directly as the inactive-to-active height ratio."""
+        p = _fas_probs(sharp=True)
+        ll = torch.full((p.shape[0],), p.shape[1])
+        alpha, c, eps = 0.40, p.shape[-1], 1e-10
+        mask = p > eps
+        for beta in (0.0, 0.25, 0.75, 1.0):
+            y = shc_loss_util.apply_floored_active_support_smoothing(
+                p, ll, alpha, beta, eps=eps)
+            n_a = mask.sum(-1, keepdim=True).to(p.dtype)
+            m = (alpha / c) * (n_a + beta * (c - n_a))
+            rate = (y - (1.0 - m) * p)[~mask]
+            want = (alpha / c) * beta
+            self.assertTrue(
+                torch.allclose(rate, torch.full_like(rate, want), atol=1e-7),
+                f"beta={beta}")
+
+    def test_eps_is_an_absolute_cut_off(self):
+        """eps compares against the probability itself, not against 1/K, so
+        the same eps selects the same values at any axis width."""
+        for c in (32, 320):
+            p = torch.zeros(1, 1, c)
+            p[0, 0, 0] = 0.90
+            p[0, 0, 1] = 2e-6         # over eps
+            p[0, 0, 2] = 5e-7         # under eps
+            p = p / p.sum()
+            ll = torch.tensor([1])
+            y = shc_loss_util.apply_floored_active_support_smoothing(
+                p, ll, 0.40, 0.0, eps=1e-6)
+            # beta=0, so only active classes are raised at all.
+            rate = y[0, 0] - (1.0 - 0.40 * 2.0 / c) * p[0, 0]
+            self.assertGreater(float(rate[1]), 0.0, f"c={c}: 2e-6 not active")
+            self.assertAlmostEqual(float(rate[2]), 0.0, places=9,
+                                   msg=f"c={c}: 5e-7 should not be active")
+
+    def test_default_eps_admits_every_reachable_class(self):
+        """The 1e-10 default sits below the smallest non-zero value the
+        scattered posterior produces (measured 4.7e-10 to 9.3e-10), so it
+        must select exactly the non-zero classes and nothing else."""
+        c = 32
+        p = torch.zeros(2, 3, c)
+        p[..., 0] = 0.5
+        p[..., 5] = 0.5 - 1e-9
+        p[..., 9] = 1e-9              # tiny but real
+        ll = torch.full((2,), 3)
+        alpha, beta = 0.40, 0.0
+        y = shc_loss_util.apply_floored_active_support_smoothing(
+            p, ll, alpha, beta)       # default eps
+        rate = y - (1.0 - alpha * 3.0 / c) * p
+        for k in (0, 5, 9):
+            self.assertAlmostEqual(float(rate[0, 0, k]), alpha / c, places=7,
+                                   msg=f"class {k} should be active")
+        self.assertAlmostEqual(float(rate[0, 0, 7]), 0.0, places=9,
+                               msg="a zero-probability class must stay inactive")
+
+    def test_zero_cutoff_does_not_make_every_class_active(self):
+        """A cutoff of 0 must still exclude classes with zero probability.
+
+        In class space the scatter only touches classes present in the
+        transcript, so the rest are EXACTLY 0. A bare `>=` against a zero
+        cutoff would mark all K active, giving N_a = K and mass = alpha at
+        every beta -- FAS silently degenerating into textbook LS while
+        still reporting whatever alpha and beta it was asked for. A cutoff
+        reaches zero if eps is passed as 0.
+        """
+        c = 32
+        p = torch.zeros(1, 1, c)
+        p[0, 0, 0] = 0.5           # blank
+        p[0, 0, 5] = 0.3
+        p[0, 0, 9] = 0.2           # every other class is exactly 0
+        ll = torch.tensor([1])
+        alpha, beta = 0.40, 0.5
+        y = shc_loss_util.apply_floored_active_support_smoothing(
+            p, ll, alpha, beta, eps=0.0)
+        # Only the three real classes may be raised to the active rate.
+        n_a = 3.0
+        mass = (alpha / c) * (n_a + beta * (c - n_a))
+        rate = y[0, 0] - (1.0 - mass) * p[0, 0]
+        active = torch.tensor([0, 5, 9])
+        self.assertTrue(
+            torch.allclose(rate[active],
+                           torch.full((3,), alpha / c), atol=1e-7),
+            f"active rates were {rate[active].tolist()}")
+        others = torch.tensor([i for i in range(c) if i not in (0, 5, 9)])
+        self.assertTrue(
+            torch.allclose(rate[others],
+                           torch.full((c - 3,), (alpha / c) * beta),
+                           atol=1e-7),
+            "zero-probability classes were treated as active")
+
+    def test_padded_frames_are_zeroed(self):
+        p = _fas_probs()
+        ll = torch.tensor([7, 4, 1])
+        y = shc_loss_util.apply_floored_active_support_smoothing(
+            p, ll, 0.4, 0.5)
+        for i, n in enumerate(ll.tolist()):
+            self.assertEqual(float(y[i, n:].abs().sum()), 0.0)
+
+    def test_stats_report_effective_mass_and_degeneracy(self):
+        p = _fas_probs(sharp=True)
+        ll = torch.full((p.shape[0],), p.shape[1])
+        shc_loss_util.pop_last_floored_active_support_stats()   # clear
+        shc_loss_util.apply_floored_active_support_smoothing(p, ll, 0.4, 0.5)
+        s = shc_loss_util.pop_last_floored_active_support_stats()
+        self.assertGreater(s["fas_mass_eff"], s["fas_mass_active_only"])
+        self.assertGreaterEqual(s["fas_n1_frac"], 0.0)
+        self.assertLessEqual(s["fas_n1_frac"], 1.0)
+        self.assertEqual(
+            shc_loss_util.pop_last_floored_active_support_stats(), {})
+
+
 if __name__ == "__main__":
     unittest.main()

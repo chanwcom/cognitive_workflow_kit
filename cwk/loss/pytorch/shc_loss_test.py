@@ -434,5 +434,52 @@ class TestTokenAugmentation(unittest.TestCase):
         # Check padding (should be -100)
         self.assertEqual(result["SEQ_DATA"][1, 3].item(), -100)
 
+
+
+class FlooredActiveSupportEndToEndTest(unittest.TestCase):
+    """FAS through ShcLoss on the batch shape that used to break the target.
+
+    T=900 with label lengths spanning 2..440 is the extreme-length-spread
+    case that produced an all-blank target before de53098, so it is the
+    shape a new alpha_mode is most likely to trip over.
+    """
+
+    def test_finite_loss_and_gradient_on_extreme_length_spread(self):
+        num_classes, max_logit_len = 32, 900
+        lengths = [2, 3, 400, 440]
+        labels = torch.full((len(lengths), max(lengths)), -100,
+                            dtype=torch.long)
+        torch.manual_seed(0)
+        for b, n in enumerate(lengths):
+            labels[b, :n] = torch.randint(1, num_classes, (n,))
+        target_lens = (labels >= 0).sum(1)
+        logit_lens = torch.full((len(lengths),), max_logit_len,
+                                dtype=torch.long)
+
+        for alpha, beta in ((0.40, 0.0), (0.40, 0.5), (0.53, 1.0)):
+            logits = (torch.randn(len(lengths), max_logit_len, num_classes)
+                      * 0.1).requires_grad_(True)
+            loss = shc_loss.ShcLoss.apply(
+                labels, target_lens, logits.log_softmax(-1), logit_lens,
+                num_classes, alpha, beta, False, 0.0, False, "class",
+                "floored_active_support").mean()
+            loss.backward()
+            where = f"alpha={alpha} beta={beta}"
+            self.assertTrue(bool(torch.isfinite(loss)), where)
+            self.assertTrue(bool(torch.isfinite(logits.grad).all()), where)
+
+    def test_rejects_non_class_space(self):
+        """Both FAS rates are per-class and its threshold would fire on the
+        label axis's padding, so label/hybrid space must be refused."""
+        logits = torch.randn(1, 20, 12)
+        labels = torch.randint(1, 12, (1, 4))
+        for space in ("label", "hybrid"):
+            with self.assertRaises(AssertionError):
+                shc_loss.ShcLoss.apply(
+                    labels, torch.tensor([4]), logits.log_softmax(-1),
+                    torch.tensor([20]), 12, 0.4, 0.5, False, 0.0, False,
+                    space, "floored_active_support")
+
+
 if __name__ == "__main__":
     unittest.main()

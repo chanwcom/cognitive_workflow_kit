@@ -876,7 +876,10 @@ def apply_active_support_smoothing(est_probs, logits_len, alpha, eps=1e-6):
     """
     b, t, c = est_probs.shape
 
-    ge_mask = est_probs >= eps                                   # (B, T, K)
+    # Strictly greater, matching apply_floored_active_support_smoothing:
+    # a class with exactly zero probability is never active, and the two
+    # functions agree on every input rather than only on non-ties.
+    ge_mask = est_probs > eps                                    # (B, T, K)
     n_a = ge_mask.sum(dim=-1, keepdim=True).to(est_probs.dtype)  # (B, T, 1)
     p_p = n_a / c
 
@@ -908,6 +911,163 @@ def apply_active_support_smoothing(est_probs, logits_len, alpha, eps=1e-6):
         _LAST_ACTIVE_SUPPORT_STATS.get("n_frames", 0.0) + n_valid.detach())
     _LAST_ACTIVE_SUPPORT_STATS["alpha"] = alpha
     _LAST_ACTIVE_SUPPORT_STATS["c"] = c
+
+    return y_ls * valid.unsqueeze(-1).to(est_probs.dtype)
+
+
+_LAST_FLOORED_ACTIVE_SUPPORT_STATS = {}
+
+
+def pop_last_floored_active_support_stats():
+    """Returns and clears diagnostics from the last floored-AS smoothing.
+
+    Same contract as `pop_last_active_support_stats`: frames-weighted means
+    accumulated since the previous call, then cleared; an empty dict if the
+    path never ran.
+    """
+    acc = dict(_LAST_FLOORED_ACTIVE_SUPPORT_STATS)
+    _LAST_FLOORED_ACTIVE_SUPPORT_STATS.clear()
+    if not acc or not acc.get("n_frames"):
+        return {}
+    n_frames = float(acc["n_frames"])
+    mean_n_a = float(acc["sum_n_a"]) / n_frames
+    c, alpha, beta = acc["c"], acc["alpha"], acc["beta"]
+    return {
+        "fas_n_active": mean_n_a,
+        "fas_frac": mean_n_a / c,
+        # Total mass actually handed out. This, not alpha, is the real
+        # smoothing strength, and it moves over training because N_a does.
+        "fas_mass_eff": alpha * (mean_n_a + beta * (c - mean_n_a)) / c,
+        # The same with the floor removed, i.e. what plain AS at this alpha
+        # would have used. Lets an FAS run and an AS run be compared at
+        # matched strength after the fact.
+        "fas_mass_active_only": alpha * mean_n_a / c,
+        # Fraction of frames whose active set collapsed to a single class.
+        # A trained CTC model does this at ~9% of frames even at eps=1e-6
+        # and at ~29% once eps reaches 3.1e-3; those frames get the
+        # weakest intervention, so a cell is not interpretable without it.
+        "fas_n1_frac": float(acc["sum_n1"]) / n_frames,
+    }
+
+
+def apply_floored_active_support_smoothing(est_probs, logits_len, alpha, beta,
+                                            eps=1e-10):
+    """Two-rate smoothing: alpha/K on the active set, (1-beta)*alpha/K off it.
+
+    A one-parameter generalization of `apply_active_support_smoothing`:
+    instead of giving inactive classes exactly nothing, it gives them a
+    fraction `beta` of the active rate. Both endpoints are exact, not
+    approximate (see FlooredActiveSupportTest):
+
+        beta = 0  ->  apply_active_support_smoothing, bit for bit
+        beta = 1  ->  textbook uniform LS, (1 - alpha) y + alpha/K
+
+    beta reads directly as the inactive-to-active HEIGHT ratio: at 0.5 an
+    inactive class gets half the per-class rate an active one does. Note
+    this runs OPPOSITE to C-SETS's beta, where 1 is the most selective
+    end -- the two methods' betas are not interchangeable.
+
+    The height ratio is beta regardless of alpha or K, but the MASS ratio
+    is ((K - N_a)/N_a) * beta, which does move with N_a: at the measured
+    late-training N_a = 2.9 with K = 32, beta = 0.1 puts as much total
+    mass on the ~29 inactive classes as on the ~3 active ones. Read beta
+    as a per-class height, never as a share of the smoothing budget.
+
+    Why this parameterization rather than an algebraically equivalent one:
+    `alpha` sets the ACTIVE rate alone and `beta` moves only the floor, so
+    an (alpha, beta) grid separates "how much smoothing" from "where it
+    goes". C-SETS cannot do that -- its beta moves both at once, which is
+    why its grid could not say whether a floor helps. It also keeps the
+    method out of the failure mode C-SETS has at beta = 1, where the
+    active rate alpha/N_a explodes as the alignment sharpens (measured
+    collapse past ~4x the textbook optimum rate); here the active rate is
+    alpha/K and does not depend on N_a at all.
+
+    No clamp is needed, and that is a property of this form specifically:
+
+        mass = (alpha/K) * (N_a + beta*(K - N_a)) <= (alpha/K) * K = alpha
+
+    since N_a <= K and beta <= 1, so 1 - mass >= 1 - alpha >= 0 at every
+    frame for any beta whenever alpha <= 1. The variant that adds a
+    full-support uniform on top instead has active rate (alpha/K)(1+beta)
+    and does go negative -- measured -0.200 at alpha=0.60 with N_a = K. Clamping that would silently change the effective beta on
+    exactly the frames where the active set is widest, making a grid
+    uninterpretable.
+
+    Args:
+        est_probs: Float tensor (B, T, K). The target distribution over
+            classes, i.e. the scattered alignment posterior. Class space
+            only: the label axis is padded, and a threshold rule would
+            fire on padded positions.
+        logits_len: Long tensor (B,). Valid length per sample; frames past
+            it are zeroed in the output.
+        alpha: Python float in [0, 1]. Per-class rate on the active set,
+            in units of 1/K. Sets the active rate ALONE.
+        beta: Python float in [0, 1]. Floor height as a fraction of the
+            active rate: inactive classes receive beta*alpha/K, so beta = 0
+            gives them nothing and beta = 1 gives them the same as active
+            ones.
+        eps: A class is active when its probability EXCEEDS eps.
+            Strictly greater, so a class with exactly zero probability is
+            never active even at eps = 0.
+
+            The default 1e-10 sits below the smallest non-zero value the
+            scattered posterior produces -- measured 4.7e-10 to 9.3e-10
+            over transcripts from 6 to 300 tokens -- so it means "every
+            class the alignment can reach". N_a saturates there: dropping
+            eps from 1e-9 to 0 moves it by under 0.1, while raising it to
+            1e-6 costs about 3 classes and to 3.1e-3 about 8.
+
+            A larger eps is therefore a way to WEAKEN the smoothing, not
+            a neutral implementation detail. Measured on 1hr at
+            alpha=0.40 with no floor: eps=1e-6 gave WER 0.1964, and the
+            equivalent of 3.1e-3 gave 0.2119 -- lower training loss,
+            worse eval, i.e. the narrower active set simply regularized
+            less.
+
+    Returns:
+        Float tensor (B, T, K), same dtype/device. Padded frames zeroed.
+    """
+    b, t, c = est_probs.shape
+
+    # Strictly greater, not >=. In class space the scatter only touches
+    # classes present in the transcript, so the rest are EXACTLY 0 --
+    # measured 25 of 32 on a 3-class transcript. A `>=` test against a
+    # cutoff of zero would mark all of them active: N_a would equal K,
+    # mass would equal alpha, and FAS would silently collapse to textbook
+    # LS at every beta (measured N_a jumping 5 -> 30 on one frame). The
+    # With `>`, eps = 0 instead means the useful thing: active is
+    # anything the alignment can actually reach.
+    ge_mask = est_probs > eps                                    # (B, T, K)
+    n_a = ge_mask.sum(dim=-1, keepdim=True).to(est_probs.dtype)  # (B, T, 1)
+
+    rate = alpha / c
+    mixin = torch.where(
+        ge_mask,
+        torch.full_like(est_probs, rate),
+        torch.full_like(est_probs, rate * beta))
+    # Grouped as alpha * (.../c), matching apply_active_support_smoothing's
+    # `alpha * p_p` term, so beta = 0 reproduces it bit for bit rather than
+    # merely to within rounding.
+    mass = alpha * ((n_a + beta * (c - n_a)) / c)
+    y_ls = (1.0 - mass) * est_probs + mixin
+
+    time_idx = torch.arange(t, device=est_probs.device)
+    valid = time_idx.unsqueeze(0) < logits_len.unsqueeze(1)      # (B, T)
+
+    # Accumulated across calls rather than overwritten per batch, for the
+    # reason spelled out in apply_active_support_smoothing: the stream is
+    # length-bucketed, so one batch is not representative of the next.
+    n_valid = valid.sum().to(est_probs.dtype)
+    sum_n_a = (n_a.squeeze(-1) * valid).sum()
+    sum_n1 = ((n_a.squeeze(-1) == 1.0) & valid).sum().to(est_probs.dtype)
+    acc = _LAST_FLOORED_ACTIVE_SUPPORT_STATS
+    acc["sum_n_a"] = acc.get("sum_n_a", 0.0) + sum_n_a.detach()
+    acc["sum_n1"] = acc.get("sum_n1", 0.0) + sum_n1.detach()
+    acc["n_frames"] = acc.get("n_frames", 0.0) + n_valid.detach()
+    acc["alpha"] = alpha
+    acc["beta"] = beta
+    acc["c"] = c
 
     return y_ls * valid.unsqueeze(-1).to(est_probs.dtype)
 
