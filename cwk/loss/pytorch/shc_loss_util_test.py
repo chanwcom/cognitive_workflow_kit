@@ -892,3 +892,99 @@ class FlooredActiveSupportTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ActiveSupportAcousticTest(unittest.TestCase):
+    """ASAP: FAS's arithmetic, active set from the acoustic posterior."""
+
+    def setUp(self):
+        self.c = 32
+        self.logits_len = torch.tensor([4, 3])
+        # Alignment posterior: sparse, as the scatter really produces.
+        self.y = torch.zeros(2, 4, self.c)
+        self.y[:, :, 0] = 0.7
+        self.y[:, :, 3] = 0.3
+
+    def _acoustic(self, n_active, floor=1e-9, high=0.5):
+        """A softmax-like tensor with exactly `n_active` classes above 1e-5."""
+        p = torch.full((2, 4, self.c), floor)
+        p[:, :, :n_active] = high
+        return p
+
+    def test_active_set_comes_from_the_acoustic_tensor_not_the_target(self):
+        """The target has 2 non-zero classes; the acoustics say 5 are active.
+
+        If the rule read `est_probs` (as FAS does) N_a would be 2. This is
+        the entire difference between the two methods, so it is the first
+        thing that must hold.
+        """
+        ac = self._acoustic(5)
+        shc_loss_util.apply_active_support_acoustic_smoothing(
+            self.y.clone(), ac, self.logits_len, alpha=0.25, beta=0.0,
+            eps=1e-5)
+        stats = shc_loss_util.pop_last_asap_stats()
+        self.assertAlmostEqual(stats["asap_n_active"], 5.0, places=5)
+
+    def test_rows_sum_to_one_on_valid_frames(self):
+        for n in (1, 5, 32):
+            out = shc_loss_util.apply_active_support_acoustic_smoothing(
+                self.y.clone(), self._acoustic(n), self.logits_len,
+                alpha=0.4, beta=0.1, eps=1e-5)
+            shc_loss_util.pop_last_asap_stats()
+            self.assertTrue(
+                torch.allclose(out[0, :4].sum(-1), torch.ones(4), atol=1e-6),
+                msg=f"n_active={n}")
+
+    def test_matches_fas_exactly_when_both_rules_select_the_same_set(self):
+        """Feeding the target in as the acoustics must reproduce FAS bit for bit.
+
+        Pins that the only thing ASAP changes is which tensor is
+        thresholded -- not the arithmetic, and not the ordering of the
+        floating-point operations that produce it.
+        """
+        for alpha, beta in ((0.25, 0.0), (0.4, 0.05), (0.1, 1.0)):
+            fas = shc_loss_util.apply_floored_active_support_smoothing(
+                self.y.clone(), self.logits_len, alpha, beta, eps=1e-5)
+            shc_loss_util.pop_last_floored_active_support_stats()
+            asap = shc_loss_util.apply_active_support_acoustic_smoothing(
+                self.y.clone(), self.y.clone(), self.logits_len, alpha, beta,
+                eps=1e-5)
+            shc_loss_util.pop_last_asap_stats()
+            self.assertTrue(torch.equal(fas, asap),
+                            msg=f"alpha={alpha} beta={beta}")
+
+    def test_unreachable_but_acoustically_active_classes_get_smoothed(self):
+        """The class the alignment cannot reach still receives alpha/C.
+
+        FAS can never do this; it is the behavioural point of ASAP, and
+        `asap_unreachable_active` is the stat that reports it.
+        """
+        ac = self._acoustic(5)          # classes 0..4 active
+        out = shc_loss_util.apply_active_support_acoustic_smoothing(
+            self.y.clone(), ac, self.logits_len, alpha=0.32, beta=0.0,
+            eps=1e-5)
+        stats = shc_loss_util.pop_last_asap_stats()
+        # Class 1 is acoustically active but carries zero alignment mass.
+        self.assertAlmostEqual(out[0, 0, 1].item(), 0.32 / self.c, places=6)
+        # Classes 1, 2, 4 are active-but-unreachable (0 and 3 are reachable).
+        self.assertAlmostEqual(stats["asap_unreachable_active"], 3.0, places=5)
+
+    def test_threshold_is_absolute_and_strictly_greater(self):
+        p = torch.full((1, 1, self.c), 1e-9)
+        p[0, 0, 0] = 1.0
+        eps = 1e-5
+        p[0, 0, 1] = torch.tensor(eps)                       # exactly eps
+        p[0, 0, 2] = torch.nextafter(torch.tensor(eps), torch.tensor(1.0))
+        shc_loss_util.apply_active_support_acoustic_smoothing(
+            torch.zeros(1, 1, self.c), p, torch.tensor([1]), alpha=0.2,
+            beta=0.0, eps=eps)
+        stats = shc_loss_util.pop_last_asap_stats()
+        # class 0 and class 2 only -- exactly-eps is excluded by `>`.
+        self.assertAlmostEqual(stats["asap_n_active"], 2.0, places=5)
+
+    def test_padded_frames_are_zeroed(self):
+        out = shc_loss_util.apply_active_support_acoustic_smoothing(
+            self.y.clone(), self._acoustic(5), self.logits_len, alpha=0.25,
+            beta=0.05, eps=1e-5)
+        shc_loss_util.pop_last_asap_stats()
+        self.assertTrue(torch.all(out[1, 3] == 0.0))

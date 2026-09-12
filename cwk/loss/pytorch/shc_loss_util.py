@@ -1317,3 +1317,125 @@ def apply_peak_capping_selective_estimated_target_smoothing(
     y_new = y_new * valid.unsqueeze(-1).to(est_probs.dtype)
 
     return y_new
+
+
+_LAST_ASAP_STATS = {}
+
+
+def pop_last_asap_stats():
+    """Returns and clears diagnostics from the last ASAP smoothing.
+
+    Same contract as `pop_last_floored_active_support_stats`, with one
+    extra field: `asap_disagree`, the mean number of classes the acoustic
+    and alignment rules disagree about. That is the whole point of the
+    method, so a run is not interpretable without it -- at zero the method
+    is just FAS with a different threshold.
+    """
+    acc = dict(_LAST_ASAP_STATS)
+    _LAST_ASAP_STATS.clear()
+    if not acc or not acc.get("n_frames"):
+        return {}
+    n_frames = float(acc["n_frames"])
+    mean_n_a = float(acc["sum_n_a"]) / n_frames
+    c, alpha, beta = acc["c"], acc["alpha"], acc["beta"]
+    return {
+        "asap_n_active": mean_n_a,
+        "asap_frac": mean_n_a / c,
+        "asap_mass_eff": alpha * (mean_n_a + beta * (c - mean_n_a)) / c,
+        "asap_mass_active_only": alpha * mean_n_a / c,
+        "asap_n1_frac": float(acc["sum_n1"]) / n_frames,
+        # Mean |acoustic active set XOR alignment-reachable set|.
+        "asap_disagree": float(acc["sum_disagree"]) / n_frames,
+        # Mean count of classes the acoustics call active that the
+        # alignment cannot reach at all. These are the ones FAS could
+        # never smooth and ASAP now does.
+        "asap_unreachable_active": float(acc["sum_unreach"]) / n_frames,
+    }
+
+
+def apply_active_support_acoustic_smoothing(est_probs, acoustic_probs,
+                                            logits_len, alpha, beta,
+                                            eps=1e-3):
+    """FAS's formula with the active set taken from the ACOUSTIC posterior.
+
+    Identical arithmetic to `apply_floored_active_support_smoothing` --
+    active classes get alpha/C, inactive get beta*alpha/C, and the target
+    being smoothed is still the alignment posterior `est_probs`. The one
+    difference is which tensor the threshold is applied to:
+
+        FAS  : active = (est_probs      > eps)   alignment posterior
+        ASAP : active = (acoustic_probs > eps)   softmax of the logits
+
+    Why that changes the meaning of `eps`, and why the default is 1e-3
+    rather than FAS's 1e-10: the scattered alignment posterior is exactly
+    zero for every class the alignment cannot reach, so a cutoff anywhere
+    below the smallest representable positive value means "reachable at
+    all". A softmax has no structural zeros -- every class carries some
+    mass -- so the same cutoff marks all C classes active and the method
+    silently degenerates to textbook uniform LS.
+
+    Measured on a trained 32-class checkpoint (2000 steps, test-clean,
+    28356 frames), mean N_active by cutoff:
+
+        1e-2   2.23      1e-6   31.51
+        1e-3   2.88      1e-8   32.00
+        1e-4  13.55      1e-10  32.00   <- every class, always
+
+    The smallest softmax value seen anywhere was 8.18e-08, so nothing
+    below about 1e-7 discriminates. 1e-3 is the default because it puts
+    N_active at 2.88, closest to the 3.9 that FAS at eps=1e-10 settles on
+    late in training, which makes the two methods comparable at matched
+    support width rather than at matched (and meaningless) cutoff.
+
+    Note the acoustic rule can mark a class active that the alignment can
+    never produce for this transcript. That is the intended difference --
+    `asap_unreachable_active` in the stats counts exactly those.
+
+    Args:
+        est_probs: Float tensor (B, T, C). The alignment posterior; this
+            is what gets smoothed, unchanged from FAS.
+        acoustic_probs: Float tensor (B, T, C). softmax(logits), i.e.
+            `log_probs.exp()` at the call site. Only its support pattern
+            is used, never its values. Must be detached: the mask is a
+            hard threshold and is not part of the differentiated graph.
+        logits_len: Long tensor (B,). Frames past it are zeroed.
+        alpha: Per-class rate on the active set, in units of 1/C.
+        beta: Floor height as a fraction of the active rate.
+        eps: A class is active when its ACOUSTIC probability exceeds it.
+            Strictly greater, matching FAS.
+    """
+    _, t, c = est_probs.shape
+
+    ge_mask = acoustic_probs > eps                               # (B, T, C)
+    n_a = ge_mask.sum(dim=-1, keepdim=True).to(est_probs.dtype)  # (B, T, 1)
+
+    rate = alpha / c
+    mixin = torch.where(
+        ge_mask,
+        torch.full_like(est_probs, rate),
+        torch.full_like(est_probs, rate * beta))
+    mass = alpha * ((n_a + beta * (c - n_a)) / c)
+    y_ls = (1.0 - mass) * est_probs + mixin
+
+    time_idx = torch.arange(t, device=est_probs.device)
+    valid = time_idx.unsqueeze(0) < logits_len.unsqueeze(1)      # (B, T)
+
+    reach = est_probs > 0.0
+    n_valid = valid.sum().to(est_probs.dtype)
+    acc = _LAST_ASAP_STATS
+    acc["sum_n_a"] = acc.get("sum_n_a", 0.0) + (
+        n_a.squeeze(-1) * valid).sum().detach()
+    acc["sum_n1"] = acc.get("sum_n1", 0.0) + (
+        (n_a.squeeze(-1) == 1.0) & valid).sum().to(est_probs.dtype).detach()
+    acc["sum_disagree"] = acc.get("sum_disagree", 0.0) + (
+        (ge_mask ^ reach).sum(dim=-1) * valid).sum().to(
+            est_probs.dtype).detach()
+    acc["sum_unreach"] = acc.get("sum_unreach", 0.0) + (
+        (ge_mask & ~reach).sum(dim=-1) * valid).sum().to(
+            est_probs.dtype).detach()
+    acc["n_frames"] = acc.get("n_frames", 0.0) + n_valid.detach()
+    acc["alpha"] = alpha
+    acc["beta"] = beta
+    acc["c"] = c
+
+    return y_ls * valid.unsqueeze(-1).to(est_probs.dtype)

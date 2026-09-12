@@ -960,7 +960,8 @@ class ShcLoss(torch.autograd.Function):
                 peak_capping=False, smoothing_space="label",
                 alpha_mode="fixed", entropy_match_alpha_max=1.0,
                 entropy_match_kappa=1.0,
-                fas_eps=1e-10):
+                fas_eps=1e-10,
+                asap_eps=1e-3):
         """Calculates the Sequential Hypothesis Classifier (SHC) loss.
 
         Args:
@@ -1201,10 +1202,11 @@ class ShcLoss(torch.autograd.Function):
         assert alpha_mode in ("fixed", "entropy_matched",
                               "entropy_matched_selective",
                               "active_support",
-                              "floored_active_support"), (
+                              "floored_active_support",
+                              "asap"), (
             f"alpha_mode must be 'fixed', 'entropy_matched', "
-            f"'entropy_matched_selective', 'active_support' or "
-            f"'floored_active_support', got {alpha_mode!r}")
+            f"'entropy_matched_selective', 'active_support', "
+            f"'floored_active_support' or 'asap', got {alpha_mode!r}")
         assert not (alpha_mode == "entropy_matched_selective"
                     and smoothing_space != "class"), (
             "alpha_mode='entropy_matched_selective' requires "
@@ -1220,6 +1222,11 @@ class ShcLoss(torch.autograd.Function):
             "smoothing_space='class': both its rates are per-class, and its "
             "relative activity threshold would fire on the padded positions "
             "of the label axis.")
+        assert not (alpha_mode == "asap"
+                    and smoothing_space != "class"), (
+            "alpha_mode='asap' requires smoothing_space='class': its "
+            "activity test reads the acoustic posterior, which only exists "
+            "on the output class axis.")
         assert not (alpha_mode != "fixed" and smoothing_space == "hybrid"), (
             "smoothing_space='hybrid' only supports alpha_mode='fixed'; "
             f"got {alpha_mode!r}.")
@@ -1283,6 +1290,15 @@ class ShcLoss(torch.autograd.Function):
                     shc_loss_util.apply_floored_active_support_smoothing(
                         ground_truth_prob, logits_len, alpha, beta,
                         eps=fas_eps))
+            elif alpha_mode == "asap":
+                # Same formula as FAS; the active set comes from the
+                # acoustic posterior instead of the alignment one.
+                # log_probs is already detached (forward runs under
+                # no_grad), which is what the hard threshold needs.
+                ground_truth_prob = (
+                    shc_loss_util.apply_active_support_acoustic_smoothing(
+                        ground_truth_prob, log_probs.exp(), logits_len,
+                        alpha, beta, eps=asap_eps))
             elif smoothing_enabled:
                 ground_truth_prob = shc_loss_util.apply_post_processing(
                     ground_truth_prob, logits_len, alpha, beta,
@@ -1357,10 +1373,10 @@ class ShcLoss(torch.autograd.Function):
         # labels, target_lens, logits, logits_len, vocab_size, alpha, beta,
         # peak_preserving, peak_preserving_gamma, peak_capping,
         # smoothing_space, alpha_mode, entropy_match_alpha_max,
-        # entropy_match_kappa, fas_eps.
+        # entropy_match_kappa, fas_eps, asap_eps.
         # Only `logits` (position 3) receives a gradient. This tuple's
         # length must track `forward`'s arity exactly -- autograd raises
         # "returned an incorrect number of gradients" otherwise, which is
         # what adding fas_threshold_frac without touching this did.
         return (None, None, gradient, None, None, None, None, None, None,
-               None, None, None, None, None, None)
+               None, None, None, None, None, None, None)
