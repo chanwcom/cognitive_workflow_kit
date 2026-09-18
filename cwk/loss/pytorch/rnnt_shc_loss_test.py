@@ -224,7 +224,8 @@ class SmoothingTest(unittest.TestCase):
         logits, labels, tl, ul = _random_case(2, 8, 3, 6, seed=13)
         base = self._grad(logits, labels, tl, ul, alpha=0.0)
         for mode in ("fixed", "active_support", "floored_active_support",
-                     "frame_label_support", "asap"):
+                     "frame_label_support", "diagonal_active_support",
+                     "asap"):
             g = self._grad(logits, labels, tl, ul, alpha=0.0,
                            alpha_mode=mode)
             torch.testing.assert_close(g, base, atol=0, rtol=0,
@@ -524,6 +525,134 @@ class FrameLabelSupportTest(unittest.TestCase):
         rnnt_shc_loss.RnntShcLoss.apply(
             labels, ul, x, tl, 0, 0.3, 0.0,
             "frame_label_support").sum().backward()
+        for i, (t, u) in enumerate(zip(tl.tolist(), ul.tolist())):
+            self.assertEqual(float(x.grad[i, t:].abs().sum()), 0.0)
+            self.assertEqual(float(x.grad[i, :, u + 1:].abs().sum()), 0.0)
+class DiagonalActiveSupportTest(unittest.TestCase):
+    """`diagonal_active_support`: one active set per anti-diagonal.
+
+    k = t + u is the step index of an alignment path -- every transition
+    advances exactly one of the two axes -- so a path visits exactly one
+    node per anti-diagonal. That is what makes the tokens crossing a
+    diagonal competing hypotheses for the same decision, and it is what a
+    per-FRAME set lacks: at fixed t a path climbs several u, so those
+    nodes are sequential rather than alternative.
+    """
+
+    def _fb(self, logits, labels, tl, ul):
+        log_probs = torch.log_softmax(logits.float(), dim=-1)
+        b, t_len, u1, c = logits.shape
+        log_p_blank = log_probs[..., 0]
+        lab = labels.clamp(min=0)
+        gathered = torch.gather(
+            log_probs[:, :, :u1 - 1, :], 3,
+            lab.view(b, 1, u1 - 1, 1).expand(b, t_len, u1 - 1, 1)).squeeze(3)
+        log_p_label = torch.cat(
+            [gathered, torch.full((b, t_len, 1), rnnt_shc_loss.NEG_INF)],
+            dim=2)
+        la, lb, lz = rnnt_shc_loss.calculate_rnnt_alpha_beta(
+            log_p_blank, log_p_label, tl, ul)
+        qb, ql = rnnt_shc_loss.rnnt_transition_posteriors(
+            la, lb, log_p_blank, log_p_label, lz, tl, ul)
+        target, gamma = rnnt_shc_loss._node_target(qb, ql, lab, c, 0)
+        return target, gamma
+
+    def test_occupancy_sums_to_one_on_every_anti_diagonal(self):
+        """sum_{t+u=k} gamma(t,u) = 1 for every step k.
+
+        This is the property the whole mode rests on, and the RNN-T
+        analogue of CTC's sum_l gamma(t,l) = 1.
+        """
+        logits, labels, tl, ul = _random_case(3, 9, 4, 6, seed=61)
+        _, gamma = self._fb(logits, labels, tl, ul)
+        for i, (t, u) in enumerate(zip(tl.tolist(), ul.tolist())):
+            g = gamma[i, :t, :u + 1]
+            for k in range(t + u):
+                idx = [(x, k - x) for x in range(max(0, k - u), min(t, k + 1))]
+                tot = sum(float(g[x, y]) for x, y in idx)
+                self.assertAlmostEqual(tot, 1.0, delta=1e-5,
+                                       msg=f"sample {i}, k={k}")
+
+    def test_diagonal_token_mass_is_a_distribution(self):
+        """Each diagonal's token mass sums to 1 over classes."""
+        logits, labels, tl, ul = _random_case(3, 9, 4, 6, seed=67)
+        target, gamma = self._fb(logits, labels, tl, ul)
+        p = rnnt_shc_loss.diagonal_token_mass(target, gamma)
+        for i, (t, u) in enumerate(zip(tl.tolist(), ul.tolist())):
+            for k in range(t + u):
+                self.assertAlmostEqual(float(p[i, k].sum()), 1.0, delta=1e-5,
+                                       msg=f"sample {i}, k={k}")
+
+    def test_nodes_on_one_diagonal_get_the_same_floor(self):
+        """The defining property: the active set is shared along t + u."""
+        logits, labels, tl, ul = _random_case(2, 8, 3, 6, seed=71)
+        target, gamma = self._fb(logits, labels, tl, ul)
+        flat = torch.zeros_like(target)
+        out = rnnt_shc_loss.apply_diagonal_active_support_smoothing(
+            flat, gamma, 0.3, 0.0)          # zero target isolates the floor
+        for i, (t, u) in enumerate(zip(tl.tolist(), ul.tolist())):
+            for k in range(t + u):
+                idx = [(x, k - x) for x in range(max(0, k - u), min(t, k + 1))]
+                if len(idx) < 2:
+                    continue
+                first = out[i, idx[0][0], idx[0][1]]
+                for x, y in idx[1:]:
+                    torch.testing.assert_close(out[i, x, y], first,
+                                               atol=0, rtol=0)
+
+    def test_arrival_is_departure_shifted_by_one_diagonal(self):
+        """The two alignments differ by exactly one step, nothing else."""
+        logits, labels, tl, ul = _random_case(2, 8, 3, 6, seed=73)
+        target, gamma = self._fb(logits, labels, tl, ul)
+        zero = torch.zeros_like(target)
+        dep = rnnt_shc_loss.apply_diagonal_active_support_smoothing(
+            zero, gamma, 0.3, 0.0, align="departure")
+        arr = rnnt_shc_loss.apply_diagonal_active_support_smoothing(
+            zero, gamma, 0.3, 0.0, align="arrival")
+        b, t_len, u1, _ = target.shape
+        for i in range(b):
+            for t in range(t_len):
+                for u in range(u1):
+                    if t + u == 0:
+                        continue
+                    src_t, src_u = (t - 1, u) if t >= 1 else (t, u - 1)
+                    torch.testing.assert_close(arr[i, t, u],
+                                               dep[i, src_t, src_u],
+                                               atol=1e-6, rtol=1e-5)
+
+    def test_target_stays_a_distribution(self):
+        for beta in (0.0, 0.3, 1.0):
+            for align in ("departure", "arrival"):
+                logits, labels, tl, ul = _random_case(2, 6, 3, 8, seed=79)
+                target, gamma = self._fb(logits, labels, tl, ul)
+                out = rnnt_shc_loss.apply_diagonal_active_support_smoothing(
+                    target, gamma, 0.4, beta, align=align)
+                occupied = gamma > 1e-6
+                self.assertGreaterEqual(float(out.min()), -1e-7,
+                                        msg=f"beta={beta} {align}")
+                sums = out.sum(-1)[occupied]
+                torch.testing.assert_close(
+                    sums, torch.ones_like(sums), atol=1e-5, rtol=1e-5,
+                    msg=f"beta={beta} {align}")
+
+    def test_beta_one_is_textbook_label_smoothing(self):
+        """beta = 1 puts alpha/C on every class, so it is plain LS."""
+        logits, labels, tl, ul = _random_case(2, 8, 3, 6, seed=83)
+        alpha, c = 0.25, logits.shape[-1]
+        target, gamma = self._fb(logits, labels, tl, ul)
+        out = rnnt_shc_loss.apply_diagonal_active_support_smoothing(
+            target, gamma, alpha, 1.0)
+        ref = (1.0 - alpha) * target + alpha / c
+        occupied = (gamma > 1e-6).unsqueeze(3).expand_as(out)
+        torch.testing.assert_close(out[occupied], ref[occupied],
+                                   atol=1e-6, rtol=1e-5)
+
+    def test_gradient_is_zero_outside_the_valid_rectangle(self):
+        logits, labels, tl, ul = _random_case(3, 9, 4, 6, seed=89)
+        x = logits.float().clone().requires_grad_(True)
+        rnnt_shc_loss.RnntShcLoss.apply(
+            labels, ul, x, tl, 0, 0.3, 0.0,
+            "diagonal_active_support").sum().backward()
         for i, (t, u) in enumerate(zip(tl.tolist(), ul.tolist())):
             self.assertEqual(float(x.grad[i, t:].abs().sum()), 0.0)
             self.assertEqual(float(x.grad[i, :, u + 1:].abs().sum()), 0.0)
