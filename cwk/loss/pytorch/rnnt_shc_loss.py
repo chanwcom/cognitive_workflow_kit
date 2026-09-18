@@ -351,6 +351,110 @@ def _node_target(q_blank: torch.Tensor, q_label: torch.Tensor,
     return target, gamma
 
 
+def apply_frame_label_support_smoothing(
+        target: torch.Tensor,
+        gamma: torch.Tensor,
+        blank: int,
+        alpha: float,
+        beta: float,
+        eps: float = 1e-10,
+) -> torch.Tensor:
+    """FAS confined to the label subspace, with a FRAME-level active set.
+
+    Why this exists, and why plain FAS is not the right transfer of the
+    CTC result to RNN-T.
+
+    A node's target has exactly two non-zero entries, {blank, y_{u+1}}, so
+    `apply_floored_active_support_smoothing` sees N_a = 2 there. Its change
+    to the blank entry is
+
+        d target(blank) = (alpha/K) * (1 - N_a * q_b)
+
+    which is +alpha/K wherever q_b -> 0, i.e. at exactly the nodes where a
+    label has to be emitted -- and that is the only chance to emit it,
+    since RNN-T emits each label once. Measured on a converged 100 h model
+    (alpha = 0.05, seed 0, full dev): deletions +18 %, insertions -28 %,
+    substitutions unchanged. The operating point moved along the D/I
+    trade-off without any gain in discrimination.
+
+    Note the blank pressure does NOT come from N_a being small: the limit
+    above is independent of N_a, so widening the active set cannot remove
+    it (and makes the true label lose more mass, not less). Excluding
+    blank from a PER-NODE active set is no use either -- one class would be
+    left and the result is a deterministic blank penalty, not smoothing.
+
+    What CTC actually has that RNN-T does not is redundancy: a label spans
+    several frames there, so no single frame's argmax is decisive, and the
+    frame's active set holds blank plus several DISTINCT labels. The
+    transfer that preserves that structure is to leave the blank/label
+    split alone and smooth only WITHIN the label part, over the labels the
+    lattice could emit at this frame:
+
+        A_t = {c != blank : pbar_t(c) > eps},
+        pbar_t = sum_u gamma(t,u) target(t,u,.) / sum_u gamma(t,u)
+
+    the occupancy-weighted marginal over the u axis -- the same object CTC
+    smooths. Measured |A_t| on the model above: 2.48 labels at eps = 1e-10,
+    against CTC's 2.9, so the set is genuinely multi-class. It collapses
+    below ~1 by eps = 1e-2, so the small default matters here.
+
+    Writing s_b = q_blank/gamma and s = q_label/gamma = 1 - s_b, the node
+    target becomes
+
+        target(blank) = s_b                                    (unchanged)
+        target(c)     = s * [(1 - m) e_{y_{u+1}}(c) + r(c)]    (c != blank)
+
+    with active rate alpha/K as in FAS, r(c) = (alpha/K)(1_{A_t}(c) +
+    beta (1 - 1_{A_t}(c))) and m = (alpha/K)(N_a + beta(K - 1 - N_a)), so
+    the label part keeps its total mass s and d target(blank) = 0 exactly.
+    beta keeps its FAS meaning: 0 restricts smoothing to A_t, 1 is uniform
+    LS over the non-blank classes.
+
+    Args:
+        target: (B, T, U+1, C) per-node class-space target, normalized over
+            C, as `_node_target` returns it.
+        gamma: (B, T, U+1) node occupancy, exactly zero outside each
+            sample's valid rectangle.
+        blank: blank class id.
+        alpha: smoothing strength, a per-class rate in 1/C as everywhere
+            else in this family.
+        beta: floor height for the inactive labels.
+        eps: activity threshold on the frame marginal.
+
+    Returns:
+        (B, T, U+1, C) smoothed target. Nodes with no label mass (the u = U
+        column, and everything outside the rectangle) are returned
+        untouched.
+    """
+    b, t_len, u1, num_classes = target.shape
+    dt = target.dtype
+    occ = gamma.sum(2).clamp(min=1e-30)                             # (B,T)
+    pbar = (gamma.unsqueeze(3) * target).sum(2) / occ.unsqueeze(2)  # (B,T,C)
+
+    active = pbar > eps
+    active[..., blank] = False
+    n_a = active.sum(-1, keepdim=True).to(dt)                       # (B,T,1)
+    k = float(num_classes)
+    rate = alpha / k
+    mass = rate * (n_a + beta * (k - 1.0 - n_a))                    # (B,T,1)
+
+    floor = rate * (active.to(dt) + beta * (~active).to(dt))        # (B,T,C)
+    floor[..., blank] = 0.0
+
+    s_b = target[..., blank]                                        # (B,T,U+1)
+    label_part = target.clone()
+    label_part[..., blank] = 0.0
+    s = label_part.sum(-1)                                          # (B,T,U+1)
+    # The conditional is only defined where there is label mass; where
+    # there is none the whole label part stays zero, which is what
+    # multiplying by s does anyway.
+    cond = label_part / s.clamp(min=1e-30).unsqueeze(3)
+    new_cond = (1.0 - mass).unsqueeze(2) * cond + floor.unsqueeze(2)
+    out = new_cond * s.unsqueeze(3)
+    out[..., blank] = s_b
+    return out
+
+
 class RnntShcLoss(torch.autograd.Function):
     """RNN-T loss with the `shc_loss` target-smoothing family applied.
 
@@ -387,11 +491,16 @@ class RnntShcLoss(torch.autograd.Function):
                 per-class rate in 1/C).
             beta: floor height for "floored_active_support"; 0 restricts
                 smoothing to the active set and 1 is textbook uniform LS.
-            alpha_mode: "fixed", "active_support", "floored_active_support"
-                or "asap". There is no "label"/"class" smoothing_space
-                choice here -- the per-node target only exists in class
-                space, so the label-axis variants have no analogue.
-            fas_eps: activity threshold for floored_active_support.
+            alpha_mode: "fixed", "active_support",
+                "floored_active_support", "frame_label_support" or "asap".
+                There is no "label"/"class" smoothing_space choice here --
+                the per-node target only exists in class space, so the
+                label-axis variants have no analogue.
+                "frame_label_support" is the one mode that is not a
+                per-node rule; see `apply_frame_label_support_smoothing`
+                for why RNN-T needs it where CTC does not.
+            fas_eps: activity threshold for
+                floored_active_support and frame_label_support.
             asap_eps: activity threshold for asap.
 
         Returns:
@@ -406,7 +515,8 @@ class RnntShcLoss(torch.autograd.Function):
             "logits' third axis must be U+1 where U is labels' width; got "
             f"{logits.shape[2]} vs {labels.shape[1]} + 1")
         assert alpha_mode in ("fixed", "active_support",
-                              "floored_active_support", "asap"), alpha_mode
+                              "floored_active_support",
+                              "frame_label_support", "asap"), alpha_mode
 
         b, t_len, u1, num_classes = logits.shape
         log_probs = torch.log_softmax(logits.float(), dim=-1)
@@ -433,7 +543,12 @@ class RnntShcLoss(torch.autograd.Function):
                                      blank)
 
         smoothing_enabled = alpha > 0.0
-        if smoothing_enabled:
+        if smoothing_enabled and alpha_mode == "frame_label_support":
+            # Needs the (t, u) structure and the occupancy, so it does not
+            # go through the flattened per-node path below.
+            target = apply_frame_label_support_smoothing(
+                target, gamma, blank, alpha, beta, eps=fas_eps)
+        elif smoothing_enabled:
             # The smoothing functions take (B, N, C) plus a per-sample
             # valid length along N. Nodes are folded into one axis and the
             # length is set to the full width, because validity here is a

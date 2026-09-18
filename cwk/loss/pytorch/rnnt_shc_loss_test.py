@@ -224,7 +224,7 @@ class SmoothingTest(unittest.TestCase):
         logits, labels, tl, ul = _random_case(2, 8, 3, 6, seed=13)
         base = self._grad(logits, labels, tl, ul, alpha=0.0)
         for mode in ("fixed", "active_support", "floored_active_support",
-                     "asap"):
+                     "frame_label_support", "asap"):
             g = self._grad(logits, labels, tl, ul, alpha=0.0,
                            alpha_mode=mode)
             torch.testing.assert_close(g, base, atol=0, rtol=0,
@@ -401,6 +401,132 @@ class PaddingTest(unittest.TestCase):
         self.assertAlmostEqual(float(qb32.sum()) / t_len, 1.0, delta=2e-3)
         self.assertAlmostEqual(float(ql32.sum()) / u_len, 1.0, delta=2e-3)
 
+class FrameLabelSupportTest(unittest.TestCase):
+    """`frame_label_support`: smoothing confined to the label subspace.
+
+    The mode exists because per-node FAS raises the blank target by
+    alpha/K at every node where a label has to be emitted, which in RNN-T
+    is that label's only chance to be emitted. The tests below pin the two
+    claims that make the mode worth having: the blank target does not
+    move, and the active set is genuinely multi-class (which a per-node
+    blank-excluded set could never be, since it would hold one label).
+    """
+
+    def _target(self, logits, labels, tl, ul, **kw):
+        """Returns (plain target, smoothed target, gamma)."""
+        log_probs = torch.log_softmax(logits.float(), dim=-1)
+        b, t_len, u1, c = logits.shape
+        log_p_blank = log_probs[..., 0]
+        lab = labels.clamp(min=0)
+        gathered = torch.gather(
+            log_probs[:, :, :u1 - 1, :], 3,
+            lab.view(b, 1, u1 - 1, 1).expand(b, t_len, u1 - 1, 1)).squeeze(3)
+        log_p_label = torch.cat(
+            [gathered, torch.full((b, t_len, 1), rnnt_shc_loss.NEG_INF)],
+            dim=2)
+        la, lb, lz = rnnt_shc_loss.calculate_rnnt_alpha_beta(
+            log_p_blank, log_p_label, tl, ul)
+        qb, ql = rnnt_shc_loss.rnnt_transition_posteriors(
+            la, lb, log_p_blank, log_p_label, lz, tl, ul)
+        target, gamma = rnnt_shc_loss._node_target(qb, ql, lab, c, 0)
+        smoothed = rnnt_shc_loss.apply_frame_label_support_smoothing(
+            target, gamma, 0, kw.get("alpha", 0.2), kw.get("beta", 0.0),
+            eps=kw.get("eps", 1e-10))
+        return target, smoothed, gamma
+
+    def test_blank_target_is_unchanged(self):
+        """The defining property: d target(blank) = 0 at every node.
+
+        This is the whole point of the mode -- per-node FAS moves it by
+        (alpha/K)(1 - N_a q_b), which is +alpha/K exactly where a label
+        must be emitted.
+        """
+        logits, labels, tl, ul = _random_case(2, 8, 3, 6, seed=31)
+        target, smoothed, _ = self._target(logits, labels, tl, ul, alpha=0.3)
+        torch.testing.assert_close(smoothed[..., 0], target[..., 0],
+                                   atol=1e-6, rtol=1e-5)
+
+    def test_per_node_fas_does_move_the_blank_target(self):
+        """Control for the test above: the mode it replaces does move it.
+
+        Without this the previous test could pass for the trivial reason
+        that the case has no label mass anywhere.
+        """
+        logits, labels, tl, ul = _random_case(2, 8, 3, 6, seed=31)
+        log_probs = torch.log_softmax(logits.float(), dim=-1)
+        b, t_len, u1, c = logits.shape
+        target, _, gamma = self._target(logits, labels, tl, ul, alpha=0.3)
+        flat = target.reshape(b, t_len * u1, c)
+        full = torch.full((b,), t_len * u1, dtype=torch.long)
+        from cwk.loss.pytorch import shc_loss_util
+        node = shc_loss_util.apply_floored_active_support_smoothing(
+            flat, full, 0.3, 0.0).reshape(b, t_len, u1, c)
+        moved = (node[..., 0] - target[..., 0]).abs()
+        self.assertGreater(float(moved[gamma > 1e-6].max()), 1e-3)
+
+    def test_target_stays_a_distribution(self):
+        """Non-negative and summing to 1 wherever the node is occupied."""
+        for beta in (0.0, 0.3, 1.0):
+            logits, labels, tl, ul = _random_case(2, 6, 3, 8, seed=37)
+            _, smoothed, gamma = self._target(
+                logits, labels, tl, ul, alpha=0.4, beta=beta)
+            occupied = gamma > 1e-6
+            self.assertGreaterEqual(float(smoothed.min()), -1e-7,
+                                    msg=f"beta={beta}")
+            sums = smoothed.sum(-1)[occupied]
+            torch.testing.assert_close(sums, torch.ones_like(sums),
+                                       atol=1e-5, rtol=1e-5)
+
+    def test_active_set_is_frame_level_not_node_level(self):
+        """Mass must reach labels other than this node's own y_{u+1}.
+
+        A per-node label support holds exactly one class, so smoothing
+        over it would be a pure blank penalty. The frame marginal pulls in
+        every label the lattice could emit at this frame, which is what
+        makes the mode a smoother at all.
+        """
+        logits, labels, tl, ul = _random_case(2, 8, 4, 6, seed=41)
+        target, smoothed, gamma = self._target(
+            logits, labels, tl, ul, alpha=0.3, beta=0.0)
+        # Classes that had exactly zero target at a node but gained mass.
+        gained = (target < 1e-12) & (smoothed > 1e-9)
+        gained = gained & (gamma > 1e-6).unsqueeze(3)
+        self.assertGreater(int(gained.sum()), 0)
+
+    def test_beta_one_is_uniform_over_the_non_blank_classes(self):
+        """beta = 1 must be textbook LS applied inside the label part."""
+        logits, labels, tl, ul = _random_case(2, 8, 3, 6, seed=43)
+        alpha, c = 0.25, logits.shape[-1]
+        target, smoothed, gamma = self._target(
+            logits, labels, tl, ul, alpha=alpha, beta=1.0)
+        rate = alpha / c
+        mass = rate * (c - 1.0)
+        label_part = target.clone()
+        label_part[..., 0] = 0.0
+        s = label_part.sum(-1, keepdim=True)
+        floor = torch.full_like(target, rate)
+        floor[..., 0] = 0.0
+        ref = (1.0 - mass) * label_part + floor * s
+        ref[..., 0] = target[..., 0]
+        torch.testing.assert_close(smoothed, ref, atol=1e-6, rtol=1e-5)
+
+    def test_nodes_without_label_mass_are_untouched(self):
+        """The u = U column has no label transition, so nothing to smooth."""
+        logits, labels, tl, ul = _random_case(2, 8, 3, 6, seed=47)
+        target, smoothed, _ = self._target(logits, labels, tl, ul, alpha=0.3)
+        for i, u in enumerate(ul.tolist()):
+            torch.testing.assert_close(smoothed[i, :, u], target[i, :, u],
+                                       atol=1e-6, rtol=1e-5)
+
+    def test_gradient_is_zero_outside_the_valid_rectangle(self):
+        logits, labels, tl, ul = _random_case(3, 9, 4, 6, seed=53)
+        x = logits.float().clone().requires_grad_(True)
+        rnnt_shc_loss.RnntShcLoss.apply(
+            labels, ul, x, tl, 0, 0.3, 0.0,
+            "frame_label_support").sum().backward()
+        for i, (t, u) in enumerate(zip(tl.tolist(), ul.tolist())):
+            self.assertEqual(float(x.grad[i, t:].abs().sum()), 0.0)
+            self.assertEqual(float(x.grad[i, :, u + 1:].abs().sum()), 0.0)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
