@@ -480,6 +480,108 @@ class FlooredActiveSupportEndToEndTest(unittest.TestCase):
                     torch.tensor([20]), 12, 0.4, 0.5, False, 0.0, False,
                     space, "floored_active_support")
 
+class AlignmentBiasedTest(unittest.TestCase):
+    """ABS through ShcLoss: smooth toward the no-acoustics alignment.
+
+    Textbook LS pulls the target toward 1/C, which knows nothing about the
+    lattice. ABS pulls it toward the alignment posterior the same lattice
+    would produce if every per-frame log-probability were equal -- a purely
+    combinatorial object that depends on T and the label sequence's repeat
+    pattern and NOT on the model.
+    """
+
+    def _case(self, seed=0, b=3, t=60, c=12, lens=(4, 9, 15)):
+        torch.manual_seed(seed)
+        labels = torch.full((b, max(lens)), -100, dtype=torch.long)
+        for i, n in enumerate(lens):
+            labels[i, :n] = torch.randint(1, c, (n,))
+        target_lens = (labels >= 0).sum(1)
+        logit_lens = torch.full((b,), t, dtype=torch.long)
+        logits = torch.randn(b, t, c) * 0.5
+        return labels, target_lens, logits, logit_lens, c
+
+    def _reference(self, labels, target_lens, logits, logit_lens):
+        """The class-space reference ABS mixes toward."""
+        inputs = seq_loss_util.to_blank_augmented_labels(
+            {"SEQ_DATA": labels, "SEQ_LEN": target_lens}, 0, False, False)
+        aug, aug_lens = inputs["SEQ_DATA"], inputs["SEQ_LEN"]
+        clamped = aug.clamp(min=0)
+        trans = seq_loss_util.label_trans_allowance_table_ctc(aug, aug_lens)
+        log_probs = torch.log_softmax(logits, dim=-1)
+        ltp = seq_loss_util.calculate_log_label_prob(clamped, log_probs)
+        ug = shc_loss.uniform_acoustic_gamma(
+            trans, ltp, aug_lens, logit_lens,
+            max_logit_len_int=int(logit_lens.max()))
+        return shc_loss._scatter_to_class_space(ug, log_probs, clamped), ug
+
+    def test_reference_is_a_per_frame_distribution(self):
+        labels, tl, logits, ll, c = self._case(seed=1)
+        ref, ug = self._reference(labels, tl, logits, ll)
+        sums = ug.sum(-1)
+        torch.testing.assert_close(sums, torch.ones_like(sums),
+                                   atol=1e-5, rtol=1e-5)
+        cs = ref.sum(-1)
+        torch.testing.assert_close(cs, torch.ones_like(cs),
+                                   atol=1e-5, rtol=1e-5)
+
+    def test_reference_does_not_depend_on_the_model(self):
+        """It is combinatorial: same (T, labels) must give the same thing."""
+        labels, tl, logits, ll, c = self._case(seed=2)
+        _, ug1 = self._reference(labels, tl, logits, ll)
+        _, ug2 = self._reference(labels, tl, torch.randn_like(logits) * 3.0, ll)
+        torch.testing.assert_close(ug1, ug2, atol=1e-6, rtol=1e-5)
+
+    def test_alpha_zero_is_the_plain_loss(self):
+        labels, tl, logits, ll, c = self._case(seed=3)
+        g = []
+        for mode in ("fixed", "alignment_biased"):
+            x = logits.clone().requires_grad_(True)
+            shc_loss.ShcLoss.apply(labels, tl, x.log_softmax(-1), ll, c,
+                                   0.0, 0.0, False, 0.0, False, "class",
+                                   mode).sum().backward()
+            g.append(x.grad)
+        torch.testing.assert_close(g[0], g[1], atol=0, rtol=0)
+
+    def test_alpha_one_replaces_the_target_with_the_reference(self):
+        labels, tl, logits, ll, c = self._case(seed=4)
+        ref, _ = self._reference(labels, tl, logits, ll)
+        x = logits.clone().requires_grad_(True)
+        shc_loss.ShcLoss.apply(labels, tl, x.log_softmax(-1), ll, c,
+                               1.0, 0.0, False, 0.0, False, "class",
+                               "alignment_biased").sum().backward()
+        log_probs = torch.log_softmax(logits, dim=-1)
+        expected = log_probs.exp() - ref
+        torch.testing.assert_close(x.grad, expected, atol=1e-5, rtol=1e-4)
+
+    def test_finite_on_extreme_length_spread(self):
+        """The shape that broke the target before de53098."""
+        num_classes, t = 32, 900
+        lens = [2, 3, 400, 440]
+        torch.manual_seed(0)
+        labels = torch.full((len(lens), max(lens)), -100, dtype=torch.long)
+        for b, n in enumerate(lens):
+            labels[b, :n] = torch.randint(1, num_classes, (n,))
+        tl = (labels >= 0).sum(1)
+        ll = torch.full((len(lens),), t, dtype=torch.long)
+        for alpha in (0.05, 0.3, 1.0):
+            x = (torch.randn(len(lens), t, num_classes) * 0.1
+                 ).requires_grad_(True)
+            loss = shc_loss.ShcLoss.apply(
+                labels, tl, x.log_softmax(-1), ll, num_classes, alpha, 0.0,
+                False, 0.0, False, "class", "alignment_biased").mean()
+            loss.backward()
+            self.assertTrue(bool(torch.isfinite(loss)), f"alpha={alpha}")
+            self.assertTrue(bool(torch.isfinite(x.grad).all()), f"alpha={alpha}")
+
+    def test_rejects_non_class_space(self):
+        logits = torch.randn(1, 20, 12)
+        labels = torch.randint(1, 12, (1, 4))
+        for space in ("label", "hybrid"):
+            with self.assertRaises(AssertionError):
+                shc_loss.ShcLoss.apply(
+                    labels, torch.tensor([4]), logits.log_softmax(-1),
+                    torch.tensor([20]), 12, 0.4, 0.0, False, 0.0, False,
+                    space, "alignment_biased")
 
 if __name__ == "__main__":
     unittest.main()

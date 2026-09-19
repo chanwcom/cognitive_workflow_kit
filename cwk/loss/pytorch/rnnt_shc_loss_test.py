@@ -21,6 +21,7 @@ from __future__ import (absolute_import, division, print_function,
                         unicode_literals)
 
 import itertools
+import math
 import unittest
 
 import torch
@@ -225,7 +226,7 @@ class SmoothingTest(unittest.TestCase):
         base = self._grad(logits, labels, tl, ul, alpha=0.0)
         for mode in ("fixed", "active_support", "floored_active_support",
                      "frame_label_support", "diagonal_active_support",
-                     "asap"):
+                     "alignment_biased", "asap"):
             g = self._grad(logits, labels, tl, ul, alpha=0.0,
                            alpha_mode=mode)
             torch.testing.assert_close(g, base, atol=0, rtol=0,
@@ -653,6 +654,132 @@ class DiagonalActiveSupportTest(unittest.TestCase):
         rnnt_shc_loss.RnntShcLoss.apply(
             labels, ul, x, tl, 0, 0.3, 0.0,
             "diagonal_active_support").sum().backward()
+        for i, (t, u) in enumerate(zip(tl.tolist(), ul.tolist())):
+            self.assertEqual(float(x.grad[i, t:].abs().sum()), 0.0)
+            self.assertEqual(float(x.grad[i, :, u + 1:].abs().sum()), 0.0)
+class AlignmentBiasedTest(unittest.TestCase):
+    """`alignment_biased` (ABS): smooth toward the no-acoustics alignment.
+
+    The reference is what the lattice itself says when the model says
+    nothing, which for RNN-T is "remaining frames : remaining labels". It
+    lives on the same two classes the node's own target does, so it moves
+    the blank/label split without ever nominating a label that is wrong
+    given the node's predictor history.
+    """
+
+    def _uniform_recursion(self, labels, tl, ul, t_len, c):
+        """gamma and node target from the recursion with flat acoustics."""
+        b = labels.shape[0]
+        u1 = labels.shape[1] + 1
+        lp = torch.full((b, t_len, u1, c), math.log(1.0 / c),
+                        dtype=torch.float64)
+        lab = labels.clamp(min=0)
+        gathered = torch.gather(
+            lp[:, :, :u1 - 1, :], 3,
+            lab.view(b, 1, u1 - 1, 1).expand(b, t_len, u1 - 1, 1)).squeeze(3)
+        lpl = torch.cat(
+            [gathered, torch.full((b, t_len, 1), rnnt_shc_loss.NEG_INF,
+                                  dtype=torch.float64)], dim=2)
+        la, lb, lz = rnnt_shc_loss.calculate_rnnt_alpha_beta(
+            lp[..., 0], lpl, tl, ul)
+        qb, ql = rnnt_shc_loss.rnnt_transition_posteriors(
+            la, lb, lp[..., 0], lpl, lz, tl, ul)
+        return rnnt_shc_loss._node_target(qb, ql, lab, c, 0)
+
+    def test_reference_matches_the_flat_acoustic_recursion(self):
+        """The closed form must equal running forward-backward at 1/C.
+
+        This is the whole claim: "remaining frames : remaining labels" IS
+        the alignment posterior under uniform acoustics, not an
+        approximation of it.
+        """
+        logits, labels, tl, ul = _random_case(3, 9, 4, 6, seed=101)
+        b, t_len, u1, c = logits.shape
+        ref_recursion, gamma = self._uniform_recursion(labels, tl, ul, t_len, c)
+        ref_closed = rnnt_shc_loss.uniform_acoustic_node_target(
+            tl, ul, labels, t_len, u1, c, 0, torch.float64)
+        occupied = (gamma > 1e-12).unsqueeze(3).expand_as(ref_closed)
+        torch.testing.assert_close(ref_closed[occupied],
+                                   ref_recursion[occupied],
+                                   atol=1e-10, rtol=1e-8)
+
+    def test_reference_is_a_distribution_on_two_classes(self):
+        """Normalized over classes, and supported on {blank, y_{u+1}} only."""
+        logits, labels, tl, ul = _random_case(3, 9, 4, 6, seed=103)
+        b, t_len, u1, c = logits.shape
+        ref = rnnt_shc_loss.uniform_acoustic_node_target(
+            tl, ul, labels, t_len, u1, c, 0, torch.float32)
+        sums = ref.sum(-1)
+        torch.testing.assert_close(sums, torch.ones_like(sums),
+                                   atol=1e-6, rtol=1e-5)
+        self.assertGreaterEqual(float(ref.min()), 0.0)
+        # Nothing outside {blank} u {y_{u+1}}.
+        allowed = torch.zeros_like(ref)
+        allowed[..., 0] = 1.0
+        lab = labels.clamp(min=0)
+        u_real = lab.shape[1]
+        allowed[:, :, :u_real, :].scatter_(
+            3, lab.view(b, 1, u_real, 1).expand(b, t_len, u_real, 1), 1.0)
+        self.assertEqual(float((ref * (1.0 - allowed)).abs().sum()), 0.0)
+
+    def test_puts_no_mass_on_a_wrong_history_label(self):
+        """The property every earlier wide-support attempt lacked."""
+        logits, labels, tl, ul = _random_case(2, 8, 4, 6, seed=107)
+        b, t_len, u1, c = logits.shape
+        x = logits.float().clone().requires_grad_(True)
+        rnnt_shc_loss.RnntShcLoss.apply(
+            labels, ul, x, tl, 0, 0.3, 0.0, "alignment_biased").sum().backward()
+        base = logits.float().clone().requires_grad_(True)
+        rnnt_shc_loss.RnntShcLoss.apply(
+            labels, ul, base, tl, 0, 0.0, 0.0, "fixed").sum().backward()
+        # The gradient may only move on the two classes the node owns.
+        allowed = torch.zeros_like(x.grad)
+        allowed[..., 0] = 1.0
+        lab = labels.clamp(min=0)
+        u_real = lab.shape[1]
+        allowed[:, :, :u_real, :].scatter_(
+            3, lab.view(b, 1, u_real, 1).expand(b, t_len, u_real, 1), 1.0)
+        moved = (x.grad - base.grad) * (1.0 - allowed)
+        self.assertLess(float(moved.abs().max()), 1e-6)
+
+    def test_terminal_node_reference_is_all_blank(self):
+        """At (T-1, U) both remainders are zero; only the exit blank is legal."""
+        logits, labels, tl, ul = _random_case(3, 9, 4, 6, seed=109)
+        b, t_len, u1, c = logits.shape
+        ref = rnnt_shc_loss.uniform_acoustic_node_target(
+            tl, ul, labels, t_len, u1, c, 0, torch.float32)
+        for i, (t, u) in enumerate(zip(tl.tolist(), ul.tolist())):
+            self.assertAlmostEqual(float(ref[i, t - 1, u, 0]), 1.0, places=6)
+
+    def test_alpha_one_replaces_the_target_entirely(self):
+        """alpha = 1 must leave the reference alone as the target."""
+        logits, labels, tl, ul = _random_case(2, 8, 3, 6, seed=113)
+        b, t_len, u1, c = logits.shape
+        log_probs = torch.log_softmax(logits.float(), dim=-1)
+        lab = labels.clamp(min=0)
+        gathered = torch.gather(
+            log_probs[:, :, :u1 - 1, :], 3,
+            lab.view(b, 1, u1 - 1, 1).expand(b, t_len, u1 - 1, 1)).squeeze(3)
+        lpl = torch.cat(
+            [gathered, torch.full((b, t_len, 1), rnnt_shc_loss.NEG_INF)], dim=2)
+        la, lb, lz = rnnt_shc_loss.calculate_rnnt_alpha_beta(
+            log_probs[..., 0], lpl, tl, ul)
+        qb, ql = rnnt_shc_loss.rnnt_transition_posteriors(
+            la, lb, log_probs[..., 0], lpl, lz, tl, ul)
+        _, gamma = rnnt_shc_loss._node_target(qb, ql, lab, c, 0)
+        ref = rnnt_shc_loss.uniform_acoustic_node_target(
+            tl, ul, labels, t_len, u1, c, 0, torch.float32)
+        x = logits.float().clone().requires_grad_(True)
+        rnnt_shc_loss.RnntShcLoss.apply(
+            labels, ul, x, tl, 0, 1.0, 0.0, "alignment_biased").sum().backward()
+        expected = gamma.unsqueeze(3) * (log_probs.exp() - ref)
+        torch.testing.assert_close(x.grad, expected, atol=1e-5, rtol=1e-4)
+
+    def test_gradient_is_zero_outside_the_valid_rectangle(self):
+        logits, labels, tl, ul = _random_case(3, 9, 4, 6, seed=127)
+        x = logits.float().clone().requires_grad_(True)
+        rnnt_shc_loss.RnntShcLoss.apply(
+            labels, ul, x, tl, 0, 0.3, 0.0, "alignment_biased").sum().backward()
         for i, (t, u) in enumerate(zip(tl.tolist(), ul.tolist())):
             self.assertEqual(float(x.grad[i, t:].abs().sum()), 0.0)
             self.assertEqual(float(x.grad[i, :, u + 1:].abs().sum()), 0.0)

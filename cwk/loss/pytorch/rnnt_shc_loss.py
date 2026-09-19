@@ -574,6 +574,77 @@ def apply_diagonal_active_support_smoothing(
     return target * (1.0 - mass_n) + floor_n
 
 
+def uniform_acoustic_node_target(logits_len: torch.Tensor,
+                                 target_lens: torch.Tensor,
+                                 labels: torch.Tensor,
+                                 t_len: int,
+                                 u1: int,
+                                 num_classes: int,
+                                 blank: int,
+                                 dtype: torch.dtype) -> torch.Tensor:
+    """The node target the lattice would give if the acoustics said nothing.
+
+    With every transition equally likely, all RNN-T paths have the same
+    length T + U and hence the same probability, so the alignment posterior
+    is the ratio of path counts:
+
+        gamma(t,u) = C(t+u, u) C(T-1-t+U-u, U-u) / C(T-1+U, U)
+
+    verified against the recursion to 1e-15. What the smoothing needs is
+    the NODE-CONDITIONAL, and that ratio collapses to something with no
+    binomials left in it:
+
+        u(blank | t,u)   = (T-1-t) / ((T-1-t) + (U-u))
+        u(y_{u+1} | t,u) = (U-u)   / ((T-1-t) + (U-u))
+
+    i.e. "remaining frames : remaining labels". That is the maximum-entropy
+    alignment -- spend the budget evenly -- and it is the reference
+    `alignment_biased` pulls the target toward.
+
+    Note its support is exactly {blank, y_{u+1}}, the same two classes the
+    node's own target has. So unlike every attempt to widen the active set
+    (per-node FAS, per-frame, per-anti-diagonal), this puts ZERO mass on a
+    label that is wrong given the node's predictor history: it re-weights
+    the blank/label split and nothing else. It regularizes WHERE the labels
+    are emitted, not WHICH labels they are.
+
+    At the terminal node the two remainders are both zero; the only legal
+    action there is the exit blank, so the reference is all blank.
+
+    Args:
+        logits_len: (B,) valid frame count per sample.
+        target_lens: (B,) real label count per sample.
+        labels: (B, U) label ids without blanks.
+        t_len: padded T.
+        u1: padded U + 1.
+        num_classes: C.
+        blank: blank class id.
+        dtype: dtype of the returned tensor.
+
+    Returns:
+        (B, T, U+1, C) reference, normalized over classes at every node.
+    """
+    device = logits_len.device
+    b = logits_len.shape[0]
+    t_ar = torch.arange(t_len, device=device).view(1, -1, 1)
+    u_ar = torch.arange(u1, device=device).view(1, 1, -1)
+    rem_f = (logits_len.view(-1, 1, 1) - 1 - t_ar).clamp(min=0).to(dtype)
+    rem_l = (target_lens.view(-1, 1, 1) - u_ar).clamp(min=0).to(dtype)
+    total = rem_f + rem_l
+    # total == 0 only at the terminal node, where the exit blank is the one
+    # legal action.
+    blank_share = torch.where(total > 0, rem_f / total.clamp(min=1e-30),
+                              torch.ones_like(total))
+    ref = torch.zeros((b, t_len, u1, num_classes), device=device, dtype=dtype)
+    ref[..., blank] = blank_share
+    lab = labels.clamp(min=0)
+    u_real = lab.shape[1]
+    lab_idx = lab.view(b, 1, u_real, 1).expand(b, t_len, u_real, 1)
+    ref[:, :, :u_real, :].scatter_add_(
+        3, lab_idx, (1.0 - blank_share[:, :, :u_real]).unsqueeze(3))
+    return ref
+
+
 class RnntShcLoss(torch.autograd.Function):
     """RNN-T loss with the `shc_loss` target-smoothing family applied.
 
@@ -640,7 +711,8 @@ class RnntShcLoss(torch.autograd.Function):
         assert alpha_mode in ("fixed", "active_support",
                               "floored_active_support",
                               "frame_label_support",
-                              "diagonal_active_support", "asap"), alpha_mode
+                              "diagonal_active_support",
+                              "alignment_biased", "asap"), alpha_mode
 
         b, t_len, u1, num_classes = logits.shape
         log_probs = torch.log_softmax(logits.float(), dim=-1)
@@ -667,7 +739,12 @@ class RnntShcLoss(torch.autograd.Function):
                                      blank)
 
         smoothing_enabled = alpha > 0.0
-        if smoothing_enabled and alpha_mode == "diagonal_active_support":
+        if smoothing_enabled and alpha_mode == "alignment_biased":
+            reference = uniform_acoustic_node_target(
+                logits_len, target_lens, lab, t_len, u1, num_classes,
+                blank, target.dtype)
+            target = (1.0 - alpha) * target + alpha * reference
+        elif smoothing_enabled and alpha_mode == "diagonal_active_support":
             target = apply_diagonal_active_support_smoothing(
                 target, gamma, alpha, beta, eps=fas_eps, align=diag_align)
         elif smoothing_enabled and alpha_mode == "frame_label_support":

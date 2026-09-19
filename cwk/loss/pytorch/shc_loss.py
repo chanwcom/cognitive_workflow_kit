@@ -945,6 +945,50 @@ def _compute_gradient(gamma, log_probs, clamped_labels, seq_mask,
         ground_truth_prob, log_probs, seq_mask, valid_sample_mask)
 
 
+def uniform_acoustic_gamma(trans_table, log_target_probs, target_lens,
+                           logits_len, max_logit_len_int=None):
+    """Alignment posterior the lattice would have if the acoustics said nothing.
+
+    Setting every per-frame log-probability to the same constant makes all
+    paths through the lattice equally likely, so the posterior collapses to
+    "what fraction of the valid alignments pass through this cell" -- a
+    purely combinatorial quantity that depends on (T, the label sequence's
+    repeat pattern) and NOT on the model. It is therefore cacheable per
+    utterance, though it is cheap enough to recompute.
+
+    This is the reference distribution `alignment_biased` smooths toward.
+    Textbook label smoothing pulls the target toward a uniform distribution
+    over CLASSES, which ignores the lattice entirely; pulling toward this
+    instead says "do not be more certain about WHERE the labels sit than
+    the alignment evidence warrants", while leaving the label identities
+    alone.
+
+    The constant itself cancels: every path picks up exactly T of them, so
+    they factor out of the per-frame normalization. Zeros are used.
+
+    Args:
+        trans_table: as `calculate_alpha_beta` takes it.
+        log_target_probs: only its shape and dtype are used.
+        target_lens: blank-augmented label lengths.
+        logits_len: valid frame counts.
+        max_logit_len_int: optional, passed through.
+
+    Returns:
+        (B, T, L) posterior in PROBABILITY domain, normalized over the
+        label axis at every valid frame.
+    """
+    flat = torch.zeros_like(log_target_probs)
+    la, lb, _ = calculate_alpha_beta(
+        trans_table, flat, target_lens, logits_len,
+        max_logit_len_int=max_logit_len_int)
+    lg = la + lb
+    mask = seq_loss_util.sequence_mask(
+        target_lens.clamp(min=1), maxlen=lg.shape[2]).unsqueeze(1).bool()
+    lg = lg.masked_fill(~mask, float("-inf")).float()
+    lg = lg - torch.logsumexp(lg, axis=2, keepdim=True)
+    return torch.exp(lg).to(log_target_probs.dtype)
+
+
 class ShcLoss(torch.autograd.Function):
     """A class for calculating the SHC loss."""
 
@@ -1203,10 +1247,17 @@ class ShcLoss(torch.autograd.Function):
                               "entropy_matched_selective",
                               "active_support",
                               "floored_active_support",
+                              "alignment_biased",
                               "asap"), (
             f"alpha_mode must be 'fixed', 'entropy_matched', "
             f"'entropy_matched_selective', 'active_support', "
-            f"'floored_active_support' or 'asap', got {alpha_mode!r}")
+            f"'floored_active_support', 'alignment_biased' or 'asap', got "
+            f"{alpha_mode!r}")
+        assert not (alpha_mode == "alignment_biased"
+                    and smoothing_space != "class"), (
+            "alpha_mode='alignment_biased' requires smoothing_space='class': "
+            "its reference is the uniform-acoustics alignment posterior "
+            "projected onto the output classes.")
         assert not (alpha_mode == "entropy_matched_selective"
                     and smoothing_space != "class"), (
             "alpha_mode='entropy_matched_selective' requires "
@@ -1290,6 +1341,22 @@ class ShcLoss(torch.autograd.Function):
                     shc_loss_util.apply_floored_active_support_smoothing(
                         ground_truth_prob, logits_len, alpha, beta,
                         eps=fas_eps))
+            elif alpha_mode == "alignment_biased":
+                # ABS. The reference is not a uniform distribution over
+                # classes but the alignment posterior the SAME lattice
+                # would give if the acoustics carried no information, so
+                # the smoothing says "do not be more certain about WHERE
+                # the labels sit than the alignment evidence warrants" and
+                # leaves the label identities alone. Scatter is linear, so
+                # projecting the reference to class space and mixing there
+                # equals mixing in label space and projecting.
+                uniform_gamma = uniform_acoustic_gamma(
+                    trans_table, log_target_probs, target_lens, logits_len,
+                    max_logit_len_int=max_logit_len_int)
+                reference = _scatter_to_class_space(
+                    uniform_gamma, log_probs, clamped_labels)
+                ground_truth_prob = ((1.0 - alpha) * ground_truth_prob
+                                     + alpha * reference)
             elif alpha_mode == "asap":
                 # Same formula as FAS; the active set comes from the
                 # acoustic posterior instead of the alignment one.
