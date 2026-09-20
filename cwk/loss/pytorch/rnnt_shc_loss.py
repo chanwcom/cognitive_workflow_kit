@@ -666,7 +666,9 @@ class RnntShcLoss(torch.autograd.Function):
                 alpha_mode="fixed",
                 fas_eps=1e-10,
                 asap_eps=1e-3,
-                diag_align="departure"):
+                diag_align="departure",
+                gate="none",
+                gate_thresh=0.9):
         """Calculates the smoothed RNN-T loss.
 
         Args:
@@ -695,6 +697,45 @@ class RnntShcLoss(torch.autograd.Function):
             diag_align: "departure" or "arrival"; only diagonal_active_support
                 reads it. See
                 `apply_diagonal_active_support_smoothing`.
+            gate: "none", "low", "high", "blank_only" or "label_only".
+                "low"/"high" restrict smoothing to nodes whose UNSMOOTHED
+                target max is at most (`low`) or above (`high`)
+                `gate_thresh`.
+
+                "blank_only"/"label_only" split on WHICH class dominates
+                rather than by how much, and `gate_thresh` is ignored. The
+                motivation is that FAS moves the blank target by
+
+                    d target(blank) = (alpha / K) (1 - 2 z_blank)
+
+                so it RAISES blank exactly at the nodes where a label has to
+                be emitted, and lowers it where blank already dominates. In
+                RNN-T each label is emitted once, so the first half is the
+                deletion mechanism -- measured on 100 h at alpha = 0.05,
+                deletions +18 %, insertions -28 %, substitutions flat.
+                "blank_only" keeps just the second half, which both spares
+                the emission decision and biases the remaining nodes toward
+                emitting. Note this is no longer a symmetric regularizer but
+                a directional one.
+
+                The motivation is that smoothing here has a fixed point far
+                below the one-step perturbation: the target is computed FROM
+                the model, so a flatter model gives a flatter alignment
+                posterior which gives a flatter target, and the loop runs for
+                the whole schedule. Measured on 100 h at alpha = 0.05, the
+                dominant class at a label node falls from 0.963 (baseline) to
+                0.791 and its logit margin from 8.31 to 2.10 -- far past the
+                0.9984 ceiling a fixed target would impose. "low" breaks that
+                loop by exempting nodes the model is already sure about;
+                "high" does the opposite and smooths only those, which is the
+                reading that matches "penalize overconfidence".
+
+                Note "low" is a one-way ratchet: a node that crosses the
+                threshold stops being smoothed and is never pulled back, so
+                it behaves like an alpha schedule that switches off as the
+                model sharpens. On a converged baseline 94.5 % of the node
+                occupancy already sits above 0.9.
+            gate_thresh: the threshold itself.
             asap_eps: activity threshold for asap.
 
         Returns:
@@ -708,6 +749,8 @@ class RnntShcLoss(torch.autograd.Function):
         assert logits.shape[2] == labels.shape[1] + 1, (
             "logits' third axis must be U+1 where U is labels' width; got "
             f"{logits.shape[2]} vs {labels.shape[1]} + 1")
+        assert gate in ("none", "low", "high", "blank_only",
+                        "label_only"), gate
         assert alpha_mode in ("fixed", "active_support",
                               "floored_active_support",
                               "frame_label_support",
@@ -739,6 +782,7 @@ class RnntShcLoss(torch.autograd.Function):
                                      blank)
 
         smoothing_enabled = alpha > 0.0
+        unsmoothed = target if gate != "none" else None
         if smoothing_enabled and alpha_mode == "alignment_biased":
             reference = uniform_acoustic_node_target(
                 logits_len, target_lens, lab, t_len, u1, num_classes,
@@ -778,6 +822,16 @@ class RnntShcLoss(torch.autograd.Function):
                     flat, full_len, alpha, beta)
             target = flat.reshape(b, t_len, u1, num_classes)
 
+        if smoothing_enabled and gate != "none":
+            if gate in ("blank_only", "label_only"):
+                blank_dominant = (unsmoothed[..., blank] > 0.5).unsqueeze(3)
+                keep = ~blank_dominant if gate == "blank_only" else blank_dominant
+            else:
+                mx = unsmoothed.max(dim=3, keepdim=True).values
+                keep = ((mx > gate_thresh) if gate == "low"
+                        else (mx <= gate_thresh))
+            target = torch.where(keep, unsmoothed, target)
+
         # d(-log P)/d logit = gamma * (p - target). gamma is zero outside
         # each sample's (T_b, U_b) rectangle, so no extra mask is needed.
         gradient = gamma.unsqueeze(3) * (log_probs.exp() - target)
@@ -790,20 +844,20 @@ class RnntShcLoss(torch.autograd.Function):
         gradient = gradient * grad.view(-1, 1, 1, 1)
         # One entry per non-ctx argument of `forward`, in order: labels,
         # target_lens, logits, logits_len, blank, alpha, beta, alpha_mode,
-        # fas_eps, asap_eps, diag_align. Only `logits` (position 3) gets a
-        # gradient.
+        # fas_eps, asap_eps, diag_align, gate, gate_thresh. Only `logits`
+        # (position 3) gets a gradient.
         return (None, None, gradient, None, None, None, None, None, None,
-                None, None)
+                None, None, None, None)
 
 
 def rnnt_shc_loss(labels, target_lens, logits, logits_len, blank=0,
                   alpha=0.0, beta=0.0, alpha_mode="fixed",
                   fas_eps=1e-10, asap_eps=1e-3, reduction="mean",
-                  diag_align="departure"):
+                  diag_align="departure", gate="none", gate_thresh=0.9):
     """Thin functional wrapper, mirroring torchaudio.functional.rnnt_loss."""
     loss = RnntShcLoss.apply(labels, target_lens, logits, logits_len, blank,
                              alpha, beta, alpha_mode, fas_eps, asap_eps,
-                             diag_align)
+                             diag_align, gate, gate_thresh)
     if reduction == "none":
         return loss
     if reduction == "sum":

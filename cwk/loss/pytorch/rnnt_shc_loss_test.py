@@ -783,6 +783,51 @@ class AlignmentBiasedTest(unittest.TestCase):
         for i, (t, u) in enumerate(zip(tl.tolist(), ul.tolist())):
             self.assertEqual(float(x.grad[i, t:].abs().sum()), 0.0)
             self.assertEqual(float(x.grad[i, :, u + 1:].abs().sum()), 0.0)
+class ConfidenceGateTest(unittest.TestCase):
+    """`gate`: restrict smoothing by the unsmoothed target's confidence."""
+
+    def _grad(self, logits, labels, tl, ul, **kw):
+        x = logits.float().clone().requires_grad_(True)
+        rnnt_shc_loss.RnntShcLoss.apply(
+            labels, ul, x, tl, 0, kw.get("alpha", 0.3), kw.get("beta", 0.0),
+            kw.get("alpha_mode", "floored_active_support"), 1e-10, 1e-3,
+            "departure", kw.get("gate", "none"),
+            kw.get("gate_thresh", 0.9)).sum().backward()
+        return x.grad
+
+    def test_gate_none_is_unchanged(self):
+        logits, labels, tl, ul = _random_case(2, 8, 3, 6, seed=131)
+        a = self._grad(logits, labels, tl, ul, gate="none")
+        b = self._grad(logits, labels, tl, ul)
+        torch.testing.assert_close(a, b, atol=0, rtol=0)
+
+    def test_threshold_zero_and_one_are_the_endpoints(self):
+        """thresh = 0: 'low' smooths nothing, 'high' smooths everything."""
+        logits, labels, tl, ul = _random_case(2, 8, 3, 6, seed=137)
+        plain = self._grad(logits, labels, tl, ul, alpha=0.0)
+        full = self._grad(logits, labels, tl, ul, alpha=0.3)
+        lo0 = self._grad(logits, labels, tl, ul, gate="low", gate_thresh=0.0)
+        hi0 = self._grad(logits, labels, tl, ul, gate="high", gate_thresh=0.0)
+        torch.testing.assert_close(lo0, plain, atol=1e-6, rtol=1e-5)
+        torch.testing.assert_close(hi0, full, atol=1e-6, rtol=1e-5)
+
+    def test_low_and_high_partition_the_nodes(self):
+        """Every node is smoothed by exactly one of the two gates."""
+        logits, labels, tl, ul = _random_case(2, 8, 3, 6, seed=139)
+        plain = self._grad(logits, labels, tl, ul, alpha=0.0)
+        full = self._grad(logits, labels, tl, ul, alpha=0.3)
+        lo = self._grad(logits, labels, tl, ul, gate="low", gate_thresh=0.9)
+        hi = self._grad(logits, labels, tl, ul, gate="high", gate_thresh=0.9)
+        # (lo - plain) + (hi - plain) == full - plain, node by node.
+        torch.testing.assert_close(lo + hi - plain, full, atol=1e-5, rtol=1e-4)
+
+    def test_gradient_is_zero_outside_the_valid_rectangle(self):
+        logits, labels, tl, ul = _random_case(3, 9, 4, 6, seed=149)
+        for gate in ("low", "high"):
+            g = self._grad(logits, labels, tl, ul, gate=gate)
+            for i, (t, u) in enumerate(zip(tl.tolist(), ul.tolist())):
+                self.assertEqual(float(g[i, t:].abs().sum()), 0.0, gate)
+                self.assertEqual(float(g[i, :, u + 1:].abs().sum()), 0.0, gate)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
