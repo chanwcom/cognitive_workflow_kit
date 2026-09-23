@@ -869,6 +869,67 @@ def calculate_alpha_beta(trans_mask, log_target_probs, target_lens,
 
 
 @torch.compile(dynamic=True)
+
+def apply_alignment_weight_smoothing(gamma, axis_lens, alpha, beta,
+                                     eps=1e-10):
+    """AWS: FAS applied to the alignment posterior over label POSITIONS.
+
+    `gamma[b, t, l] = P(q_t = l | X, theta)` is the probability that frame
+    t sits at blank-augmented label position l, and it sums to one over l
+    for every valid frame. This smooths THAT, at fixed t, and the caller
+    then scatters the result into class space as usual.
+
+    Three things share the label axis and are not the same method:
+
+      - AWS (here): alpha/K on the positions whose gamma exceeds `eps`,
+        beta*alpha/K on the rest, renormalized. The active set is the
+        positions the alignment can actually reach at this frame.
+      - class-space FAS: the same two-rate rule, but applied AFTER the
+        scatter, so its uniform is over active CLASSES. A label occurring
+        twice in the transcript is one class there and two positions here.
+      - L-SETS (`smoothing_space="label"`): SETS post-processing, whose
+        uniform covers every position regardless of activity.
+
+    Unlike RNN-T, where gamma is only a per-node weight and the target is
+    a separate factor, CTC's target IS the scattered gamma -- so here AWS
+    does change what the model is trained toward, not merely how much each
+    alignment position is weighted.
+
+    Args:
+        gamma: (B, T, L) alignment posterior; padded positions are zero.
+        axis_lens: (B,) each sample's own blank-augmented label width. The
+            floor is alpha/K with K taken from HERE, not from the batch's
+            padded width -- otherwise a sample's target depends on how
+            long its batch-mates happen to be (the class-space axis has no
+            padding, which is why that path needs no such argument).
+        alpha: per-position rate on the active set, in units of 1/K.
+        beta: floor height as a fraction of the active rate.
+        eps: a position is active when its gamma EXCEEDS this.
+
+    Returns:
+        (B, T, L) smoothed posterior. Still sums to one over l, and padded
+        positions stay exactly zero.
+    """
+    l_width = gamma.shape[-1]
+    pos = torch.arange(l_width, device=gamma.device).view(1, 1, -1)
+    valid = pos < axis_lens.view(-1, 1, 1)
+    active = (gamma > eps) & valid
+    k = axis_lens.clamp(min=1).view(-1, 1, 1).to(gamma.dtype)
+    rate = alpha / k
+    mixin = rate * (active.to(gamma.dtype)
+                    + beta * (valid & ~active).to(gamma.dtype))
+    # The handed-out mass is taken from the ACTIVE positions only, so at
+    # beta = 0 an inactive position keeps exactly the value the forward
+    # recursion gave it. (shc_loss_util's class-space FAS shrinks active
+    # and inactive alike; the two agree only when the inactive mass is
+    # negligible, which at eps = 1e-10 in class space it is.)
+    added = mixin.sum(dim=-1, keepdim=True)
+    m_active = (gamma * active.to(gamma.dtype)).sum(
+        dim=-1, keepdim=True).clamp(min=1e-12)
+    scale = (1.0 - added / m_active).clamp(min=0.0)
+    smoothed = torch.where(active, gamma * scale + mixin, gamma + mixin)
+    return torch.where(valid, smoothed, gamma)
+
 def _scatter_to_class_space(gamma, log_probs, clamped_labels):
     """Maps the alignment posterior from label-position space to class space.
 
@@ -1005,7 +1066,9 @@ class ShcLoss(torch.autograd.Function):
                 alpha_mode="fixed", entropy_match_alpha_max=1.0,
                 entropy_match_kappa=1.0,
                 fas_eps=1e-10,
-                asap_eps=1e-3):
+                asap_eps=1e-3,
+                peak_thresh=0.9, peak_gate="high",
+                blank_gate="none"):
         """Calculates the Sequential Hypothesis Classifier (SHC) loss.
 
         Args:
@@ -1125,6 +1188,26 @@ class ShcLoss(torch.autograd.Function):
         # In case of HuggingFace, the boundary blanks should be added and non
         # -blank token indices should NOT be updated.
         log_probs = torch.log_softmax(logits, dim=-1)
+        if alpha > 0.0 and alpha_mode == "mos":
+            # MOS -- Model Output Smoothing. Everything downstream (alpha,
+            # beta, gamma, the scattered target and the gradient) is then
+            # computed from the SMOOTHED emission distribution, so this is
+            # not a target-side intervention at all: it makes the acoustic
+            # model look less certain to the forward-backward, which
+            # flattens the alignment posterior as a consequence rather
+            # than by construction.
+            #
+            # The reported loss becomes -log P~(y | X) under the smoothed
+            # emissions, not the true likelihood. That is deliberate, and
+            # it means MOS's loss curve is not comparable with a baseline's.
+            smoothed_p = shc_loss_util.apply_floored_active_support_smoothing(
+                log_probs.exp(), logits_len, alpha, beta, eps=fas_eps)
+            # apply_... zeroes padded frames; restore them so the recursion
+            # sees a valid distribution everywhere (gamma masks them later).
+            t_ar = torch.arange(log_probs.shape[1], device=log_probs.device)
+            pad = (t_ar.unsqueeze(0) >= logits_len.unsqueeze(1)).unsqueeze(-1)
+            smoothed_p = torch.where(pad, log_probs.exp(), smoothed_p)
+            log_probs = smoothed_p.clamp(min=1e-30).log()
         log_target_probs = seq_loss_util.calculate_log_label_prob(
             clamped_labels, log_probs)
 
@@ -1247,12 +1330,19 @@ class ShcLoss(torch.autograd.Function):
                               "entropy_matched_selective",
                               "active_support",
                               "floored_active_support",
-                              "alignment_biased",
+                              "fas_peak_gated",
+                              "aws", "mos", "alignment_biased",
                               "asap"), (
             f"alpha_mode must be 'fixed', 'entropy_matched', "
             f"'entropy_matched_selective', 'active_support', "
-            f"'floored_active_support', 'alignment_biased' or 'asap', got "
+            f"'floored_active_support', 'fas_peak_gated', "
+            f"'alignment_biased' or 'asap', got "
             f"{alpha_mode!r}")
+        assert blank_gate in ("none", "blank_only", "label_only"), blank_gate
+        assert not (blank_gate != "none" and smoothing_space != "class"), (
+            "blank_gate requires smoothing_space='class': it splits frames "
+            "by whether the blank CLASS holds more than half the alignment "
+            "posterior, which only exists on the output class axis.")
         assert not (alpha_mode == "alignment_biased"
                     and smoothing_space != "class"), (
             "alpha_mode='alignment_biased' requires smoothing_space='class': "
@@ -1273,6 +1363,11 @@ class ShcLoss(torch.autograd.Function):
             "smoothing_space='class': both its rates are per-class, and its "
             "relative activity threshold would fire on the padded positions "
             "of the label axis.")
+        assert not (alpha_mode == "fas_peak_gated"
+                    and smoothing_space != "class"), (
+            "alpha_mode='fas_peak_gated' requires smoothing_space='class': "
+            "it gates FAS, which is class-space only, and its peak test "
+            "would read the padded positions of the label axis.")
         assert not (alpha_mode == "asap"
                     and smoothing_space != "class"), (
             "alpha_mode='asap' requires smoothing_space='class': its "
@@ -1283,7 +1378,15 @@ class ShcLoss(torch.autograd.Function):
             f"got {alpha_mode!r}.")
         smoothing_enabled = peak_preserving or peak_capping or alpha > 0.0
 
-        if alpha_mode == "entropy_matched" and smoothing_space == "label":
+        if smoothing_enabled and alpha_mode == "aws":
+            # Smooth the alignment posterior over label positions, then
+            # scatter exactly as the unsmoothed path does.
+            gamma = apply_alignment_weight_smoothing(
+                gamma, target_lens.clamp(min=1), alpha, beta, eps=fas_eps)
+            gradient = _compute_gradient(
+                gamma, log_probs, clamped_labels, seq_mask,
+                valid_sample_mask)
+        elif alpha_mode == "entropy_matched" and smoothing_space == "label":
             # L-SETS-H. The entropy has to be evaluated over classes --
             # that is the only alphabet on which comparing against the
             # acoustic posterior means anything -- but the intervention
@@ -1341,6 +1444,18 @@ class ShcLoss(torch.autograd.Function):
                     shc_loss_util.apply_floored_active_support_smoothing(
                         ground_truth_prob, logits_len, alpha, beta,
                         eps=fas_eps))
+            elif alpha_mode == "fas_peak_gated":
+                # FAS, but only on the frames whose alignment posterior is
+                # already peaked (gate="high") or only on the rest
+                # (gate="low"). The two gates partition the frames, so a
+                # matched pair of runs splits plain FAS's effect into the
+                # part that comes from the confident frames and the part
+                # that comes from the ambiguous ones.
+                ground_truth_prob = (
+                    shc_loss_util.apply_peak_gated_fas_smoothing(
+                        ground_truth_prob, logits_len, alpha, beta,
+                        eps=fas_eps, peak_thresh=peak_thresh,
+                        gate=peak_gate))
             elif alpha_mode == "alignment_biased":
                 # ABS. The reference is not a uniform distribution over
                 # classes but the alignment posterior the SAME lattice
@@ -1372,6 +1487,28 @@ class ShcLoss(torch.autograd.Function):
                     peak_preserving=peak_preserving,
                     gamma=peak_preserving_gamma,
                     peak_capping=peak_capping)
+            if smoothing_enabled and blank_gate != "none":
+                # Split the frames by WHICH class dominates, not by how
+                # much -- which is what separates this from
+                # `fas_peak_gated`. On the 100 h baseline 93.6 % of frames
+                # have a peak above 0.9 but only 43.8 % are blank-dominant,
+                # so the two gates select very different sets.
+                #
+                # The motive comes from RNN-T, where FAS moves blank by
+                # (alpha/K)(1 - 2 y_blank) and so RAISES it exactly at the
+                # frames that have to emit. There the restriction is
+                # degenerate (two classes, nothing to redistribute among),
+                # but a CTC frame's active set is 2.2 classes at the
+                # baseline and 3.4 once smoothing has widened it, so the
+                # blank-dominant frames still have a real redistribution to
+                # perform among the labels the alignment can reach.
+                plain = _scatter_to_class_space(gamma, log_probs,
+                                                clamped_labels)
+                blank_dominant = (plain[..., 0] > 0.5).unsqueeze(-1)
+                keep = (~blank_dominant if blank_gate == "blank_only"
+                        else blank_dominant)
+                ground_truth_prob = torch.where(keep, plain,
+                                                ground_truth_prob)
             gradient = _gradient_from_class_probs(
                 ground_truth_prob, log_probs, seq_mask, valid_sample_mask)
         elif smoothing_space == "hybrid":
@@ -1440,10 +1577,11 @@ class ShcLoss(torch.autograd.Function):
         # labels, target_lens, logits, logits_len, vocab_size, alpha, beta,
         # peak_preserving, peak_preserving_gamma, peak_capping,
         # smoothing_space, alpha_mode, entropy_match_alpha_max,
-        # entropy_match_kappa, fas_eps, asap_eps.
+        # entropy_match_kappa, fas_eps, asap_eps, peak_thresh, peak_gate,
+        # blank_gate.
         # Only `logits` (position 3) receives a gradient. This tuple's
         # length must track `forward`'s arity exactly -- autograd raises
         # "returned an incorrect number of gradients" otherwise, which is
         # what adding fas_threshold_frac without touching this did.
-        return (None, None, gradient, None, None, None, None, None, None,
-               None, None, None, None, None, None, None)
+        return (None, None, gradient,
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None)

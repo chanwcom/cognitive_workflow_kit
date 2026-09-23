@@ -1072,6 +1072,86 @@ def apply_floored_active_support_smoothing(est_probs, logits_len, alpha, beta,
     return y_ls * valid.unsqueeze(-1).to(est_probs.dtype)
 
 
+_LAST_PEAK_GATE_STATS = {}
+
+
+def apply_peak_gated_fas_smoothing(est_probs, logits_len, alpha, beta,
+                                    eps=1e-10, peak_thresh=0.9, gate="high"):
+    """FAS applied to only the frames whose TARGET peak clears a threshold.
+
+    `apply_floored_active_support_smoothing` smooths every frame at the
+    same rate. This gates it on how peaked the alignment posterior already
+    is at that frame:
+
+        gate="high"  smooth only where max_k y[t,k] >= peak_thresh
+        gate="low"   smooth only where max_k y[t,k] <  peak_thresh
+
+    Ungated frames keep their target EXACTLY -- not a reduced rate, no
+    smoothing at all -- so the two gates partition the frames and their
+    smoothed masses add up to what plain FAS would have applied.
+
+    The peak is a property of the alignment, not of the model's output, so
+    the gate is reproducible from the seed and does not create a feedback
+    loop the way a confidence gate would. In CTC the peaked frames are
+    overwhelmingly blank: the posterior concentrates on blank wherever no
+    label is being emitted, so gate="high" is close to "smooth the blank
+    plateaus and leave the emission frames alone", and gate="low" is its
+    complement.
+
+    Statistics are accumulated into _LAST_PEAK_GATE_STATS (gated fraction,
+    mean peak) so a run can report how much of the utterance each gate
+    actually touched -- that fraction moves during training as the
+    alignment sharpens, and a run where it drifts to 0 or 1 has stopped
+    being a gated experiment.
+
+    Note the FAS activity statistics logged by the inner call describe
+    ALL frames, gated or not; only the returned target is gated.
+
+    Args:
+        est_probs: Float tensor (B, T, K), the scattered alignment
+            posterior. Class space only, same as FAS.
+        logits_len: Long tensor (B,). Frames past it are zeroed.
+        alpha: Per-class rate on the active set, in units of 1/K.
+        beta: Floor height as a fraction of the active rate.
+        eps: Activity threshold; a class is active when it EXCEEDS eps.
+        peak_thresh: Float in [0, 1]. The cutoff on max_k y[t,k].
+        gate: "high" or "low", selecting which side of the cutoff is
+            smoothed.
+
+    Returns:
+        Float tensor (B, T, K), same dtype/device. Padded frames zeroed.
+    """
+    if gate not in ("high", "low"):
+        raise ValueError(f"gate must be 'high' or 'low', got {gate!r}")
+
+    smoothed = apply_floored_active_support_smoothing(
+        est_probs, logits_len, alpha, beta, eps=eps)
+
+    peak = est_probs.max(dim=-1).values                          # (B, T)
+    # >= on the high side and < on the low side, so the two gates are
+    # exact complements and a frame is never smoothed twice or skipped by
+    # both when the same threshold is used for a pair of runs.
+    selected = peak >= peak_thresh if gate == "high" else peak < peak_thresh
+
+    b, t, _ = est_probs.shape
+    time_idx = torch.arange(t, device=est_probs.device)
+    valid = time_idx.unsqueeze(0) < logits_len.unsqueeze(1)      # (B, T)
+
+    out = torch.where(selected.unsqueeze(-1), smoothed, est_probs)
+
+    n_valid = valid.sum().to(est_probs.dtype)
+    acc = _LAST_PEAK_GATE_STATS
+    acc["sum_sel"] = (acc.get("sum_sel", 0.0)
+                      + (selected & valid).sum().to(est_probs.dtype).detach())
+    acc["sum_peak"] = (acc.get("sum_peak", 0.0)
+                       + (peak * valid).sum().detach())
+    acc["n_frames"] = acc.get("n_frames", 0.0) + n_valid.detach()
+    acc["peak_thresh"] = peak_thresh
+    acc["gate"] = gate
+
+    return out * valid.unsqueeze(-1).to(est_probs.dtype)
+
+
 def apply_mixed_prior_smoothing(est_probs, prior_probs, logits_len, alpha,
                                  beta):
     """Smooths toward a beta-blend of the class uniform and a given prior.

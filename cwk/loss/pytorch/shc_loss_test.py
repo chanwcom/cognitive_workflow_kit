@@ -582,6 +582,218 @@ class AlignmentBiasedTest(unittest.TestCase):
                     labels, torch.tensor([4]), logits.log_softmax(-1),
                     torch.tensor([20]), 12, 0.4, 0.0, False, 0.0, False,
                     space, "alignment_biased")
+class BackwardAritySmokeTest(unittest.TestCase):
+    """`backward` must return one entry per `forward` argument.
+
+    Autograd only reports this as "returned an incorrect number of
+    gradients" at the first backward pass, so a new keyword silently
+    breaks every run that uses the loss. It has now happened twice --
+    once for fas_threshold_frac, once when peak_thresh/peak_gate and
+    blank_gate were added -- hence this check.
+    """
+
+    def test_arity_matches(self):
+        import inspect
+        n_forward = len(inspect.signature(
+            shc_loss.ShcLoss.forward).parameters) - 1   # drop ctx
+        src = inspect.getsource(shc_loss.ShcLoss.backward)
+        ret = src[src.rindex("return ("):]
+        n_backward = ret.count("None") + ret.count("gradient")
+        self.assertEqual(n_forward, n_backward,
+                         f"forward takes {n_forward} args but backward "
+                         f"returns {n_backward} gradients")
+
+    def test_every_new_keyword_reaches_backward(self):
+        """A real backward pass, which is where the mismatch actually fires."""
+        torch.manual_seed(0)
+        c, t = 12, 40
+        labels = torch.randint(1, c, (2, 5))
+        logits = (torch.randn(2, t, c) * 0.5).requires_grad_(True)
+        shc_loss.ShcLoss.apply(
+            labels, torch.tensor([5, 5]), logits.log_softmax(-1),
+            torch.tensor([t, t]), c, 0.2, 0.0, False, 0.0, False, "class",
+            "floored_active_support", 1.0, 1.0, 1e-10, 1e-5, 0.9, "high",
+            "blank_only").sum().backward()
+        self.assertTrue(bool(torch.isfinite(logits.grad).all()))
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AlignmentWeightSmoothingTest(unittest.TestCase):
+    """AWS smooths gamma(t, l) over label POSITIONS before the scatter."""
+
+    def setUp(self):
+        torch.manual_seed(0)
+        self.labels = torch.tensor([[0, 1, 0, 2, 0, 1, 0],
+                                    [0, 3, 0, 3, 0, 0, 0]])
+        self.target_lens = torch.tensor([7, 5])
+        self.logits_len = torch.tensor([9, 7])
+        self.logits = torch.randn(2, 9, 6) * 3
+
+    def _apply(self, alpha, beta=0.0, eps=1e-10):
+        g = torch.rand(2, 9, 7).abs() + 1e-12
+        pos = torch.arange(7).view(1, 1, -1)
+        g = torch.where(pos < self.target_lens.view(-1, 1, 1), g,
+                        torch.zeros_like(g))
+        g = g / g.sum(-1, keepdim=True)
+        out = shc_loss.apply_alignment_weight_smoothing(
+            g, self.target_lens, alpha, beta, eps=eps)
+        return g, out
+
+    def test_rows_still_sum_to_one(self):
+        _, out = self._apply(0.15)
+        self.assertTrue(torch.allclose(out.sum(-1), torch.ones(2, 9),
+                                       atol=1e-5))
+
+    def test_padded_positions_stay_zero(self):
+        _, out = self._apply(0.15, beta=1.0)
+        pos = torch.arange(7).view(1, 1, -1)
+        pad = pos >= self.target_lens.view(-1, 1, 1)
+        self.assertGreater(int(pad.sum()), 0)
+        self.assertTrue(torch.all(out[pad.expand_as(out)] == 0.0))
+
+    def test_alpha_zero_is_a_no_op(self):
+        g, out = self._apply(0.0)
+        self.assertTrue(torch.allclose(g, out, atol=1e-7))
+
+    def test_inactive_positions_are_exactly_unchanged(self):
+        g = torch.tensor([[[0.90, 0.06, 0.03, 0.008, 0.002, 0.0, 0.0]]])
+        out = shc_loss.apply_alignment_weight_smoothing(
+            g, torch.tensor([5]), 0.2, 0.0, eps=0.01)
+        self.assertTrue(torch.equal(out[0, 0, 3:5], g[0, 0, 3:5]))
+        self.assertAlmostEqual(float(out.sum()), 1.0, places=6)
+
+    def test_it_flattens(self):
+        """The fixed point is 1/K over the sample's OWN width, not the
+        padded width -- a position above it comes down, one below goes up.
+        With eps at its default every valid position is active, so this is
+        the whole rule."""
+        g, out = self._apply(0.3)
+        k = self.target_lens.view(-1, 1, 1).to(g.dtype)
+        pos = torch.arange(g.shape[-1]).view(1, 1, -1)
+        valid = pos < self.target_lens.view(-1, 1, 1)
+        above = valid.expand_as(g) & (g > 1.0 / k)
+        below = valid.expand_as(g) & (g < 1.0 / k)
+        self.assertGreater(int(above.sum()), 0)
+        self.assertGreater(int(below.sum()), 0)
+        self.assertTrue(torch.all(out[above] < g[above]))
+        self.assertTrue(torch.all(out[below] > g[below]))
+
+    def test_K_is_the_samples_own_width_not_the_batch_width(self):
+        """Bug 2 in CLAUDE.md: a sample's target must not depend on how
+        long its batch-mates are."""
+        g = torch.rand(1, 4, 7).abs()
+        pos = torch.arange(7).view(1, 1, -1)
+        g = torch.where(pos < 5, g, torch.zeros_like(g))
+        g = g / g.sum(-1, keepdim=True)
+        alone = shc_loss.apply_alignment_weight_smoothing(
+            g, torch.tensor([5]), 0.2, 0.0)
+        wide = torch.cat([g, torch.zeros(1, 4, 9)], dim=-1)
+        with_mates = shc_loss.apply_alignment_weight_smoothing(
+            wide, torch.tensor([5]), 0.2, 0.0)[..., :7]
+        self.assertTrue(torch.allclose(alone, with_mates, atol=1e-6))
+
+    def test_beta_one_reaches_inactive_positions(self):
+        g = torch.tensor([[[0.7, 0.3, 0.0, 0.0]]])
+        lens = torch.tensor([4])
+        b0 = shc_loss.apply_alignment_weight_smoothing(g, lens, 0.2, 0.0)
+        b1 = shc_loss.apply_alignment_weight_smoothing(g, lens, 0.2, 1.0)
+        self.assertAlmostEqual(float(b0[0, 0, 2]), 0.0, places=6)
+        self.assertGreater(float(b1[0, 0, 2]), 0.0)
+
+    def test_end_to_end_changes_the_gradient(self):
+        def grad(alpha, mode):
+            x = self.logits.clone().requires_grad_(True)
+            loss = shc_loss.ShcLoss.apply(
+                self.labels, self.target_lens, x, self.logits_len, 6,
+                alpha, 0.0, False, 0.0, False, "label", mode, 1.0, 1.0,
+                1e-10, 1e-5, 0.9, "none", "none")
+            loss.sum().backward()
+            return x.grad.clone()
+        g0 = grad(0.0, "fixed")
+        g1 = grad(0.15, "aws")
+        rel = float((g0 - g1).norm() / g0.norm())
+        self.assertGreater(rel, 1e-3)
+        self.assertTrue(torch.isfinite(g1).all())
+
+    def test_differs_from_label_space_sets(self):
+        """AWS is not L-SETS: the mixing distribution covers only the
+        ACTIVE positions, not every position."""
+        def grad(mode, space):
+            x = self.logits.clone().requires_grad_(True)
+            loss = shc_loss.ShcLoss.apply(
+                self.labels, self.target_lens, x, self.logits_len, 6,
+                0.15, 0.0, False, 0.0, False, space, mode, 1.0, 1.0,
+                1e-10, 1e-5, 0.9, "none", "none")
+            loss.sum().backward()
+            return x.grad.clone()
+        aws = grad("aws", "label")
+        lsets = grad("fixed", "label")
+        self.assertGreater(float((aws - lsets).norm() / lsets.norm()), 1e-3)
+
+
+class ModelOutputSmoothingTest(unittest.TestCase):
+    """MOS smooths the emission distribution itself, so alpha, beta, gamma,
+    the target and the gradient are all derived from the smoothed one."""
+
+    def setUp(self):
+        torch.manual_seed(0)
+        self.labels = torch.tensor([[0, 3, 0, 5, 0, 3, 0]])
+        self.target_lens = torch.tensor([7])
+        self.logits_len = torch.tensor([9])
+        self.logits = torch.randn(1, 9, 8) * 3
+
+    def _run(self, alpha, mode, eps=1e-2):
+        x = self.logits.clone().requires_grad_(True)
+        loss = shc_loss.ShcLoss.apply(
+            self.labels, self.target_lens, x, self.logits_len, 8, alpha,
+            0.0, False, 0.0, False, "label", mode, 1.0, 1.0, eps, 1e-5,
+            0.9, "none", "none")
+        loss.sum().backward()
+        return float(loss.sum()), x.grad.clone()
+
+    def test_alpha_zero_is_a_no_op(self):
+        a, ga = self._run(0.0, "fixed")
+        b, gb = self._run(0.0, "mos")
+        self.assertAlmostEqual(a, b, places=5)
+        self.assertTrue(torch.allclose(ga, gb, atol=1e-6))
+
+    def test_it_changes_the_loss_value_unlike_every_other_mode(self):
+        """MOS reports -log P~ under the smoothed emissions, so its loss is
+        NOT the true likelihood and is not comparable with a baseline's."""
+        base, _ = self._run(0.0, "fixed")
+        mos, _ = self._run(0.1, "mos")
+        self.assertNotAlmostEqual(base, mos, places=4)
+
+    def test_smoothing_lowers_the_loss(self):
+        """Flattening the emissions spreads mass onto every alignment, so
+        the summed path probability can only go up."""
+        base, _ = self._run(0.0, "fixed")
+        for a in (0.05, 0.1, 0.2):
+            mos, _ = self._run(a, "mos")
+            self.assertLess(mos, base)
+
+    def test_gradient_is_finite_and_changes(self):
+        _, g0 = self._run(0.0, "fixed")
+        _, g1 = self._run(0.05, "mos")
+        self.assertTrue(torch.isfinite(g1).all())
+        self.assertGreater(float((g0 - g1).norm() / g0.norm()), 1e-3)
+
+    def test_padded_frames_do_not_leak(self):
+        """A short sample in a padded batch must get the same gradient it
+        gets alone -- the smoothing must not let padding into the
+        recursion."""
+        lab = torch.cat([self.labels, self.labels], 0)
+        tl = torch.tensor([7, 7])
+        ll = torch.tensor([9, 5])
+        lg = torch.cat([self.logits, self.logits], 0)
+        x = lg.clone().requires_grad_(True)
+        loss = shc_loss.ShcLoss.apply(
+            lab, tl, x, ll, 8, 0.05, 0.0, False, 0.0, False, "label",
+            "mos", 1.0, 1.0, 1e-2, 1e-5, 0.9, "none", "none")
+        loss.sum().backward()
+        self.assertTrue(torch.isfinite(x.grad).all())
+        # frames past the second sample's length get no gradient
+        self.assertTrue(torch.allclose(x.grad[1, 5:], torch.zeros(4, 8),
+                                       atol=1e-7))

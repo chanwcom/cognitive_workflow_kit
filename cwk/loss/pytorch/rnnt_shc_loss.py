@@ -574,6 +574,427 @@ def apply_diagonal_active_support_smoothing(
     return target * (1.0 - mass_n) + floor_n
 
 
+
+def apply_alignment_weight_smoothing(gamma, logits_len, target_lens,
+                                     alpha, beta, eps=1e-3):
+    """AWS: smooths the alignment WEIGHT along each anti-diagonal.
+
+    Alignment Weight Smoothing. Smooths the node occupancy, not the target.
+
+    Every other smoothing in this file rewrites the per-node target
+    z_hat(t, u, .), which is where RNN-T differs from CTC and where it
+    keeps losing: z_hat has at most two non-zero entries (blank and
+    y_{u+1}), so it is a binary distribution already sitting at a
+    structural ceiling, and perturbing it in either direction -- flatter
+    (`floored_active_support`) or sharper (`sharpen`) -- costs WER
+    monotonically.
+
+    gamma is the other factor. The gradient is
+
+        dL/dz(t, u, c) = gamma(t, u) * ( p(c | t, u) - z_hat(t, u, c) )
+
+    so gamma is a pure per-node WEIGHT and z_hat is the target. Smoothing
+    gamma therefore leaves every node's target exactly as the lattice
+    computed it -- the model is never asked to put mass on a wrong label
+    -- and changes only how much each alignment position is trained on.
+
+    The axis is the anti-diagonal t + u = k, because that is the one whose
+    occupancy is a probability distribution: every transition raises t + u
+    by exactly one, so a path crosses each anti-diagonal exactly once and
+    `sum_{t+u=k} gamma(t, u) = 1` (verified to 4e-6). Columns are not
+    normalized -- `sum_u gamma(t, u)` is the expected number of nodes
+    visited in frame t, which exceeds 1 whenever the model emits more than
+    one label in a frame. This is the RNN-T analogue of CTC's
+    `sum_l gamma(t, l) = 1`, which is what CTC's smoothing_space="label"
+    smooths.
+
+    In a trained model each anti-diagonal is nearly a Viterbi decision --
+    one node holds 97-98 % of the mass with 2-3 above `eps` -- so the
+    smoothing says "do not be this certain about WHERE on this diagonal
+    the path sits".
+
+    Args:
+        gamma: (B, T, U+1) node occupancies, exactly zero outside each
+            sample's own (T_b, U_b+1) rectangle.
+        logits_len: (B,) valid frame count per sample.
+        target_lens: (B,) real label count per sample.
+        alpha: per-node rate, same units as the class-space modes: the
+            floor added to each active node is alpha / K, where K is the
+            number of VALID nodes on that diagonal (the analogue of the
+            vocabulary size in class space). K varies with k, so the floor
+            does too.
+        beta: 0 mixes toward uniform over the active nodes only, 1 toward
+            uniform over every valid node on the diagonal, linear between.
+        eps: a node is active when its occupancy exceeds this.
+
+    Returns:
+        (B, T, U+1) smoothed occupancies. Each diagonal still sums to 1,
+        and nodes outside the rectangle stay exactly zero.
+    """
+    b, t_len, u1 = gamma.shape
+    device = gamma.device
+    n_diag = t_len + u1
+
+    t_idx = torch.arange(t_len, device=device).view(-1, 1)
+    u_idx = torch.arange(u1, device=device).view(1, -1)
+    diag = (t_idx + u_idx).reshape(-1)                      # (T*(U+1),)
+
+    valid = ((t_idx < logits_len.view(-1, 1, 1))
+             & (u_idx <= target_lens.view(-1, 1, 1)))       # (B, T, U+1)
+    active = (gamma > eps) & valid
+
+    def per_diag(x):
+        """Sums x over each anti-diagonal -> (B, T+U)."""
+        out = torch.zeros(b, n_diag, dtype=gamma.dtype, device=device)
+        return out.index_add_(1, diag, x.reshape(b, -1).to(gamma.dtype))
+
+    n_active = per_diag(active).clamp(min=1.0)
+    n_valid = per_diag(valid).clamp(min=1.0)
+
+    take = lambda d: d.index_select(1, diag).reshape(b, t_len, u1)
+    # Exactly `apply_floored_active_support_smoothing`'s two-rate rule,
+    # with the diagonal standing in for the class axis: every active node
+    # gets alpha/K, every inactive valid one gets beta*alpha/K, and the
+    # diagonal is renormalized so it still sums to one. beta = 0 is
+    # active-support only, beta = 1 is uniform over the whole diagonal.
+    rate = alpha / take(n_valid)
+    inactive = valid & ~active
+    mixin = rate * (active.to(gamma.dtype) + beta * inactive.to(gamma.dtype))
+    # The mass handed out has to come from somewhere, and it comes out of
+    # the ACTIVE nodes alone -- scaled by (1 - added/M_A), where M_A is the
+    # active nodes' own share of the diagonal. At beta = 0 an inactive node
+    # is then left exactly as the lattice computed it.
+    #
+    # shc_loss_util's class-space FAS instead writes
+    # `(1 - mass) * y + mixin`, shrinking active and inactive alike. The
+    # two agree whenever the inactive mass is negligible, which in class
+    # space at eps = 1e-10 it is (inactive classes sit below 1e-10). On a
+    # diagonal at eps = 1e-3 it is not, so the distinction is real here.
+    added = take(per_diag(mixin))
+    m_active = take(per_diag(gamma * active.to(gamma.dtype))).clamp(min=1e-12)
+    scale = (1.0 - added / m_active).clamp(min=0.0)
+    smoothed = torch.where(active, gamma * scale + mixin, gamma + mixin)
+    # Outside the rectangle `add` is zero and gamma is exactly zero, so
+    # those nodes stay zero; the where() makes that explicit.
+    return torch.where(valid, smoothed, gamma)
+
+
+
+def apply_alpha_beta_diagonal_smoothing(log_x: torch.Tensor,
+                                        logits_len: torch.Tensor,
+                                        target_lens: torch.Tensor,
+                                        alpha: float,
+                                        beta: float,
+                                        eps: float = 1e-10) -> torch.Tensor:
+    """AWS applied to a LOG-domain lattice half (log_alpha or log_beta).
+
+    `apply_alignment_weight_smoothing` smooths gamma, whose anti-diagonals
+    are probability distributions (`sum_{t+u=k} gamma = 1`, verified to
+    4e-6), so an absolute floor of alpha/K per node is meaningful there.
+    log_alpha and log_beta have no such normalization -- their diagonal
+    sums span many orders of magnitude -- so each diagonal is first
+    rescaled to sum to one, smoothed by exactly the same rule, and then
+    put back on its original scale. That makes the smoothing
+    scale-invariant, which it has to be: alpha and beta are only defined
+    up to the per-diagonal factor that cancels in gamma = alpha*beta/P.
+
+    Smoothing the two halves is not the same intervention twice:
+
+        gamma(t,u)    = alpha(t,u) beta(t,u) / P
+        z_hat(t,u,bl) = p(blank|t,u) beta(t+1,u) / beta(t,u)
+
+    alpha cancels out of z_hat entirely (verified: rescaling alpha per
+    node moves z_hat by 0.0000 while rescaling beta moves it by 0.1108),
+    so smoothing alpha moves only the WEIGHT, and smoothing beta moves the
+    weight and the TARGET together.
+
+    Args:
+        log_x: (B, T, U+1) log_alpha or log_beta, floored at LOG_0 outside
+            each sample's rectangle.
+        logits_len: (B,) valid frame count per sample.
+        target_lens: (B,) real label count per sample.
+        alpha: AWS rate, in units of 1/K with K the diagonal's valid node
+            count -- the same units as `apply_alignment_weight_smoothing`.
+        beta: AWS floor height for inactive nodes.
+        eps: a node is active when its rescaled diagonal share exceeds it.
+
+    Returns:
+        (B, T, U+1) smoothed log-lattice, untouched outside the rectangle.
+    """
+    b, t_len, u1 = log_x.shape
+    device = log_x.device
+    n_diag = t_len + u1
+
+    t_idx = torch.arange(t_len, device=device).view(-1, 1)
+    u_idx = torch.arange(u1, device=device).view(1, -1)
+    diag = (t_idx + u_idx).reshape(-1)
+    valid = ((t_idx < logits_len.view(-1, 1, 1))
+             & (u_idx <= target_lens.view(-1, 1, 1)))
+
+    take = lambda d: d.index_select(1, diag).reshape(b, t_len, u1)
+
+    def per_diag(x):
+        out = torch.zeros(b, n_diag, dtype=log_x.dtype, device=device)
+        return out.index_add_(1, diag, x.reshape(b, -1).to(log_x.dtype))
+
+    # Rescale each diagonal to sum to one, in a max-shifted exponential so
+    # the deep underflow that makes the log domain necessary in the first
+    # place does not reappear here.
+    masked = log_x.masked_fill(~valid, NEG_INF)
+    peak = torch.full((b, n_diag), NEG_INF, dtype=log_x.dtype, device=device)
+    peak = peak.index_reduce_(1, diag, masked.reshape(b, -1), "amax",
+                              include_self=True)
+    live = torch.isfinite(peak)
+    peak = torch.where(live, peak, torch.zeros_like(peak))
+    share = (masked - take(peak)).exp()                 # 0 where invalid
+    total = per_diag(share)
+    share = share / take(total).clamp(min=1e-30)
+
+    share = apply_alignment_weight_smoothing(share, logits_len, target_lens,
+                                             alpha, beta, eps=eps)
+
+    out = (share.clamp(min=1e-30).log() + take(peak)
+           + take(total).clamp(min=1e-30).log())
+    return torch.where(valid & take(live), out, log_x)
+
+
+def apply_diagonal_projected_smoothing(target: torch.Tensor,
+                                       gamma: torch.Tensor,
+                                       labels: torch.Tensor,
+                                       logits_len: torch.Tensor,
+                                       target_lens: torch.Tensor,
+                                       blank: int,
+                                       alpha: float,
+                                       beta: float,
+                                       eps: float = 1e-10,
+                                       share: str = "ratio_label_only") -> torch.Tensor:
+    """DPS: FAS in the anti-diagonal's CLASS space, projected back to nodes.
+
+    Diagonal Projected Smoothing. Per-node FAS keeps failing on RNN-T for
+    a structural reason: z_hat(t, u, .) has at most two non-zero entries
+    (blank and y_{u+1}), so the active set is 2 and there is nothing to
+    redistribute among. This mode moves the smoothing to a space where
+    the active set is genuinely wider, then pushes the result back down.
+
+    The axis is the anti-diagonal t + u = k, because that is the one whose
+    occupancy is a probability distribution: every transition raises t + u
+    by exactly one, so a path crosses each anti-diagonal exactly once and
+    `sum_{t+u=k} gamma(t, u) = 1` (verified to 4e-6). Columns are NOT
+    normalized -- `sum_u gamma(t, u)` is the expected number of nodes
+    visited in frame t, measured 1.00 to 2.69. So k indexes the alignment
+    path's k-th STEP, and the aggregate below is "the distribution of the
+    class emitted at step k" -- the exact RNN-T analogue of CTC's
+    per-frame class posterior.
+
+    Four steps:
+
+    1. Aggregate to the diagonal's class distribution,
+
+           z_k(j) = sum_{t+u=k} gamma(t, u) z_hat(t, u, j),
+
+       which sums to one over j for free, since sum_{t+u=k} gamma = 1 and
+       each node's target is normalized. Blank collects from EVERY node on
+       the diagonal; a label class c collects from the nodes whose
+       y_{u+1} is c, and a transcript that repeats c has several of those.
+
+    2. Run the ordinary class-space FAS on z_k, BLANK INCLUDED. Blank
+       usually dominates z_k, so it decides the active set, the active
+       mass and therefore how much every other class is moved; dropping it
+       would change the size of the smoothing, not just its support.
+
+    3. Project back, REAL TOKENS ONLY. Scale each node's label component
+       by its class's ratio r_k(c) = z_tilde_k(c) / z_k(c); blank is then
+       fixed by 1 - (label), because a node has exactly those two
+       non-zero entries. Multiplying the label component by a per-class
+       ratio is what makes the nodes that can produce c share the change
+       in proportion to gamma, which is the intended rule.
+
+    4. No renormalization step: the construction in 3 already leaves every
+       node summing to one. Blank's diagonal aggregate lands on
+       z_tilde_k(blank) by itself --
+
+           sum_j sum_{D_k} gamma z_hat' = sum_{D_k} gamma = 1
+           sum_{D_k} gamma z_hat'(c)    = z_tilde_k(c)      (real c, by 3)
+           => sum_{D_k} gamma z_hat'(blank) = 1 - sum_c z_tilde_k(c)
+                                            = z_tilde_k(blank)
+
+       since FAS preserves total mass. That identity is why blank needs no
+       projection of its own. It holds up to the clamp in step 3, which
+       fires when r_k(c) > 1 pushes an already near-one label component
+       past one; that residual is accepted.
+
+    Unlike `apply_alignment_weight_smoothing`, gamma itself is untouched,
+    so this does not create AWS's self-referential loop (AWS training
+    raised alignment entropy 3.46x and the active-node count 2.25 -> 5.01,
+    and its RNN-T gain decayed away by the end of training). Only the
+    target moves, which is the structure FAS wins with on CTC.
+
+    Args:
+        target: (B, T, U+1, C) per-node class target, normalized over C.
+        gamma: (B, T, U+1) node occupancies, zero outside the rectangle.
+        labels: (B, U) label ids, no blanks inserted.
+        logits_len: (B,) valid frame count per sample.
+        target_lens: (B,) real label count per sample.
+        blank: blank class id.
+        alpha: FAS rate in class space, in units of 1/C -- the same units
+            as every other class-space mode here, NOT AWS's per-diagonal
+            node units.
+        beta: FAS floor height for classes the diagonal cannot reach.
+        eps: a class is active when z_k exceeds it. MUST be > 0: at
+            eps <= 0 every class is active, including the ones with no
+            contributing node on the diagonal, and their alpha/C has no
+            node to be projected onto -- that mass is simply lost. With
+            eps > 0 an active class always has a contributing node.
+
+    Returns:
+        (B, T, U+1, C) smoothed target, normalized at every valid node and
+        left exactly as passed in outside the rectangle.
+    """
+    assert eps > 0.0, (
+        "diagonal_projected needs a strictly positive eps: at eps <= 0 the "
+        f"classes with no node on the diagonal go active and lose their "
+        f"mass in the projection. Got {eps}")
+    b, t_len, u1, num_classes = target.shape
+    device = target.device
+    dtype = target.dtype
+    n_diag = t_len + u1
+
+    t_idx = torch.arange(t_len, device=device).view(-1, 1)
+    u_idx = torch.arange(u1, device=device).view(1, -1)
+    diag = (t_idx + u_idx).reshape(-1)                        # (T*(U+1),)
+
+    valid = ((t_idx < logits_len.view(-1, 1, 1))
+             & (u_idx <= target_lens.view(-1, 1, 1)))         # (B, T, U+1)
+    # gamma is already exactly zero outside the rectangle; the mask is
+    # belt-and-braces so a caller that hands in a smoothed gamma cannot
+    # leak padding into the aggregate.
+    w = gamma * valid.to(dtype)
+
+    # --- 1. gamma-weighted aggregate over each anti-diagonal.
+    z = torch.zeros(b, n_diag, num_classes, dtype=dtype, device=device)
+    z.index_add_(1, diag, (w.unsqueeze(3) * target).reshape(b, -1,
+                                                           num_classes))
+
+    # --- 2. ordinary class-space FAS, blank included.
+    full = torch.full((b,), n_diag, dtype=torch.long, device=device)
+    z_smoothed = shc_loss_util.apply_floored_active_support_smoothing(
+        z, full, alpha, beta, eps=eps)
+
+    # --- 3. split each class's SMOOTHED MASS over the nodes that can
+    # emit it, in proportion to their occupancy.
+    #
+    #     M(t, l, j) = z_tilde_k(j) * gamma(t, l) / G_k(j),
+    #     G_k(j)     = sum over the diagonal's nodes with y_{l+1} = j
+    #
+    # and the node's CONDITIONAL is that mass divided by its own gamma,
+    # so gamma cancels:
+    #
+    #     z_hat'(t, l, j) = z_tilde_k(j) / G_k(j)
+    #
+    # Every node that can emit j on this diagonal therefore gets the same
+    # value. That is not a loss of the lattice's information in practice:
+    # a diagonal almost always carries a given class at a single label
+    # position, in which case G_k(j) = gamma(t, l) and the expression
+    # reduces to z_hat*(1 - mass) + (alpha/K)/gamma -- the node's own
+    # shape, shifted. Uniformity only bites where the transcript repeats a
+    # class inside one diagonal.
+    #
+    # Note what is NOT done here: dividing by z_k(j) = sum gamma*z_hat.
+    # That denominator carries the emission factor as well, so at a
+    # blank-dominant node (z_hat ~ 1e-9) the ratio explodes and the
+    # projection saturates the target at 1. Measured: WER went the wrong
+    # way from step 1000 to step 2000 at both alpha = 0.05 and 0.10.
+    # Dividing by the pure occupancy sum is bounded by comparison --
+    # z_hat' <= 1 needs roughly G_k(j) >= 1/N_a.
+    # Column u emits labels[:, u]; the last column has no label left. Its
+    # id is set to blank there so the gathers below stay in range -- that
+    # column is excluded by `label_col`.
+    lab = labels.clamp(min=0)
+    lab_full = torch.cat(
+        [lab, torch.full((b, 1), blank, dtype=lab.dtype, device=device)],
+        dim=1)                                                # (B, U+1)
+    lab_node = lab_full.view(b, 1, u1).expand(b, t_len, u1)   # (B, T, U+1)
+    label_col = valid & (u_idx < target_lens.view(-1, 1, 1))
+
+    # G_k(j): occupancy summed over the diagonal's nodes that emit j.
+    # Scattered by (diagonal, class) in one flat index_add_ rather than
+    # materializing a second (B, T, U+1, C) tensor.
+    lin = (diag.view(1, -1) * num_classes
+           + lab_node.reshape(b, -1))                         # (B, T*(U+1))
+    gsum = torch.zeros(b, n_diag * num_classes, dtype=dtype, device=device)
+    gsum.scatter_add_(1, lin, (w * label_col.to(dtype)).reshape(b, -1))
+
+    # Only the INCREMENT is shared out, not the class's whole mass:
+    #
+    #     z_hat'(t, l, j) = z_hat(t, l, j) + delta_k(j) / G_k(j),
+    #     delta_k(j)      = z_tilde_k(j) - z_k(j)
+    #
+    # The mass node (t, l) receives is gamma(t, l) * delta_k(j) / G_k(j),
+    # i.e. proportional to its occupancy, which is the intended rule; and
+    # the aggregate still lands exactly on the smoothed value, since
+    # sum gamma * z_hat' = z_k(j) + delta_k(j) * (sum gamma / G_k) =
+    # z_tilde_k(j).
+    #
+    # Sharing out the class's TOTAL mass instead gives
+    # z_hat' = z_tilde_k(j) / G_k(j), which is the gamma-weighted MEAN of
+    # z_hat over the nodes that emit j -- so at alpha = 0 it replaces each
+    # node's own value by that mean rather than leaving it alone. The
+    # distortion does not scale with alpha and does not vanish with it:
+    # measured 0.0012 in gamma-weighted L1 on a trained 1hr model at
+    # alpha = 0, which is most of the 0.0014 gap to node-level FAS at
+    # alpha = 0.01. Splitting the increment removes it exactly, and is the
+    # only form that is both gamma-proportional and an identity at
+    # alpha = 0.
+    if share == "ratio":
+        # Multiply every class by its own coefficient and renormalize the
+        # node. w_k(j) = z_tilde_k(j) / z_k(j) is the factor by which FAS
+        # moved class j on this diagonal; blank has one too and gets it.
+        # Nothing is clipped, so nothing is thrown away -- the node stays
+        # a distribution by construction.
+        ratio = torch.where(z > eps, z_smoothed / z.clamp(min=eps),
+                            torch.ones_like(z)).reshape(b, -1)
+        w_lab = ratio.gather(1, lin).reshape(b, t_len, u1)
+        w_bl = ratio.gather(
+            1, diag.view(1, -1).expand(b, -1) * num_classes + blank
+        ).reshape(b, t_len, u1)
+        p_lab = torch.gather(target, 3, lab_node.unsqueeze(3)).squeeze(3)
+        p_bl = target[..., blank]
+        a_lab = p_lab * w_lab
+        a_bl = p_bl * w_bl
+        denom = (a_lab + a_bl).clamp(min=1e-30)
+        p_new = torch.where(label_col, a_lab / denom, p_lab)
+        out = torch.zeros_like(target)
+        out[..., blank] = 1.0 - p_new
+        out.scatter_add_(3, lab_node.unsqueeze(3), p_new.unsqueeze(3))
+        return torch.where(valid.unsqueeze(3), out, target)
+
+    if share == "ratio_label_only":
+        # Solve one coefficient w_j per (diagonal, class) and scale every
+        # node that emits j by it:  z_hat' = w_j * z_hat, with w_j fixed
+        # by the aggregate, sum gamma * w_j * z_hat = z_tilde_k(j), i.e.
+        # w_j = z_tilde_k(j) / z_k(j) -- exactly the factor by which FAS
+        # moved the class.
+        w_j = (z_smoothed / z.clamp(min=eps)).reshape(b, -1).gather(1, lin)
+        p_lab = torch.gather(target, 3, lab_node.unsqueeze(3)).squeeze(3)
+        p_new = (p_lab.reshape(b, -1) * w_j).reshape(b, t_len, u1)
+        ok = label_col & (z.reshape(b, -1).gather(1, lin).reshape(
+            b, t_len, u1) > eps)
+    else:
+        delta = (z_smoothed - z).reshape(b, -1).gather(1, lin)
+        gnew = gsum.gather(1, lin)
+        p_lab = torch.gather(target, 3, lab_node.unsqueeze(3)).squeeze(3)
+        p_new = (p_lab.reshape(b, -1) + delta / gnew.clamp(min=eps)
+                 ).reshape(b, t_len, u1)
+        ok = label_col & (gnew.reshape(b, t_len, u1) > eps)
+    p_new = torch.where(ok, p_new.clamp(0.0, 1.0), p_lab)
+
+    # --- 4. rebuild; blank takes whatever the label component left.
+    out = torch.zeros_like(target)
+    out[..., blank] = 1.0 - p_new
+    out.scatter_add_(3, lab_node.unsqueeze(3), p_new.unsqueeze(3))
+    return torch.where(valid.unsqueeze(3), out, target)
+
+
 def uniform_acoustic_node_target(logits_len: torch.Tensor,
                                  target_lens: torch.Tensor,
                                  labels: torch.Tensor,
@@ -668,7 +1089,9 @@ class RnntShcLoss(torch.autograd.Function):
                 asap_eps=1e-3,
                 diag_align="departure",
                 gate="none",
-                gate_thresh=0.9):
+                gate_thresh=0.9,
+                sharpen=0.0,
+                sharpen_thresh=0.9):
         """Calculates the smoothed RNN-T loss.
 
         Args:
@@ -697,6 +1120,20 @@ class RnntShcLoss(torch.autograd.Function):
             diag_align: "departure" or "arrival"; only diagonal_active_support
                 reads it. See
                 `apply_diagonal_active_support_smoothing`.
+            sharpen: target sharpening strength, the opposite of
+                smoothing. At every node whose target already puts more
+                than `sharpen_thresh` on one class, the target is moved
+                that fraction of the way to a one-hot on that class; 1.0
+                snaps it all the way. Because the node target is the
+                alignment posterior, this interpolates the loss from
+                marginalization (Baum-Welch) toward hard alignment
+                (Viterbi), which is the direction smoothing moves away
+                from. It self-limits early in training, when no node's
+                target is concentrated enough to qualify. Applies to
+                blank-dominant and label-dominant nodes alike -- the
+                argmax decides which -- and is independent of `alpha`.
+            sharpen_thresh: the confidence a node must already have
+                before it is sharpened.
             gate: "none", "low", "high", "blank_only" or "label_only".
                 "low"/"high" restrict smoothing to nodes whose UNSMOOTHED
                 target max is at most (`low`) or above (`high`)
@@ -755,10 +1192,31 @@ class RnntShcLoss(torch.autograd.Function):
                               "floored_active_support",
                               "frame_label_support",
                               "diagonal_active_support",
+                              # "diagonal_occupancy" is the old name for
+                              # "aws", kept so a chain launched before the
+                              # rename does not die mid-sweep.
+                              "aws", "diagonal_occupancy", "mos",
+                              "diagonal_projected", "aws_alpha_beta",
                               "alignment_biased", "asap"), alpha_mode
 
         b, t_len, u1, num_classes = logits.shape
         log_probs = torch.log_softmax(logits.float(), dim=-1)
+        if alpha > 0.0 and alpha_mode == "mos":
+            # MOS -- see shc_loss.py. The joint network's output is
+            # smoothed first and alpha/beta/gamma/z_hat are all derived
+            # from the smoothed distribution, so unlike every other mode
+            # here this one does not touch the target directly.
+            bsz, t_n, u_n, c_n = logits.shape
+            flat = log_probs.exp().reshape(bsz, t_n * u_n, c_n)
+            # Validity along the flattened node axis is a (T_b, U_b)
+            # rectangle, not a prefix, so the full width is passed here and
+            # gamma -- exactly zero outside the rectangle -- does the real
+            # masking, exactly as the per-node smoothing modes below do.
+            full = torch.full((bsz,), t_n * u_n, dtype=torch.long,
+                              device=logits.device)
+            flat = shc_loss_util.apply_floored_active_support_smoothing(
+                flat, full, alpha, beta, eps=fas_eps)
+            log_probs = flat.reshape(logits.shape).clamp(min=1e-30).log()
 
         log_p_blank = log_probs[..., blank]
         lab = labels.clamp(min=0)
@@ -775,11 +1233,49 @@ class RnntShcLoss(torch.autograd.Function):
             log_p_blank, log_p_label, logits_len, target_lens)
         loss = -log_seq_prob
 
+        if alpha > 0.0 and alpha_mode == "aws_alpha_beta":
+            # AWS on BOTH lattice halves, before anything is derived from
+            # them. alpha cancels out of z_hat, so smoothing it moves only
+            # the per-node weight; beta enters z_hat, so smoothing it moves
+            # the weight and the target together. The loss is left as the
+            # unsmoothed lattice computed it -- this is a gradient-side
+            # intervention, exactly as plain AWS is.
+            log_alpha = apply_alpha_beta_diagonal_smoothing(
+                log_alpha, logits_len, target_lens, alpha, beta, eps=fas_eps)
+            log_beta = apply_alpha_beta_diagonal_smoothing(
+                log_beta, logits_len, target_lens, alpha, beta, eps=fas_eps)
+
         q_blank, q_label = rnnt_transition_posteriors(
             log_alpha, log_beta, log_p_blank, log_p_label, log_seq_prob,
             logits_len, target_lens)
         target, gamma = _node_target(q_blank, q_label, lab, num_classes,
                                      blank)
+
+        if alpha > 0.0 and alpha_mode == "aws_alpha_beta":
+            # gamma = alpha*beta/P is a probability over each anti-diagonal
+            # -- a path crosses every diagonal exactly once, so the sum is
+            # one (measured 0.9996 to 1.0004 on a real batch). Smoothing
+            # the two halves SEPARATELY does not preserve that: each half
+            # keeps its own diagonal mass, but their product does not. A
+            # node whose share of a diagonal was 1e-30 is lifted to the
+            # floor alpha/K ~ 3e-4, a factor of 1e26, and when that happens
+            # in both halves at once the product runs away -- measured
+            # diagonal sums of 6.8e6 on average and 2.0e8 at worst at
+            # alpha = 0.01, with gamma reaching 3.3e7. Training went to NaN
+            # by step 1250 at both 0.01 and 0.02, WER 1.0.
+            #
+            # Restoring the invariant costs nothing that the mode wants:
+            # z_hat is q_blank/(q_blank+q_label) WITHIN a node, so a
+            # per-diagonal rescale of gamma leaves the target -- the part
+            # beta actually moves -- exactly as it was.
+            t_ar = torch.arange(t_len, device=logits.device).view(-1, 1)
+            u_ar = torch.arange(u1, device=logits.device).view(1, -1)
+            d_ix = (t_ar + u_ar).reshape(-1)
+            d_sum = torch.zeros(b, t_len + u1, dtype=gamma.dtype,
+                                device=logits.device)
+            d_sum.index_add_(1, d_ix, gamma.reshape(b, -1))
+            gamma = gamma / d_sum.clamp(min=1e-30).index_select(
+                1, d_ix).reshape(b, t_len, u1)
 
         smoothing_enabled = alpha > 0.0
         unsmoothed = target if gate != "none" else None
@@ -791,6 +1287,12 @@ class RnntShcLoss(torch.autograd.Function):
         elif smoothing_enabled and alpha_mode == "diagonal_active_support":
             target = apply_diagonal_active_support_smoothing(
                 target, gamma, alpha, beta, eps=fas_eps, align=diag_align)
+        elif smoothing_enabled and alpha_mode == "diagonal_projected":
+            # Needs (t, u) structure, the occupancy and the label ids, so
+            # it does not go through the flattened per-node path below.
+            target = apply_diagonal_projected_smoothing(
+                target, gamma, lab, logits_len, target_lens, blank,
+                alpha, beta, eps=fas_eps)
         elif smoothing_enabled and alpha_mode == "frame_label_support":
             # Needs the (t, u) structure and the occupancy, so it does not
             # go through the flattened per-node path below.
@@ -832,6 +1334,21 @@ class RnntShcLoss(torch.autograd.Function):
                         else (mx <= gate_thresh))
             target = torch.where(keep, unsmoothed, target)
 
+        if sharpen > 0.0:
+            # Nodes outside a sample's (T_b, U_b) rectangle hold an all-zero
+            # target, so their max is 0 and they never qualify; gamma is
+            # zero there in any case.
+            mx, idx = target.max(dim=3, keepdim=True)
+            one_hot = torch.zeros_like(target).scatter_(3, idx, 1.0)
+            hot = (1.0 - sharpen) * target + sharpen * one_hot
+            target = torch.where(mx > sharpen_thresh, hot, target)
+
+        if smoothing_enabled and alpha_mode in ("aws", "diagonal_occupancy"):
+            # The one mode that leaves `target` alone: it reweights nodes
+            # instead of rewriting what they are trained toward.
+            gamma = apply_alignment_weight_smoothing(
+                gamma, logits_len, target_lens, alpha, beta, eps=fas_eps)
+
         # d(-log P)/d logit = gamma * (p - target). gamma is zero outside
         # each sample's (T_b, U_b) rectangle, so no extra mask is needed.
         gradient = gamma.unsqueeze(3) * (log_probs.exp() - target)
@@ -844,20 +1361,22 @@ class RnntShcLoss(torch.autograd.Function):
         gradient = gradient * grad.view(-1, 1, 1, 1)
         # One entry per non-ctx argument of `forward`, in order: labels,
         # target_lens, logits, logits_len, blank, alpha, beta, alpha_mode,
-        # fas_eps, asap_eps, diag_align, gate, gate_thresh. Only `logits`
-        # (position 3) gets a gradient.
+        # fas_eps, asap_eps, diag_align, gate, gate_thresh, sharpen,
+        # sharpen_thresh. Only `logits` (position 3) gets a gradient.
         return (None, None, gradient, None, None, None, None, None, None,
-                None, None, None, None)
+                None, None, None, None, None, None)
 
 
 def rnnt_shc_loss(labels, target_lens, logits, logits_len, blank=0,
                   alpha=0.0, beta=0.0, alpha_mode="fixed",
                   fas_eps=1e-10, asap_eps=1e-3, reduction="mean",
-                  diag_align="departure", gate="none", gate_thresh=0.9):
+                  diag_align="departure", gate="none", gate_thresh=0.9,
+                  sharpen=0.0, sharpen_thresh=0.9):
     """Thin functional wrapper, mirroring torchaudio.functional.rnnt_loss."""
     loss = RnntShcLoss.apply(labels, target_lens, logits, logits_len, blank,
                              alpha, beta, alpha_mode, fas_eps, asap_eps,
-                             diag_align, gate, gate_thresh)
+                             diag_align, gate, gate_thresh, sharpen,
+                             sharpen_thresh)
     if reduction == "none":
         return loss
     if reduction == "sum":

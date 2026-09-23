@@ -27,6 +27,7 @@ import unittest
 import torch
 
 from cwk.loss.pytorch import rnnt_shc_loss
+from cwk.loss.pytorch import shc_loss_util
 
 
 def _brute_force_log_prob(log_probs, labels, blank=0):
@@ -831,3 +832,783 @@ class ConfidenceGateTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TargetSharpeningTest(unittest.TestCase):
+    """`sharpen` is the opposite of smoothing: it moves confident node
+    targets toward a one-hot, taking the loss from marginalization over
+    alignments toward a hard (Viterbi) alignment."""
+
+    def _logits(self, seed=0, scale=6.0):
+        torch.manual_seed(seed)
+        return torch.randn(2, 7, 4, 6) * scale
+
+    def _target(self, logits, **kw):
+        """Re-derives the node target the forward pass builds, so a test
+        can assert on the target rather than only on the loss."""
+        captured = {}
+        real = rnnt_shc_loss._node_target
+
+        def spy(*a, **k):
+            target, gamma = real(*a, **k)
+            captured["gamma"] = gamma
+            return target, gamma
+
+        rnnt_shc_loss._node_target = spy
+        try:
+            x = logits.clone().requires_grad_(True)
+            loss = rnnt_shc_loss.rnnt_shc_loss(
+                self.labels, self.target_lens, x, self.logits_len,
+                reduction="sum", **kw)
+            loss.backward()
+        finally:
+            rnnt_shc_loss._node_target = real
+        # grad = gamma * (p - target)  =>  target = p - grad / gamma
+        gamma = captured["gamma"]
+        probs = torch.log_softmax(logits.float(), dim=-1).exp()
+        safe = gamma.clamp(min=1e-12).unsqueeze(3)
+        return probs - x.grad.float() / safe, gamma
+
+    def setUp(self):
+        self.labels = torch.tensor([[1, 2, 3], [2, 3, 1]])
+        self.target_lens = torch.tensor([3, 3])
+        self.logits_len = torch.tensor([7, 6])
+
+    def test_sharpen_zero_is_a_no_op(self):
+        logits = self._logits()
+        base = rnnt_shc_loss.rnnt_shc_loss(
+            self.labels, self.target_lens, logits, self.logits_len,
+            reduction="none")
+        same = rnnt_shc_loss.rnnt_shc_loss(
+            self.labels, self.target_lens, logits, self.logits_len,
+            sharpen=0.0, sharpen_thresh=0.9, reduction="none")
+        self.assertTrue(torch.equal(base, same))
+
+    def test_loss_value_is_untouched(self):
+        """Sharpening only rewrites the gradient's target; -log P(y|x) is
+        still the true marginal."""
+        logits = self._logits()
+        base = rnnt_shc_loss.rnnt_shc_loss(
+            self.labels, self.target_lens, logits, self.logits_len,
+            reduction="none")
+        sharp = rnnt_shc_loss.rnnt_shc_loss(
+            self.labels, self.target_lens, logits, self.logits_len,
+            sharpen=1.0, reduction="none")
+        self.assertTrue(torch.allclose(base, sharp))
+
+    def test_confident_nodes_become_one_hot(self):
+        logits = self._logits()
+        plain, gamma = self._target(logits)
+        sharp, _ = self._target(logits, sharpen=1.0, sharpen_thresh=0.9)
+        live = gamma > 1e-6
+        qualifies = (plain.max(dim=3).values > 0.9) & live
+        self.assertGreater(int(qualifies.sum()), 0,
+                           "test needs some confident nodes")
+        got = sharp[qualifies]
+        self.assertTrue(torch.allclose(got.max(dim=-1).values,
+                                       torch.ones(got.shape[0]), atol=1e-4))
+        self.assertTrue(torch.allclose(got.sum(dim=-1),
+                                       torch.ones(got.shape[0]), atol=1e-4))
+
+    def test_unconfident_nodes_are_left_alone(self):
+        logits = self._logits(scale=0.3)
+        plain, gamma = self._target(logits)
+        sharp, _ = self._target(logits, sharpen=1.0, sharpen_thresh=0.9)
+        live = gamma > 1e-6
+        below = (plain.max(dim=3).values <= 0.9) & live
+        self.assertGreater(int(below.sum()), 0)
+        self.assertTrue(torch.allclose(plain[below], sharp[below], atol=1e-4))
+
+    def test_sharpen_moves_the_argmax_class_up(self):
+        """Partial sharpening interpolates, so the dominant class' target
+        rises and the other active class' falls."""
+        logits = self._logits()
+        plain, gamma = self._target(logits)
+        half, _ = self._target(logits, sharpen=0.5, sharpen_thresh=0.9)
+        live = (gamma > 1e-6) & (plain.max(dim=3).values > 0.9)
+        self.assertGreater(int(live.sum()), 0)
+        mx_plain = plain.max(dim=3).values[live]
+        mx_half = half.max(dim=3).values[live]
+        self.assertTrue(torch.all(mx_half > mx_plain - 1e-6))
+        self.assertTrue(torch.all(mx_half < 1.0 + 1e-6))
+
+    def test_applies_to_blank_and_label_dominant_nodes_alike(self):
+        logits = self._logits()
+        plain, gamma = self._target(logits)
+        sharp, _ = self._target(logits, sharpen=1.0, sharpen_thresh=0.9)
+        live = (gamma > 1e-6) & (plain.max(dim=3).values > 0.9)
+        argmax = plain.argmax(dim=3)
+        blank_side = live & (argmax == 0)
+        label_side = live & (argmax != 0)
+        self.assertGreater(int(blank_side.sum()), 0)
+        self.assertGreater(int(label_side.sum()), 0)
+        for side in (blank_side, label_side):
+            got = sharp[side]
+            self.assertTrue(torch.allclose(
+                got.max(dim=-1).values, torch.ones(got.shape[0]), atol=1e-4))
+
+    def test_backward_arity(self):
+        logits = self._logits().requires_grad_(True)
+        loss = rnnt_shc_loss.rnnt_shc_loss(
+            self.labels, self.target_lens, logits, self.logits_len,
+            alpha=0.1, alpha_mode="floored_active_support", gate="low",
+            sharpen=1.0, reduction="sum")
+        loss.backward()
+        self.assertTrue(torch.isfinite(logits.grad).all())
+
+    def test_composes_with_smoothing(self):
+        """alpha and sharpen are independent knobs; running both must not
+        raise and must leave the loss value alone."""
+        logits = self._logits()
+        base = rnnt_shc_loss.rnnt_shc_loss(
+            self.labels, self.target_lens, logits, self.logits_len,
+            reduction="none")
+        both = rnnt_shc_loss.rnnt_shc_loss(
+            self.labels, self.target_lens, logits, self.logits_len,
+            alpha=0.05, alpha_mode="floored_active_support", sharpen=1.0,
+            reduction="none")
+        self.assertTrue(torch.allclose(base, both))
+
+
+class DiagonalOccupancyTest(unittest.TestCase):
+    """`diagonal_occupancy` is the one mode that leaves the per-node target
+    alone and reweights the nodes instead."""
+
+    def setUp(self):
+        self.labels = torch.tensor([[1, 2, 3], [2, 3, 1]])
+        self.target_lens = torch.tensor([3, 2])
+        self.logits_len = torch.tensor([7, 5])
+        torch.manual_seed(0)
+        self.logits = torch.randn(2, 7, 4, 6) * 4
+
+    def _pieces(self, **kw):
+        """Returns (target, gamma) as the forward pass uses them, with the
+        smoothing applied to gamma."""
+        captured = {}
+        real = rnnt_shc_loss.apply_alignment_weight_smoothing
+
+        def spy(gamma, *a, **k):
+            out = real(gamma, *a, **k)
+            captured["before"] = gamma.clone()
+            captured["after"] = out.clone()
+            return out
+
+        rnnt_shc_loss.apply_alignment_weight_smoothing = spy
+        try:
+            x = self.logits.clone().requires_grad_(True)
+            loss = rnnt_shc_loss.rnnt_shc_loss(
+                self.labels, self.target_lens, x, self.logits_len,
+                alpha_mode="aws", reduction="sum",
+                fas_eps=kw.pop("fas_eps", 1e-3), **kw)
+            loss.backward()
+        finally:
+            rnnt_shc_loss.apply_alignment_weight_smoothing = real
+        return captured, x.grad
+
+    def _diag_sums(self, gamma):
+        b, t_len, u1 = gamma.shape
+        d = (torch.arange(t_len).view(-1, 1)
+             + torch.arange(u1).view(1, -1)).reshape(-1)
+        out = torch.zeros(b, t_len + u1)
+        return out.index_add_(1, d, gamma.reshape(b, -1))
+
+    def test_alpha_zero_is_a_no_op(self):
+        base = rnnt_shc_loss.rnnt_shc_loss(
+            self.labels, self.target_lens, self.logits, self.logits_len,
+            reduction="none")
+        same = rnnt_shc_loss.rnnt_shc_loss(
+            self.labels, self.target_lens, self.logits, self.logits_len,
+            alpha=0.0, alpha_mode="aws", reduction="none")
+        self.assertTrue(torch.equal(base, same))
+
+    def test_loss_value_is_untouched(self):
+        base = rnnt_shc_loss.rnnt_shc_loss(
+            self.labels, self.target_lens, self.logits, self.logits_len,
+            reduction="none")
+        sm = rnnt_shc_loss.rnnt_shc_loss(
+            self.labels, self.target_lens, self.logits, self.logits_len,
+            alpha=0.1, alpha_mode="aws", reduction="none")
+        self.assertTrue(torch.allclose(base, sm))
+
+    def test_diagonal_sums_stay_one(self):
+        cap, _ = self._pieces(alpha=0.15)
+        for name in ("before", "after"):
+            sums = self._diag_sums(cap[name])
+            live = sums > 1e-6
+            self.assertTrue(
+                torch.allclose(sums[live], torch.ones(int(live.sum())),
+                               atol=1e-4),
+                f"{name}: {sums}")
+
+    def test_nodes_outside_the_rectangle_stay_zero(self):
+        cap, _ = self._pieces(alpha=0.15, beta=1.0)
+        after = cap["after"]
+        t = torch.arange(7).view(1, -1, 1)
+        u = torch.arange(4).view(1, 1, -1)
+        outside = ~((t < self.logits_len.view(-1, 1, 1))
+                    & (u <= self.target_lens.view(-1, 1, 1)))
+        self.assertGreater(int(outside.sum()), 0)
+        self.assertTrue(torch.all(after[outside] == 0.0))
+
+    def test_it_flattens_the_dominant_node(self):
+        """Only where the diagonal has a rival. A lone active node absorbs
+        the whole mixing mass -- uniform over a one-element set is that
+        element -- so it goes UP, which is the same behavior FAS has in
+        class space and not a bug."""
+        cap, _ = self._pieces(alpha=0.15, beta=0.0)
+        before, after = cap["before"], cap["after"]
+        b, t_len, u1 = before.shape
+        d = (torch.arange(t_len).view(-1, 1)
+             + torch.arange(u1).view(1, -1))
+        n_act = torch.zeros(b, t_len + u1).index_add_(
+            1, d.reshape(-1), (before > 1e-3).reshape(b, -1).float())
+        contested = n_act.index_select(1, d.reshape(-1)).reshape(
+            b, t_len, u1) >= 2
+        big = (before > 0.5) & contested
+        self.assertGreater(int(big.sum()), 0)
+        self.assertTrue(torch.all(after[big] < before[big]))
+        small = (before > 1e-3) & (before < 0.1) & contested
+        self.assertGreater(int(small.sum()), 0)
+        self.assertTrue(torch.all(after[small] > before[small]))
+
+    def test_the_target_is_not_touched(self):
+        """The whole point: z_hat must be bit-identical to the unsmoothed
+        run, so no node is ever trained toward a wrong label."""
+        def node_target(alpha, mode):
+            grabbed = {}
+            real = rnnt_shc_loss._node_target
+
+            def spy(*a, **k):
+                target, gamma = real(*a, **k)
+                grabbed["t"] = target.clone()
+                return target, gamma
+
+            rnnt_shc_loss._node_target = spy
+            try:
+                rnnt_shc_loss.rnnt_shc_loss(
+                    self.labels, self.target_lens, self.logits,
+                    self.logits_len, alpha=alpha, alpha_mode=mode,
+                    reduction="sum")
+            finally:
+                rnnt_shc_loss._node_target = real
+            return grabbed["t"]
+
+        plain = node_target(0.0, "fixed")
+        occ = node_target(0.15, "diagonal_occupancy")
+        self.assertTrue(torch.equal(plain, occ))
+
+    def test_the_gradient_does_change(self):
+        """Leaving z_hat alone is not the same as doing nothing."""
+        x0 = self.logits.clone().requires_grad_(True)
+        rnnt_shc_loss.rnnt_shc_loss(
+            self.labels, self.target_lens, x0, self.logits_len,
+            reduction="sum").backward()
+        x1 = self.logits.clone().requires_grad_(True)
+        rnnt_shc_loss.rnnt_shc_loss(
+            self.labels, self.target_lens, x1, self.logits_len,
+            alpha=0.15, alpha_mode="aws",
+            reduction="sum").backward()
+        rel = (x0.grad - x1.grad).norm() / x0.grad.norm()
+        self.assertGreater(float(rel), 1e-3)
+
+    def test_beta_one_lifts_the_inactive_nodes(self):
+        """Every node inside the rectangle is reachable, so gamma there is
+        never exactly zero; what beta controls is whether the nodes BELOW
+        eps get any of the mixing mass."""
+        b0, _ = self._pieces(alpha=0.15, beta=0.0)
+        b1, _ = self._pieces(alpha=0.15, beta=1.0)
+        before = b0["before"]
+        t = torch.arange(7).view(1, -1, 1)
+        u = torch.arange(4).view(1, 1, -1)
+        valid = ((t < self.logits_len.view(-1, 1, 1))
+                 & (u <= self.target_lens.view(-1, 1, 1)))
+        inactive = valid & (before <= 1e-3)
+        self.assertGreater(int(inactive.sum()), 0)
+        self.assertTrue(torch.all(b1["after"][inactive]
+                                  > b0["after"][inactive]))
+
+    def test_beta_zero_leaves_the_inactive_nodes_exactly_alone(self):
+        """The mass handed to the active nodes is taken from the active
+        nodes, so a node below eps keeps the value the lattice gave it."""
+        cap, _ = self._pieces(alpha=0.15, beta=0.0)
+        before, after = cap["before"], cap["after"]
+        inactive = (before > 0) & (before <= 1e-3)
+        self.assertGreater(int(inactive.sum()), 0)
+        self.assertTrue(torch.equal(after[inactive], before[inactive]))
+
+    def test_backward_arity(self):
+        x = self.logits.clone().requires_grad_(True)
+        rnnt_shc_loss.rnnt_shc_loss(
+            self.labels, self.target_lens, x, self.logits_len, alpha=0.1,
+            alpha_mode="aws", reduction="sum").backward()
+        self.assertTrue(torch.isfinite(x.grad).all())
+
+
+class RnntModelOutputSmoothingTest(unittest.TestCase):
+    """MOS on the joint network's output; alpha/beta/gamma/z_hat all follow."""
+
+    def setUp(self):
+        self.labels = torch.tensor([[1, 2, 3], [2, 3, 1]])
+        self.target_lens = torch.tensor([3, 2])
+        self.logits_len = torch.tensor([7, 5])
+        torch.manual_seed(0)
+        self.logits = torch.randn(2, 7, 4, 6) * 3
+
+    def _run(self, alpha, mode, eps=1e-2):
+        x = self.logits.clone().requires_grad_(True)
+        loss = rnnt_shc_loss.rnnt_shc_loss(
+            self.labels, self.target_lens, x, self.logits_len, alpha=alpha,
+            alpha_mode=mode, fas_eps=eps, reduction="sum")
+        loss.backward()
+        return float(loss), x.grad.clone()
+
+    def test_alpha_zero_is_a_no_op(self):
+        a, ga = self._run(0.0, "fixed")
+        b, gb = self._run(0.0, "mos")
+        self.assertAlmostEqual(a, b, places=5)
+        self.assertTrue(torch.allclose(ga, gb, atol=1e-6))
+
+    def test_smoothing_lowers_the_loss(self):
+        base, _ = self._run(0.0, "fixed")
+        for a in (0.05, 0.1, 0.2):
+            mos, _ = self._run(a, "mos")
+            self.assertLess(mos, base)
+
+    def test_gradient_is_finite_and_changes(self):
+        _, g0 = self._run(0.0, "fixed")
+        _, g1 = self._run(0.05, "mos")
+        self.assertTrue(torch.isfinite(g1).all())
+        self.assertGreater(float((g0 - g1).norm() / g0.norm()), 1e-3)
+
+    def test_nodes_outside_the_rectangle_get_no_gradient(self):
+        _, g = self._run(0.05, "mos")
+        self.assertTrue(torch.allclose(g[1, 5:], torch.zeros(2, 4, 6),
+                                       atol=1e-7))
+
+
+class DiagonalProjectedTest(unittest.TestCase):
+    """`diagonal_projected`: FAS in the anti-diagonal's class space.
+
+    A node's target has at most two non-zero entries, so per-node FAS has
+    an active set of 2 and nothing to redistribute. Aggregating along the
+    anti-diagonal t + u = k with gamma as the weight gives a genuine class
+    distribution -- the distribution of the class emitted at the path's
+    k-th step -- FAS runs there, and the result is projected back onto the
+    nodes through the label component alone.
+    """
+
+    def _fb(self, logits, labels, tl, ul):
+        log_probs = torch.log_softmax(logits.float(), dim=-1)
+        b, t_len, u1, c = logits.shape
+        log_p_blank = log_probs[..., 0]
+        lab = labels.clamp(min=0)
+        gathered = torch.gather(
+            log_probs[:, :, :u1 - 1, :], 3,
+            lab.view(b, 1, u1 - 1, 1).expand(b, t_len, u1 - 1, 1)).squeeze(3)
+        log_p_label = torch.cat(
+            [gathered, torch.full((b, t_len, 1), rnnt_shc_loss.NEG_INF)],
+            dim=2)
+        la, lb, lz = rnnt_shc_loss.calculate_rnnt_alpha_beta(
+            log_p_blank, log_p_label, tl, ul)
+        qb, ql = rnnt_shc_loss.rnnt_transition_posteriors(
+            la, lb, log_p_blank, log_p_label, lz, tl, ul)
+        target, gamma = rnnt_shc_loss._node_target(qb, ql, lab, c, 0)
+        return target, gamma, lab
+
+    def _smooth(self, logits, labels, tl, ul, alpha, beta=0.0, eps=1e-10):
+        target, gamma, lab = self._fb(logits, labels, tl, ul)
+        out = rnnt_shc_loss.apply_diagonal_projected_smoothing(
+            target, gamma, lab, tl, ul, 0, alpha, beta, eps=eps)
+        return target, gamma, lab, out
+
+    def _diag_aggregate(self, gamma, target, tl, ul):
+        """z_k(j) = sum_{t+u=k} gamma(t,u) target(t,u,j), per sample."""
+        b, t_len, u1, c = target.shape
+        out = []
+        for i, (t, u) in enumerate(zip(tl.tolist(), ul.tolist())):
+            z = {}
+            for tt in range(t):
+                for uu in range(u + 1):
+                    z.setdefault(tt + uu, torch.zeros(c, dtype=target.dtype))
+                    z[tt + uu] = z[tt + uu] + gamma[i, tt, uu] * target[i, tt, uu]
+            out.append(z)
+        return out
+
+    def test_eps_must_be_positive(self):
+        """eps <= 0 activates classes with no node to project back onto."""
+        logits, labels, tl, ul = _random_case(2, 8, 3, 6, seed=101)
+        target, gamma, lab = self._fb(logits, labels, tl, ul)
+        for bad in (0.0, -1e-10, -10.0):
+            with self.assertRaises(AssertionError):
+                rnnt_shc_loss.apply_diagonal_projected_smoothing(
+                    target, gamma, lab, tl, ul, 0, 0.05, 0.0, eps=bad)
+
+    def test_alpha_zero_is_the_identity(self):
+        """At alpha = 0 the projection returns what it was given.
+
+        It is an identity only where a diagonal carries each class at a
+        single label position, which is the real case: with C = 32 and a
+        normal transcript the active nodes on a diagonal hold distinct
+        classes. Not bit-identical because blank is rebuilt as
+        1 - (label) rather than copied. `forward` skips the call entirely
+        at alpha = 0 -- see the end-to-end test, which IS bit-identical.
+        """
+        logits, labels, tl, ul = _random_case(2, 12, 6, 32, seed=211)
+        target, _, _, out = self._smooth(logits, labels, tl, ul, 0.0)
+        self.assertTrue(torch.allclose(out, target, atol=1e-7),
+                        msg=f"max |d| = {float((out - target).abs().max())}")
+
+    def test_a_repeated_class_on_one_diagonal_is_left_alone(self):
+        """alpha = 0 is an identity even where a class repeats.
+
+        This is what splitting the INCREMENT buys. Sharing out a class's
+        whole mass in proportion to gamma gives z_tilde_k(j) / G_k(j),
+        which is the gamma-weighted MEAN of z_hat over the nodes emitting
+        j -- so at alpha = 0 it replaces each node's value with that mean
+        instead of leaving it alone, and the distortion neither scales
+        with alpha nor vanishes at zero (measured 0.0012 in gamma-weighted
+        L1 on a trained 1hr model). C = 6 with U = 3 forces repeats onto
+        most diagonals, so that form failed this test by a wide margin.
+        """
+        logits, labels, tl, ul = _random_case(2, 8, 3, 6, seed=103)
+        target, _, _, out = self._smooth(logits, labels, tl, ul, 0.0)
+        self.assertTrue(torch.allclose(out, target, atol=1e-7),
+                        msg=f"max |d| = {float((out - target).abs().max())}")
+
+    def test_every_node_gets_the_same_label_multiplier(self):
+        """The share rule: one coefficient per (diagonal, class),
+
+            p_hat_l = min(alpha_hat_j / alpha_j * p_l, 1),
+
+        applied to the node's real-token probability. So p_hat_l / p_l is
+        the SAME for every node on the diagonal emitting j, except where
+        the cap at one bites. Blank is not scaled -- it is taken as
+        1 - p_hat_l, which is what makes the cap necessary.
+        """
+        logits, labels, tl, ul = _random_case(1, 8, 3, 6, seed=103)
+        labels[0] = torch.tensor([2, 4, 2])      # class 2 at l = 0 and 2
+        target, gamma, lab, out = self._smooth(logits, labels, tl, ul, 0.05)
+        t_len, u1 = gamma.shape[1], gamma.shape[2]
+        seen = 0
+        for k in range(t_len + u1 - 1):
+            rows = [(t, k - t) for t in range(t_len)
+                    if 0 <= k - t < 3 and int(lab[0, k - t]) == 2]
+            if len(rows) < 2:
+                continue
+            vals = [(float(target[0, t, u, 2]), float(out[0, t, u, 2]))
+                    for (t, u) in rows]
+            if any(o >= 1.0 - 1e-9 or p <= 1e-12 for p, o in vals):
+                continue                       # capped, or nothing to scale
+            mult = [o / p for p, o in vals]
+            seen += 1
+            self.assertAlmostEqual(mult[0], mult[1], places=5,
+                                   msg=f"diagonal {k}: {mult}")
+        self.assertGreater(seen, 0)
+
+    def test_nothing_is_clipped(self):
+        """Scaling both entries and renormalizing cannot leave the
+        simplex, so no mass is ever thrown away -- unlike a rule that
+        writes the label component directly and clips it at one, which on
+        a trained 1hr model lost 31 % of the intended class-space change
+        at every alpha from 0.005 to 0.10.
+        """
+        logits, labels, tl, ul = _random_case(3, 9, 4, 8, seed=149)
+        _, _, _, out = self._smooth(logits, labels, tl, ul, 0.20)
+        self.assertGreaterEqual(float(out.min()), 0.0)
+        self.assertLessEqual(float(out.max()), 1.0 + 1e-9)
+
+    def test_diagonal_class_distribution_sums_to_one(self):
+        """sum_j z_k(j) = 1, for free, from sum_{t+u=k} gamma = 1."""
+        logits, labels, tl, ul = _random_case(3, 9, 4, 6, seed=107)
+        target, gamma, _ = self._fb(logits, labels, tl, ul)
+        for z in self._diag_aggregate(gamma, target, tl, ul):
+            for k, v in z.items():
+                self.assertAlmostEqual(float(v.sum()), 1.0, places=5,
+                                       msg=f"diagonal {k}")
+
+    def test_every_node_stays_normalized(self):
+        logits, labels, tl, ul = _random_case(3, 9, 4, 6, seed=109)
+        _, _, _, out = self._smooth(logits, labels, tl, ul, 0.10)
+        for i, (t, u) in enumerate(zip(tl.tolist(), ul.tolist())):
+            s = out[i, :t, :u + 1].sum(dim=-1)
+            self.assertTrue(torch.allclose(s, torch.ones_like(s), atol=1e-6),
+                            msg=f"sample {i}: {s}")
+
+    def test_target_stays_a_probability(self):
+        logits, labels, tl, ul = _random_case(3, 9, 4, 6, seed=113)
+        _, _, _, out = self._smooth(logits, labels, tl, ul, 0.20)
+        self.assertGreaterEqual(float(out.min()), 0.0)
+        self.assertLessEqual(float(out.max()), 1.0 + 1e-9)
+
+    def test_reaggregation_moves_toward_the_smoothed_distribution(self):
+        """Renormalizing costs exactness: sum gamma * z_hat' no longer
+        lands on z_tilde_k. It moves the right way, though -- every class
+        FAS raised comes back higher and every class it lowered comes back
+        lower. Measured on a trained 1hr model, the aggregate covers about
+        half the intended change (0.50 at alpha = 0.01 and 0.05), against
+        0.69 for a rule that writes the component directly and clips. The
+        difference is that here the remainder stays inside the node
+        instead of being discarded.
+        """
+        logits, labels, tl, ul = _random_case(3, 9, 4, 6, seed=127)
+        target, gamma, lab, out = self._smooth(logits, labels, tl, ul, 0.05)
+        b, t_len, u1, c = target.shape
+        before = self._diag_aggregate(gamma, target, tl, ul)
+        after = self._diag_aggregate(gamma, out, tl, ul)
+        agree = 0
+        total = 0
+        for i in range(b):
+            for k, z in before[i].items():
+                expected = shc_loss_util.apply_floored_active_support_smoothing(
+                    z.view(1, 1, c), torch.ones(1, dtype=torch.long),
+                    0.05, 0.0, eps=1e-10).view(c)
+                for j in range(c):
+                    want = float(expected[j] - z[j])
+                    got = float(after[i][k][j] - z[j])
+                    if abs(want) < 1e-6:
+                        continue
+                    total += 1
+                    if want * got > 0:
+                        agree += 1
+        self.assertGreater(total, 50)
+        # Measured 0.85 here and 0.86 at C = 32; the minority that move
+        # the wrong way are nodes whose renormalizer is dominated by the
+        # other entry's coefficient.
+        self.assertGreater(agree / total, 0.8,
+                           msg=f"{agree}/{total} moved the right way")
+
+    def test_blank_is_never_scaled_directly(self):
+        """Blank's new value is 1 - (label), not blank * r_k(blank).
+
+        Scaling blank by its own ratio as well would double-count: the
+        node would no longer sum to one and would need a renormalization
+        that undoes part of the smoothing.
+        """
+        logits, labels, tl, ul = _random_case(2, 8, 3, 6, seed=131)
+        target, _, lab, out = self._smooth(logits, labels, tl, ul, 0.10)
+        b, t_len, u1, c = target.shape
+        for i, (t, u) in enumerate(zip(tl.tolist(), ul.tolist())):
+            for tt in range(t):
+                for uu in range(u):
+                    j = int(lab[i, uu])
+                    self.assertAlmostEqual(
+                        float(out[i, tt, uu, 0]),
+                        1.0 - float(out[i, tt, uu, j]), places=6)
+
+    def test_last_column_keeps_an_all_blank_target(self):
+        """u = U_b has no label left, so nothing is projected onto it."""
+        logits, labels, tl, ul = _random_case(3, 9, 4, 6, seed=137)
+        _, _, _, out = self._smooth(logits, labels, tl, ul, 0.15)
+        for i, (t, u) in enumerate(zip(tl.tolist(), ul.tolist())):
+            col = out[i, :t, u]
+            self.assertTrue(torch.allclose(col[:, 0], torch.ones(t,
+                                                                dtype=col.dtype),
+                                           atol=1e-9), msg=f"{col}")
+
+    def test_outside_the_rectangle_is_untouched(self):
+        logits, labels, tl, ul = _random_case(3, 10, 5, 6, seed=139,
+                                              ragged=True)
+        target, _, _, out = self._smooth(logits, labels, tl, ul, 0.10)
+        for i, (t, u) in enumerate(zip(tl.tolist(), ul.tolist())):
+            self.assertTrue(torch.equal(out[i, t:], target[i, t:]))
+            self.assertTrue(torch.equal(out[i, :, u + 1:],
+                                        target[i, :, u + 1:]))
+
+    def test_a_larger_eps_shrinks_the_active_set(self):
+        """eps weakens the smoothing by narrowing the active classes."""
+        logits, labels, tl, ul = _random_case(3, 9, 4, 8, seed=149)
+        target, gamma, _ = self._fb(logits, labels, tl, ul)
+        counts = []
+        for eps in (1e-10, 1e-3, 1e-1):
+            n = 0
+            for z in self._diag_aggregate(gamma, target, tl, ul):
+                for v in z.values():
+                    n += int((v > eps).sum())
+            counts.append(n)
+        self.assertGreater(counts[0], counts[1])
+        self.assertGreater(counts[1], counts[2])
+
+    def test_it_raises_the_diagonal_class_entropy(self):
+        """The point of the mode: a flatter per-step class distribution."""
+        logits, labels, tl, ul = _random_case(3, 9, 4, 8, seed=151)
+        target, gamma, _, out = self._smooth(logits, labels, tl, ul, 0.20)
+
+        def ent(tgt):
+            tot = 0.0
+            for z in self._diag_aggregate(gamma, tgt, tl, ul):
+                for v in z.values():
+                    p = v.clamp(min=1e-30)
+                    tot += float(-(p * p.log()).sum())
+            return tot
+
+        self.assertGreater(ent(out), ent(target))
+
+    def test_end_to_end_gradient_is_finite_and_differs(self):
+        logits, labels, tl, ul = _random_case(2, 8, 3, 6, seed=157)
+        grads = []
+        for alpha in (0.0, 0.10):
+            x = logits.clone().requires_grad_(True)
+            loss = rnnt_shc_loss.rnnt_shc_loss(
+                labels, ul, x, tl, blank=0, alpha=alpha,
+                alpha_mode="diagonal_projected", fas_eps=1e-10)
+            loss.sum().backward()
+            grads.append(x.grad.clone())
+        self.assertTrue(torch.isfinite(grads[1]).all())
+        self.assertGreater(
+            float((grads[0] - grads[1]).norm() / grads[0].norm()), 1e-3)
+
+    def test_end_to_end_alpha_zero_is_bit_identical(self):
+        logits, labels, tl, ul = _random_case(2, 8, 3, 6, seed=163)
+        outs = []
+        for mode in ("fixed", "diagonal_projected"):
+            x = logits.clone().requires_grad_(True)
+            loss = rnnt_shc_loss.rnnt_shc_loss(
+                labels, ul, x, tl, blank=0, alpha=0.0, alpha_mode=mode,
+                fas_eps=1e-10)
+            loss.sum().backward()
+            outs.append((loss.detach().clone(), x.grad.clone()))
+        self.assertTrue(torch.equal(outs[0][0], outs[1][0]))
+        self.assertTrue(torch.equal(outs[0][1], outs[1][1]))
+
+    def test_nodes_outside_the_rectangle_get_no_gradient(self):
+        logits, labels, tl, ul = _random_case(3, 10, 5, 6, seed=167,
+                                              ragged=True)
+        x = logits.clone().requires_grad_(True)
+        loss = rnnt_shc_loss.rnnt_shc_loss(
+            labels, ul, x, tl, blank=0, alpha=0.10,
+            alpha_mode="diagonal_projected", fas_eps=1e-10)
+        loss.sum().backward()
+        for i, (t, u) in enumerate(zip(tl.tolist(), ul.tolist())):
+            self.assertTrue(torch.allclose(
+                x.grad[i, t:], torch.zeros_like(x.grad[i, t:]), atol=1e-9))
+            self.assertTrue(torch.allclose(
+                x.grad[i, :, u + 1:],
+                torch.zeros_like(x.grad[i, :, u + 1:]), atol=1e-9))
+
+
+class AwsAlphaBetaTest(unittest.TestCase):
+    """`aws_alpha_beta`: AWS on both lattice halves, not on gamma.
+
+    Plain AWS smooths gamma = alpha*beta/P, which is a pure per-node
+    weight, so the target is untouched by construction. Smoothing the
+    halves separately is a different intervention: alpha cancels out of
+    z_hat(t,u,blank) = p(blank|t,u) beta(t+1,u) / beta(t,u), so it moves
+    only the weight, while beta moves the weight and the target together.
+    """
+
+    def _halves(self, logits, labels, tl, ul):
+        log_probs = torch.log_softmax(logits.float(), dim=-1)
+        b, t_len, u1, c = logits.shape
+        lab = labels.clamp(min=0)
+        gathered = torch.gather(
+            log_probs[:, :, :u1 - 1, :], 3,
+            lab.view(b, 1, u1 - 1, 1).expand(b, t_len, u1 - 1, 1)).squeeze(3)
+        log_p_label = torch.cat(
+            [gathered, torch.full((b, t_len, 1), rnnt_shc_loss.NEG_INF)],
+            dim=2)
+        return rnnt_shc_loss.calculate_rnnt_alpha_beta(
+            log_probs[..., 0], log_p_label, tl, ul)
+
+    def test_alpha_zero_leaves_the_lattice_alone(self):
+        logits, labels, tl, ul = _random_case(3, 9, 4, 6, seed=401)
+        la, lb, _ = self._halves(logits, labels, tl, ul)
+        for x in (la, lb):
+            out = rnnt_shc_loss.apply_alpha_beta_diagonal_smoothing(
+                x, tl, ul, 0.0, 0.0, eps=1e-10)
+            self.assertTrue(torch.allclose(out, x, atol=1e-4),
+                            msg=f"max |d| = {float((out - x).abs().max())}")
+
+    def test_it_is_invariant_to_a_per_diagonal_rescale(self):
+        """alpha and beta are only defined up to a per-diagonal factor
+        that cancels in gamma, so the smoothing must not depend on it."""
+        logits, labels, tl, ul = _random_case(2, 8, 3, 6, seed=403)
+        la, _, _ = self._halves(logits, labels, tl, ul)
+        b, t_len, u1 = la.shape
+        t = torch.arange(t_len).view(-1, 1)
+        u = torch.arange(u1).view(1, -1)
+        g = torch.Generator().manual_seed(9)
+        shift = torch.randn(t_len + u1, generator=g, dtype=la.dtype) * 3.0
+        bumped = la + shift[(t + u)].unsqueeze(0)
+        a = rnnt_shc_loss.apply_alpha_beta_diagonal_smoothing(
+            la, tl, ul, 0.05, 0.0, eps=1e-10)
+        c = rnnt_shc_loss.apply_alpha_beta_diagonal_smoothing(
+            bumped, tl, ul, 0.05, 0.0, eps=1e-10)
+        valid = ((t.view(1, -1, 1) < tl.view(-1, 1, 1))
+                 & (u.view(1, 1, -1) <= ul.view(-1, 1, 1)))
+        d = ((c - shift[(t + u)].unsqueeze(0)) - a)[valid].abs().max()
+        self.assertLess(float(d), 1e-3, msg=f"{float(d)}")
+
+    def test_outside_the_rectangle_is_untouched(self):
+        logits, labels, tl, ul = _random_case(3, 10, 5, 6, seed=405,
+                                              ragged=True)
+        la, lb, _ = self._halves(logits, labels, tl, ul)
+        for x in (la, lb):
+            out = rnnt_shc_loss.apply_alpha_beta_diagonal_smoothing(
+                x, tl, ul, 0.05, 0.0, eps=1e-10)
+            for i, (t, u) in enumerate(zip(tl.tolist(), ul.tolist())):
+                self.assertTrue(torch.equal(out[i, t:], x[i, t:]))
+                self.assertTrue(torch.equal(out[i, :, u + 1:],
+                                            x[i, :, u + 1:]))
+
+    def test_smoothing_alpha_moves_the_weight_but_not_the_target(self):
+        """The asymmetry the mode rests on, pinned numerically."""
+        logits, labels, tl, ul = _random_case(2, 8, 3, 6, seed=407)
+        la, lb, lz = self._halves(logits, labels, tl, ul)
+        log_probs = torch.log_softmax(logits.float(), dim=-1)
+        b, t_len, u1, c = logits.shape
+        lab = labels.clamp(min=0)
+        gathered = torch.gather(
+            log_probs[:, :, :u1 - 1, :], 3,
+            lab.view(b, 1, u1 - 1, 1).expand(b, t_len, u1 - 1, 1)).squeeze(3)
+        lpl = torch.cat(
+            [gathered, torch.full((b, t_len, 1), rnnt_shc_loss.NEG_INF)], 2)
+
+        def derive(a_, b_):
+            qb, ql = rnnt_shc_loss.rnnt_transition_posteriors(
+                a_, b_, log_probs[..., 0], lpl, lz, tl, ul)
+            return rnnt_shc_loss._node_target(qb, ql, lab, c, 0)
+
+        t0, g0 = derive(la, lb)
+        la_s = rnnt_shc_loss.apply_alpha_beta_diagonal_smoothing(
+            la, tl, ul, 0.05, 0.0, eps=1e-10)
+        lb_s = rnnt_shc_loss.apply_alpha_beta_diagonal_smoothing(
+            lb, tl, ul, 0.05, 0.0, eps=1e-10)
+        t_a, g_a = derive(la_s, lb)
+        t_b, g_b = derive(la, lb_s)
+        self.assertLess(float((t_a - t0).abs().max()), 1e-5,
+                        msg="smoothing alpha must not move z_hat")
+        self.assertGreater(float((g_a - g0).abs().max()), 1e-4)
+        self.assertGreater(float((t_b - t0).abs().max()), 1e-4,
+                           msg="smoothing beta must move z_hat")
+
+    def test_end_to_end(self):
+        logits, labels, tl, ul = _random_case(2, 8, 3, 6, seed=409)
+        grads = []
+        for a in (0.0, 0.05):
+            x = logits.clone().requires_grad_(True)
+            loss = rnnt_shc_loss.rnnt_shc_loss(
+                labels, ul, x, tl, blank=0, alpha=a,
+                alpha_mode="aws_alpha_beta", fas_eps=1e-10)
+            loss.sum().backward()
+            grads.append((loss.detach().clone(), x.grad.clone()))
+        self.assertTrue(torch.equal(grads[0][0], grads[1][0]),
+                        msg="the loss is not a function of the smoothing")
+        self.assertTrue(torch.isfinite(grads[1][1]).all())
+        self.assertGreater(
+            float((grads[0][1] - grads[1][1]).norm() / grads[0][1].norm()),
+            1e-3)
+
+    def test_nodes_outside_the_rectangle_get_no_gradient(self):
+        logits, labels, tl, ul = _random_case(3, 10, 5, 6, seed=411,
+                                              ragged=True)
+        x = logits.clone().requires_grad_(True)
+        loss = rnnt_shc_loss.rnnt_shc_loss(
+            labels, ul, x, tl, blank=0, alpha=0.05,
+            alpha_mode="aws_alpha_beta", fas_eps=1e-10)
+        loss.sum().backward()
+        for i, (t, u) in enumerate(zip(tl.tolist(), ul.tolist())):
+            self.assertTrue(torch.allclose(
+                x.grad[i, t:], torch.zeros_like(x.grad[i, t:]), atol=1e-9))
+            self.assertTrue(torch.allclose(
+                x.grad[i, :, u + 1:],
+                torch.zeros_like(x.grad[i, :, u + 1:]), atol=1e-9))
